@@ -130,11 +130,13 @@ pub enum KeymapResult {
 pub enum MappableCommand {
     Typable { name: String, args: String, doc: String },
     Static { name: &'static str, fun: fn(cx: &mut Context), doc: &'static str },
-    Macro { name: String, commands: Vec<KeyEvent>, doc: String },
+    Macro { name: String, keys: Vec<KeyEvent> },  // 注意：无 doc 字段
 }
 ```
 
-`execute()` 方法是**命令执行**阶段的最终入口，将编辑动作应用到 `Editor`。
+`execute()` 方法是**命令执行**阶段的最终入口，三种变体有完全不同的落地方式（详见第 5 章）。
+
+Static 变体通过 `static_commands!` 宏在编译期生成 `const` 常量，例如 `MappableCommand::move_char_left`，其函数指针指向同名的 Rust 函数。
 
 ---
 
@@ -144,7 +146,7 @@ pub enum MappableCommand {
 
 ### 3.1 默认映射的构建
 
-[helix-term/src/keymap/default.rs](helix-term/src/keymap/default.rs) 通过 `keymap!` 宏在编译期构建默认绑定：
+[helix-term/src/keymap/default.rs](helix-term/src/keymap/default.rs) 的 `default()` 函数在**运行时**被调用（编辑器启动或配置刷新时），通过 `keymap!` 宏展开为运行时代码构建 Trie 树：
 
 ```rust
 keymap!({ "Normal mode"
@@ -157,7 +159,15 @@ keymap!({ "Normal mode"
 })
 ```
 
-`keymap!` 宏展开后生成 `KeyTrie::Node(KeyTrieNode { ... })`，确保编译期检查重复键。
+`keymap!` 宏的展开代码（见 [helix-term/src/keymap/macros.rs](helix-term/src/keymap/macros.rs#L96-L117)）在运行时执行以下操作：
+
+1. 创建 `IndexMap::with_capacity(_cap)` 存储子键
+2. 对每个绑定执行 `"key".parse::<KeyEvent>().unwrap()` 解析按键字符串
+3. 将 `(KeyEvent, KeyTrie)` 对插入 `IndexMap`
+4. 用 `assert!(_duplicate.is_none())` **运行时**检查重复键
+5. 包装为 `KeyTrie::Node(KeyTrieNode { ... })`
+
+注意：虽然键字符串解析和 Map 构建在运行时完成，但 `MappableCommand::insert_mode`、`MappableCommand::goto_file_start` 等 Static 命令本身由 `static_commands!` 宏在**编译期**生成为 `const` 常量。
 
 ### 3.2 合并算法：KeyTrieNode::merge()
 
@@ -396,6 +406,64 @@ fn handle_keymap_event(
 }
 ```
 
+### 5.5 三种命令的落地方式详解
+
+`MappableCommand::execute()` 定义位置：[helix-term/src/commands.rs](helix-term/src/commands.rs#L248-L286)
+
+三种变体有完全不同的落地路径：
+
+#### Static —— 直接函数调用
+```rust
+Self::Static { fun, .. } => (fun)(cx),
+```
+- **执行方式**：直接调用函数指针 `fn(cx: &mut Context)
+- **典型场景**：绝大多数编辑命令（移动、删除、插入模式切换等）
+- **命令来源**：由 `static_commands!` 宏在编译期生成的 `const` 常量
+- **运行时开销**：零，仅一次函数调用
+
+#### Typable —— 命令行命令分发
+```rust
+Self::Typable { name, args, doc: _ } => {
+    if let Some(command) = typed::TYPABLE_COMMAND_MAP.get(name.as_str()) {
+        let mut cx = compositor::Context { editor: cx.editor, jobs: cx.jobs, scroll: None };
+        if let Err(e) = typed::execute_command(&mut cx, command, args, PromptEvent::Validate) {
+            cx.editor.set_error(format!("{}", e));
+        }
+    } else {
+            cx.editor.set_error(format!("no such command: '{name}'"));
+    }
+}
+```
+- **执行方式**：从 `TYPABLE_COMMAND_MAP` 按名称查找，再调用 `typed::execute_command`
+- **典型场景**：用户在 TOML 配置中通过 `:write`、`:buffer-close` 等冒号命令绑定的键
+- **命令来源**：用户 TOML 配置，或 `keymap!` 宏中的字符串命令名（如 `"buffer-close"`）
+- **Context 差异**：使用 `compositor::Context` 而非 `commands::Context`，不带 `count` 和 `register`
+
+#### Macro —— 按键序列重放
+```rust
+Self::Macro { keys, .. } => {
+    if cx.editor.macro_replaying.contains(&'@') {
+        cx.editor.set_error("Cannot execute macro because the [@] register is already playing a macro");
+        return;
+    }
+    cx.editor.macro_replaying.push('@');
+    let keys = keys.clone();
+    cx.callback.push(Box::new(move |compositor, cx| {
+        for key in keys.into_iter() {
+            compositor.handle_event(&compositor::Event::Key(key), cx);
+        }
+        cx.editor.macro_replaying.pop();
+    });
+}
+```
+- **执行方式**：不直接修改文档，而是将按键序列封装为 Compositor 回调，**将按键重新注入事件循环**
+- **典型场景**：`@` 寄存器回放录制的宏
+- **关键机制**：
+  1. 递归保护：检查 `macro_replaying` 防止 `@` 寄存器递归调用
+  2. 延迟执行：通过 `cx.callback.push` 将回调交给 Compositor 处理
+  3. 事件重放：逐个按键调用 `compositor.handle_event(Event::Key(key))`，经过完整的事件分派链路
+- **重要区别**：Static/Typable 命令直接在当前函数栈执行，Macro 命令则是**异步**在下一轮事件循环中重放按键
+
 ---
 
 ## 6. 三者关联剖析：配置覆盖 → 按键匹配 → 命令执行
@@ -464,9 +532,11 @@ fn handle_keymap_event(
 |---|---|---|
 | 配置→匹配 | [keymap.rs#L309-L310](helix-term/src/keymap.rs#L309-L310) | `get()` 读取 `self.map()` 获取 Trie |
 | 匹配→执行 | [ui/editor.rs#L941](helix-term/src/ui/editor.rs#L941) | `handle_keymap_event()` 调用 `self.keymaps.get()` |
+| 匹配→执行（分支） | [commands.rs#L248-L286](helix-term/src/commands.rs#L248-L286) | `execute()` 中 Static/Typable/Macro 三种落地分支 |
 | 执行→匹配（模式） | [ui/editor.rs#L948-L963](helix-term/src/ui/editor.rs#L948-L963) | 模式切换后下次 `get()` 用新 mode |
 | 执行→匹配（sticky） | [keymap.rs#L340-L343](helix-term/src/keymap.rs#L340-L343) | sticky 节点改变查找起点 |
 | 执行→匹配（count） | [ui/editor.rs#L1025](helix-term/src/ui/editor.rs#L1025) | `contains_key()` 查询影响计数逻辑 |
+| 执行→匹配（macro） | [commands.rs#L268-L283](helix-term/src/commands.rs#L268-L283) | Macro 将按键重新注入 compositor 事件循环 |
 
 ---
 
@@ -514,10 +584,13 @@ if !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key) {
 ### 阶段 3：按第二个 `g`（按键匹配 + 命令执行）
 1. `Keymaps::get(Normal, 'g')` 首键匹配到 Node
 2. `state.push('g')` → `['g', 'g']`
-3. `trie.search(&state[1..])` → 命中 `MappableCommand(goto_file_start)`
+3. `trie.search(&state[1..])` → 命中 `MappableCommand::Static { name: "goto_file_start", fun: goto_file_start, doc: "..." }`
 4. 返回 `KeymapResult::Matched(goto_file_start)`
 5. `state` 清空
-6. `goto_file_start.execute(cx)` 执行实际跳转（构建 `Transaction` 应用到 `Document`）
+6. `execute_command` 闭包调用 `command.execute(cx)`：
+   - 匹配到 `MappableCommand::Static { fun, .. }` 分支
+   - 直接调用函数指针 `goto_file_start(cx)`
+   - 内部构建 `Transaction`（将光标移动到文档开头）应用到 `Document`
 7. 派发 `PostCommand` 钩子
 8. 模式未变化，无需特殊处理
 
