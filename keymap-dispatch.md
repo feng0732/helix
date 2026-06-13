@@ -1,6 +1,8 @@
 # Helix 模态键映射分派机制详解
 
-本文档详细解析 Helix 编辑器中从按键输入到编辑动作落地的完整链路，包括按键匹配、键映射覆盖、以及命令执行的全过程。
+本文档详细解析 Helix 编辑器中从按键输入到编辑动作落地的完整链路，重点阐明**按键匹配、配置覆盖、命令执行**三者之间的关联和实现方式。
+
+所有源码路径均为相对于仓库根目录的相对路径。
 
 ---
 
@@ -11,17 +13,17 @@
 ```
 终端输入
   ↓
-[application.rs] handle_terminal_events()
+[helix-term/src/application.rs] handle_terminal_events()
   ↓  转换为内部 Event 类型
-[compositor.rs] Compositor::handle_event()
+[helix-term/src/compositor.rs] Compositor::handle_event()
   ↓  从顶层向底层逐层冒泡
-[ui/editor.rs] EditorView::handle_event()
+[helix-term/src/ui/editor.rs] EditorView::handle_event()
   ├─ Insert 模式 → insert_mode()
   └─ Normal/Select 模式 → command_mode()
        ↓
-[ui/editor.rs] handle_keymap_event()
+[helix-term/src/ui/editor.rs] handle_keymap_event()
        ↓
-[keymap.rs] Keymaps::get()  →  Trie 树查找
+[helix-term/src/keymap.rs] Keymaps::get()  →  Trie 树查找
        ↓
 KeymapResult::{Matched, Pending, MatchedSequence, NotFound, Cancelled}
        ↓
@@ -34,7 +36,7 @@ MappableCommand::execute()  →  实际编辑动作
 
 ### 2.1 KeyEvent —— 按键事件
 
-定义位置：[input.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-view/src/input.rs#L65-L69)
+定义位置：[helix-view/src/input.rs](helix-view/src/input.rs#L65-L69)
 
 ```rust
 pub struct KeyEvent {
@@ -43,14 +45,14 @@ pub struct KeyEvent {
 }
 ```
 
-- `KeyCode`：物理按键（字符、功能键、方向键等），见 [keyboard.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-view/src/keyboard.rs#L362-L419)
+- `KeyCode`：物理按键（字符、功能键、方向键等），见 [helix-view/src/keyboard.rs](helix-view/src/keyboard.rs#L362-L419)
 - `KeyModifiers`：修饰键组合（SHIFT / CONTROL / ALT / SUPER），位标志实现
 
-**字符串解析与规范化**：通过 `FromStr` trait 将 `"C-w"`、`"S-A-F12"` 等字符串解析为 `KeyEvent`。解析时会对字符键进行规范化：如 `"C-S-r"` 与 `"C-R"` 等价（小写+SHIFT 转为大写）。
+**字符串解析与规范化**：通过 `FromStr` trait 将 `"C-w"`、`"S-A-F12"` 等字符串解析为 `KeyEvent`。解析时会对字符键进行规范化：如 `"C-S-r"` 与 `"C-R"` 等价（小写+SHIFT 转为大写），见 [helix-view/src/input.rs](helix-view/src/input.rs#L437-L445)。
 
 ### 2.2 Mode —— 编辑模式
 
-定义位置：[document.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-view/src/document.rs#L65-L69)
+定义位置：[helix-view/src/document.rs](helix-view/src/document.rs#L65-L69)
 
 ```rust
 pub enum Mode {
@@ -60,11 +62,11 @@ pub enum Mode {
 }
 ```
 
-每个模式对应独立的键映射树。
+每个模式对应**独立**的键映射树，是连接配置覆盖、按键匹配、命令执行的关键维度。
 
 ### 2.3 KeyTrie —— 键映射前缀树
 
-定义位置：[keymap.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/keymap.rs#L109-L114)
+定义位置：[helix-term/src/keymap.rs](helix-term/src/keymap.rs#L109-L114)
 
 ```rust
 pub enum KeyTrie {
@@ -90,7 +92,7 @@ root (Node)
 
 ### 2.4 Keymaps —— 状态保持的映射查找器
 
-定义位置：[keymap.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/keymap.rs#L264-L271)
+定义位置：[helix-term/src/keymap.rs](helix-term/src/keymap.rs#L264-L271)
 
 ```rust
 pub struct Keymaps {
@@ -100,13 +102,13 @@ pub struct Keymaps {
 }
 ```
 
-- `map` 通过 `ArcSwap` 实现热更新配置
-- `state` 保存多键组合的中间状态（如用户已按 `g` 等待下一个键）
-- `sticky` 支持"粘滞模式"（如 `g` 后按多个跳转命令无需重复按 `g`）
+- `map` 通过 `ArcSwap` 实现热更新配置 —— **配置覆盖**的结果存储于此
+- `state` 保存多键组合的中间状态 —— **按键匹配**的运行时上下文
+- `sticky` 支持"粘滞模式"，改变后续按键匹配的起点
 
 ### 2.5 KeymapResult —— 查找结果
 
-定义位置：[keymap.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/keymap.rs#L248-L259)
+定义位置：[helix-term/src/keymap.rs](helix-term/src/keymap.rs#L248-L259)
 
 ```rust
 pub enum KeymapResult {
@@ -118,87 +120,31 @@ pub enum KeymapResult {
 }
 ```
 
----
+这是**按键匹配**输出给**命令执行**的核心数据结构，定义了五种标准处理分支。
 
-## 3. 按键匹配算法详解
+### 2.6 MappableCommand —— 可映射命令
 
-核心算法位于 [Keymaps::get()](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/keymap.rs#L307-L356)，步骤如下：
-
-### 3.1 处理 Esc 键
+定义位置：[helix-term/src/commands.rs](helix-term/src/commands.rs#L214-L230)
 
 ```rust
-if key!(Esc) == key {
-    if !self.state.is_empty() {
-        return KeymapResult::Cancelled(self.state.drain(..).collect());
-    }
-    self.sticky = None;
+pub enum MappableCommand {
+    Typable { name: String, args: String, doc: String },
+    Static { name: &'static str, fun: fn(cx: &mut Context), doc: &'static str },
+    Macro { name: String, commands: Vec<KeyEvent>, doc: String },
 }
 ```
 
-- 若有未决按键（state 非空）：取消并返回已输入序列
-- 若有粘滞节点：清除粘滞状态
-
-### 3.2 确定查找起点
-
-```rust
-let trie_node = match self.sticky {
-    Some(ref trie) => Cow::Owned(KeyTrie::Node(trie.clone())),
-    None => Cow::Borrowed(keymap),
-};
-```
-
-优先从粘滞节点开始查找，否则从当前模式的根节点开始。
-
-### 3.3 首键快速匹配
-
-```rust
-let first = self.state.first().unwrap_or(&key);
-match trie_node.search(&[*first]) {
-    Some(KeyTrie::MappableCommand(ref cmd)) => return KeymapResult::Matched(cmd.clone()),
-    Some(KeyTrie::Sequence(ref cmds)) => return KeymapResult::MatchedSequence(cmds.clone()),
-    None => return KeymapResult::NotFound,
-    Some(t) => t,  // 是中间节点，继续
-};
-```
-
-首键若直接是叶子节点（单命令或序列），立即返回匹配；否则进入中间节点继续。
-
-### 3.4 多键组合逐级下探
-
-```rust
-self.state.push(key);
-match trie.search(&self.state[1..]) {
-    Some(KeyTrie::Node(map)) => {
-        if map.is_sticky {
-            self.state.clear();
-            self.sticky = Some(map.clone());
-        }
-        KeymapResult::Pending(map.clone())
-    }
-    Some(KeyTrie::MappableCommand(cmd)) => {
-        self.state.clear();
-        KeymapResult::Matched(cmd.clone())
-    }
-    Some(KeyTrie::Sequence(cmds)) => {
-        self.state.clear();
-        KeymapResult::MatchedSequence(cmds.clone())
-    }
-    None => KeymapResult::Cancelled(self.state.drain(..).collect()),
-}
-```
-
-关键点：
-- 若到达标记为 `sticky` 的节点，清空 state 并保存粘滞节点，后续按键从该节点开始
-- 到达叶子节点则清空 state 并返回匹配命令
-- 路径中断则返回 Cancelled，附带已输入按键
+`execute()` 方法是**命令执行**阶段的最终入口，将编辑动作应用到 `Editor`。
 
 ---
 
-## 4. 键映射覆盖机制
+## 3. 配置覆盖：静态构建 Trie 树
 
-### 4.1 默认映射
+**配置覆盖发生在编辑器启动/配置刷新时**，负责将多层配置（默认 → 全局 → 工作区）合并为最终的 `HashMap<Mode, KeyTrie>`。
 
-[default.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/keymap/default.rs) 通过 `keymap!` 宏构建默认绑定，例如：
+### 3.1 默认映射的构建
+
+[helix-term/src/keymap/default.rs](helix-term/src/keymap/default.rs) 通过 `keymap!` 宏在编译期构建默认绑定：
 
 ```rust
 keymap!({ "Normal mode"
@@ -211,9 +157,11 @@ keymap!({ "Normal mode"
 })
 ```
 
-### 4.2 合并算法
+`keymap!` 宏展开后生成 `KeyTrie::Node(KeyTrieNode { ... })`，确保编译期检查重复键。
 
-[KeyTrieNode::merge()](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/keymap.rs#L45-L55)：
+### 3.2 合并算法：KeyTrieNode::merge()
+
+[helix-term/src/keymap.rs](helix-term/src/keymap.rs#L45-L55)
 
 ```rust
 pub fn merge(&mut self, mut other: Self) {
@@ -229,48 +177,114 @@ pub fn merge(&mut self, mut other: Self) {
 }
 ```
 
-**覆盖规则**：
-| 原节点类型 | 用户配置类型 | 结果 |
+**覆盖规则**（只有 Node-Node 会合并，其余一律覆盖）：
+
+| 原节点（默认） | 用户配置 | 合并结果 |
 |---|---|---|
 | 叶子（命令） | 叶子（命令） | 用户覆盖默认 |
-| 叶子（命令） | Node | 用户 Node 覆盖默认叶子 |
-| Node | 叶子（命令） | 用户叶子覆盖默认 Node |
-| Node | Node | **递归合并**两者的子键 |
+| 叶子（命令） | Node（子菜单） | 用户 Node 覆盖默认叶子 |
+| Node（子菜单） | 叶子（命令） | 用户叶子覆盖默认 Node |
+| Node（子菜单） | Node（子菜单） | **递归合并**两者子键 |
 
-### 4.3 配置加载流程
+### 3.3 配置加载流程
 
-[Config::load()](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/config.rs#L59-L118)：
+[helix-term/src/config.rs](helix-term/src/config.rs#L59-L118)
 
 ```
 默认 keymap::default()
      ↓ merge_keys(全局 ~/.config/helix/config.toml)
      ↓ merge_keys(工作区 .helix/config.toml，需受信任)
-最终生效的键映射
+最终 HashMap<Mode, KeyTrie>
 ```
 
-这意味着：
-- 用户可以完全覆盖某个键的绑定
-- 用户可以向已有子菜单（如 `g` 跳转菜单）**追加**新绑定
+关键点：
 - 后加载的配置优先级更高
+- 用户可以向已有的子菜单（如 `g` 跳转菜单）**追加**新绑定，而非必须完全替换
+- 合并结果存入 `Config.keys`，通过 `ArcSwap` 包装后注入 `Keymaps.map`
 
 ---
 
-## 5. 从事件到命令：EditorView 分派
+## 4. 按键匹配：动态消费 Trie 树
 
-### 5.1 Compositor 事件冒泡
+**按键匹配发生在每个按键事件到达时**，使用配置覆盖阶段构建的 Trie 树，将按键序列转换为 `KeymapResult`。
 
-[Compositor::handle_event()](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/compositor.rs#L144-L182) 从顶层（最新弹出的组件，如 Picker、Prompt）向下逐层传递事件，直到某层返回 `EventResult::Consumed`。
+核心算法：[Keymaps::get()](helix-term/src/keymap.rs#L307-L356)
 
-`EditorView` 通常是最底层的组件，只有上层组件都不消费事件时才会处理。
+### 4.1 完整算法流程
 
-### 5.2 EditorView::handle_event 主入口
+```rust
+pub fn get(&mut self, mode: Mode, key: KeyEvent) -> KeymapResult {
+    let keymaps = &*self.map();       // ← 读取配置覆盖的结果
+    let keymap = &keymaps[&mode];     // ← 按当前模式选择 Trie 树
 
-[ui/editor.rs#L1436-L1601](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/ui/editor.rs#L1436-L1601)
+    // 1) Esc 键特殊处理
+    if key!(Esc) == key {
+        if !self.state.is_empty() {
+            return KeymapResult::Cancelled(self.state.drain(..).collect());
+        }
+        self.sticky = None;
+    }
+
+    // 2) 确定查找起点（受 sticky 影响）
+    let first = self.state.first().unwrap_or(&key);
+    let trie_node = match self.sticky {
+        Some(ref trie) => Cow::Owned(KeyTrie::Node(trie.clone())),
+        None => Cow::Borrowed(keymap),
+    };
+
+    // 3) 首键快速匹配
+    let trie = match trie_node.search(&[*first]) {
+        Some(KeyTrie::MappableCommand(ref cmd)) => return KeymapResult::Matched(cmd.clone()),
+        Some(KeyTrie::Sequence(ref cmds)) => return KeymapResult::MatchedSequence(cmds.clone()),
+        None => return KeymapResult::NotFound,
+        Some(t) => t,
+    };
+
+    // 4) 多键组合逐级下探
+    self.state.push(key);
+    match trie.search(&self.state[1..]) {
+        Some(KeyTrie::Node(map)) => {
+            if map.is_sticky {
+                self.state.clear();
+                self.sticky = Some(map.clone());  // ← 改变后续匹配起点
+            }
+            KeymapResult::Pending(map.clone())
+        }
+        Some(KeyTrie::MappableCommand(cmd)) => {
+            self.state.clear();
+            KeymapResult::Matched(cmd.clone())
+        }
+        Some(KeyTrie::Sequence(cmds)) => {
+            self.state.clear();
+            KeymapResult::MatchedSequence(cmds.clone())
+        }
+        None => KeymapResult::Cancelled(self.state.drain(..).collect()),
+    }
+}
+```
+
+### 4.2 关键设计要点
+
+1. **`mode` 参数**：直接决定使用哪棵 Trie 树，建立了"模式 → 键映射"的关联
+2. **`state` 字段**：累积多键组合，实现 `g g`、`C-w v` 等多键命令
+3. **`sticky` 字段**：激活后改变后续查找起点，影响后续按键匹配
+4. **`search()` 方法**：沿着 `state` 累积的按键路径在 Trie 中逐级查找
+
+---
+
+## 5. 命令执行：KeymapResult 落地
+
+**命令执行发生在按键匹配之后**，由 `EditorView` 消费 `KeymapResult`，产生实际编辑效果。
+
+### 5.1 事件分派入口
+
+[EditorView::handle_event()](helix-term/src/ui/editor.rs#L1436-L1601) 是所有按键事件的处理入口：
 
 ```rust
 Event::Key(mut key) => {
-    canonicalize_key(&mut key);  // 规范化按键（如 BackTab → S-Tab）
+    canonicalize_key(&mut key);
 
+    // on_next_key 优先截获（如 f 命令等待目标字符）
     if !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key) {
         match mode {
             Mode::Insert => self.insert_mode(&mut cx, key),
@@ -280,9 +294,9 @@ Event::Key(mut key) => {
 }
 ```
 
-### 5.3 Insert 模式处理
+### 5.2 Insert 模式
 
-[insert_mode()](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/ui/editor.rs#L984-L1011)：
+[insert_mode()](helix-term/src/ui/editor.rs#L984-L1011)
 
 ```rust
 fn insert_mode(&mut self, cx: &mut commands::Context, event: KeyEvent) {
@@ -291,11 +305,11 @@ fn insert_mode(&mut self, cx: &mut commands::Context, event: KeyEvent) {
             KeymapResult::NotFound => {
                 // 未绑定的字符直接插入文档
                 if let Some(ch) = event.char() {
-                    commands::insert::insert_char(cx, ch)
+                    commands::insert::insert_char(cx, ch);
                 }
             }
             KeymapResult::Cancelled(pending) => {
-                // 序列取消：将已输入的字符逐个插入
+                // 多键组合取消时，已输入字符逐个落盘
                 for ev in pending { ... }
             }
             _ => unreachable!(),
@@ -304,33 +318,27 @@ fn insert_mode(&mut self, cx: &mut commands::Context, event: KeyEvent) {
 }
 ```
 
-Insert 模式下：
-1. 先尝试在 Insert 模式键映射中查找（如 `Esc` 回 Normal、`Tab` 缩进等）
-2. 未找到映射的字符键直接插入文本
-3. 多键组合取消时，已输入的字符会逐个落盘
+### 5.3 Normal / Select 模式
 
-### 5.4 Normal / Select 模式处理
-
-[command_mode()](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/ui/editor.rs#L1013-L1098) 有以下特殊逻辑：
+[command_mode()](helix-term/src/ui/editor.rs#L1013-L1098) 有三类特殊处理：
 
 **1) 计数前缀（Count）**
 ```rust
-// 已有计数时继续追加数字
-(key!(i @ '0'..='9'), Some(count)) => { count = count * 10 + i; ... }
-
-// 非零数字且未被键映射占用时，开启新计数
-(key!(i @ '1'..='9'), None) if !self.keymaps.contains_key(mode, event) => { ... }
+// 数字键只有在未被当前模式映射占用时才作为计数前缀
+(key!(i @ '1'..='9'), None) if !self.keymaps.contains_key(mode, event) => {
+    cxt.editor.count = NonZeroUsize::new(i as usize);
+}
 ```
 
-注意：数字键只有在**未被当前模式映射占用**时才会作为计数前缀，这避免了与绑定冲突。
+这里调用 `self.keymaps.contains_key()` 查询 Trie 树，体现了**按键匹配**结果会**影响控制流**。
 
 **2) 重复操作（`.`）**
 ```rust
 (key!('.'), _) if self.keymaps.pending().is_empty() => {
-    for _ in 0..count {
+    for _ in 0..cxt.editor.count.map_or(1, NonZeroUsize::into) {
         self.last_insert.0.execute(cx);  // 重放进入 Insert 的命令
-        for key in self.last_insert.1.clone() {  // 重放 Insert 期间的输入
-            self.insert_mode(cx, key);
+        for key in self.last_insert.1.clone() {
+            self.insert_mode(cx, key);   // 重放 Insert 期间的输入
         }
     }
 }
@@ -348,38 +356,131 @@ _ => {
 }
 ```
 
-### 5.5 handle_keymap_event —— 命令执行封装
+### 5.4 handle_keymap_event：核心执行封装
 
-[handle_keymap_event()](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/ui/editor.rs#L933-L982)：
+[handle_keymap_event()](helix-term/src/ui/editor.rs#L933-L982)
 
 ```rust
-match &key_result {
-    KeymapResult::Matched(command) => {
-        execute_command(command);
+fn handle_keymap_event(
+    &mut self, mode: Mode, cxt: &mut commands::Context, event: KeyEvent
+) -> Option<KeymapResult> {
+    let key_result = self.keymaps.get(mode, event);  // ← 调用按键匹配
+
+    let mut execute_command = |command: &commands::MappableCommand| {
+        command.execute(cxt);  // ← 命令执行落地
+        helix_event::dispatch(PostCommand { command, cx: cxt });
+
+        // 模式切换会改变后续按键匹配使用的 Trie 树
+        let current_mode = cxt.editor.mode();
+        if current_mode != last_mode {
+            helix_event::dispatch(OnModeSwitch {
+                old_mode: last_mode, new_mode: current_mode, cx: cxt
+            });
+            if current_mode == Mode::Insert {
+                self.last_insert.0 = command.clone();  // 记录用于 . 重复
+                self.last_insert.1.clear();
+            }
+        }
+        last_mode = current_mode;
+    };
+
+    match &key_result {
+        KeymapResult::Matched(command) => execute_command(command),
+        KeymapResult::Pending(node) => cxt.editor.autoinfo = Some(node.infobox()),
+        KeymapResult::MatchedSequence(commands) => {
+            for command in commands { execute_command(command); }
+        }
+        KeymapResult::NotFound | KeymapResult::Cancelled(_) => return Some(key_result),
     }
-    KeymapResult::Pending(node) => {
-        cxt.editor.autoinfo = Some(node.infobox());  // 显示帮助弹窗
-    }
-    KeymapResult::MatchedSequence(commands) => {
-        for command in commands { execute_command(command); }
-    }
-    KeymapResult::NotFound | KeymapResult::Cancelled(_) => return Some(key_result),
+    None
 }
 ```
 
-`execute_command` 闭包额外做两件事：
-1. 派发 `PostCommand` 事件钩子
-2. 检测模式切换，派发 `OnModeSwitch` 事件，并在进入 Insert 时记录 `last_insert`
+---
+
+## 6. 三者关联剖析：配置覆盖 → 按键匹配 → 命令执行
+
+三者是**层层递进、相互影响**的闭环关系：
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                    配置覆盖（静态阶段）                            │
+│  [config.rs] Config::load()                                        │
+│      default() → merge(global) → merge(workspace)                  │
+│      生成 HashMap<Mode, KeyTrie>                                   │
+│          ↓ 注入                                                    │
+│  [keymap.rs] Keymaps.map (ArcSwap)  ←──────────────────────────┐   │
+│          ↓ 被消费                                               │   │
+└───────────────────────────────────────────────────────────────────┘   │
+            ↓                                                         │
+┌───────────────────────────────────────────────────────────────────┐ │
+│                   按键匹配（动态阶段）                             │ │
+│  [keymap.rs] Keymaps::get(mode, key)                               │ │
+│      1. 根据 mode 选择 Trie 树（取决于上次命令执行的结果）         │ │
+│      2. 沿 state 路径查找                                         │ │
+│      3. 返回 KeymapResult                                         │ │
+│          ↓ 被消费                                                 │ │
+└───────────────────────────────────────────────────────────────────┘ │
+            ↓                                                         │
+┌───────────────────────────────────────────────────────────────────┐ │
+│                   命令执行（落地阶段）                             │ │
+│  [ui/editor.rs] handle_keymap_event()                             │ │
+│      Matched → command.execute() → 模式可能改变                   │ │
+│      Pending → 显示 infobox                                       │ │
+│      NotFound → 插入字符 / on_next_key 回退                       │ │
+│          ↓ 副作用                                                 │ │
+│      模式切换 → 改变后续 get() 调用的 mode 参数 ───────────────────┘ │
+│      sticky 设置 → 改变后续 get() 调用的查找起点                    │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### 6.1 配置覆盖 → 按键匹配：数据流向
+
+- **输入**：配置覆盖的产物 `HashMap<Mode, KeyTrie>` 存储在 `Keymaps.map` 中
+- **消费**：`Keymaps::get(mode, key)` 每次调用都从 `map` 中读取当前模式的 Trie 树
+- **热更新**：通过 `ArcSwap` 支持配置刷新后按键匹配行为即时变更
+
+### 6.2 按键匹配 → 命令执行：控制流向
+
+- **输入**：`KeymapResult` 定义了 5 种标准分支
+- **消费**：
+  - `Matched` / `MatchedSequence` → 执行命令
+  - `Pending` → 显示帮助弹窗，等待下一键
+  - `NotFound` → Insert 模式插入字符，Normal 模式尝试 on_next_key 回退
+  - `Cancelled` → 多键组合取消，Insert 模式下将已输入字符落盘
+
+### 6.3 命令执行 → 按键匹配：反馈闭环
+
+命令执行产生的副作用会**改变后续按键匹配的行为**：
+
+1. **模式切换**：`insert_mode` 等命令执行后，`editor.mode()` 返回新值，下次 `Keymaps::get()` 将使用不同模式的 Trie 树
+2. **Sticky 节点激活**：命中标记为 sticky 的子菜单后，`Keymaps.sticky` 被设置，后续查找起点改变
+3. **on_next_key 回调**：某些命令（如 `f` 查找）设置回调后，下次按键将绕过正常的 Trie 查找
+4. **计数与寄存器**：数字键和 `"` 键的处理依赖 `keymaps.contains_key()` 查询结果
+
+### 6.4 代码中的具体关联点
+
+| 关联类型 | 代码位置 | 关联方式 |
+|---|---|---|
+| 配置→匹配 | [keymap.rs#L309-L310](helix-term/src/keymap.rs#L309-L310) | `get()` 读取 `self.map()` 获取 Trie |
+| 匹配→执行 | [ui/editor.rs#L941](helix-term/src/ui/editor.rs#L941) | `handle_keymap_event()` 调用 `self.keymaps.get()` |
+| 执行→匹配（模式） | [ui/editor.rs#L948-L963](helix-term/src/ui/editor.rs#L948-L963) | 模式切换后下次 `get()` 用新 mode |
+| 执行→匹配（sticky） | [keymap.rs#L340-L343](helix-term/src/keymap.rs#L340-L343) | sticky 节点改变查找起点 |
+| 执行→匹配（count） | [ui/editor.rs#L1025](helix-term/src/ui/editor.rs#L1025) | `contains_key()` 查询影响计数逻辑 |
 
 ---
 
-## 6. 辅助机制
+## 7. 辅助机制
 
-### 6.1 on_next_key 回调
+### 7.1 on_next_key 回调
 
 某些命令（如 `f` 查找字符、`m` 环绕操作）需要等待**下一个按键**作为参数。它们通过设置 `on_next_key_callback` 截获后续按键，绕过正常的键映射查找。
 
 ```rust
+// 命令中设置回调
+cx.on_next_key(|cx, key| { /* 处理下一个按键 */ });
+
+// 事件入口优先检查
 if !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key) {
     // 只有 on_next_key 不消费事件时，才走正常映射逻辑
 }
@@ -387,47 +488,53 @@ if !self.on_next_key(OnKeyCallbackKind::PseudoPending, &mut cx, key) {
 
 `pseudo_pending` 字段用于在状态栏显示这些临时等待的按键。
 
-### 6.2 寄存器（Register）
+### 7.2 寄存器（Register）
 
 `"` 前缀键用于选择寄存器，选中的寄存器暂存于 `editor.selected_register`，在命令执行时取出注入 `Context::register`。
 
-### 6.3 粘滞节点（Sticky Node）
+### 7.3 粘滞节点（Sticky Node）
 
 某些子菜单（如 Window 模式）可标记 `sticky=true`，进入后无需重复按前缀键即可连续执行子命令。例如按 `C-w` 后可连续按 `v`/`s`/`q` 进行窗口操作。
 
 ---
 
-## 7. 完整示例：`gg` 执行流程
+## 8. 完整示例：`gg` 执行流程
 
-用户在 Normal 模式按下 `g` 再按 `g`（跳转文件开头）：
+用户在 Normal 模式按下 `g` 再按 `g`（跳转文件开头），贯穿三个阶段：
 
-1. **按第一个 `g`**
-   - `Keymaps::get(Normal, 'g')` → 命中 `KeyTrie::Node("Goto")`
-   - 返回 `KeymapResult::Pending(node)`
-   - `state` 变为 `['g']`
-   - EditorView 显示 Goto 子菜单的帮助弹窗（infobox）
+### 阶段 1：配置覆盖（已在启动时完成）
+`default()` 构建的 Trie 树中，`g` 键对应 `Node("Goto")`，其下 `g` 键对应 `goto_file_start` 命令。
 
-2. **按第二个 `g`**
-   - `Keymaps::get(Normal, 'g')` 首键匹配到 Node
-   - `state.push('g')` → `['g', 'g']`
-   - `trie.search(&state[1..])` → 命中 `MappableCommand(goto_file_start)`
-   - 返回 `KeymapResult::Matched(goto_file_start)`
-   - `state` 清空
-   - `goto_file_start.execute(cx)` 执行实际跳转
-   - 派发 `PostCommand` 钩子
+### 阶段 2：按第一个 `g`（按键匹配 + 命令执行）
+1. `Keymaps::get(Normal, 'g')` → 命中 `KeyTrie::Node("Goto")`
+2. 返回 `KeymapResult::Pending(node)`
+3. `state` 变为 `['g']`
+4. `handle_keymap_event` 显示 Goto 子菜单的帮助弹窗
+
+### 阶段 3：按第二个 `g`（按键匹配 + 命令执行）
+1. `Keymaps::get(Normal, 'g')` 首键匹配到 Node
+2. `state.push('g')` → `['g', 'g']`
+3. `trie.search(&state[1..])` → 命中 `MappableCommand(goto_file_start)`
+4. 返回 `KeymapResult::Matched(goto_file_start)`
+5. `state` 清空
+6. `goto_file_start.execute(cx)` 执行实际跳转（构建 `Transaction` 应用到 `Document`）
+7. 派发 `PostCommand` 钩子
+8. 模式未变化，无需特殊处理
 
 ---
 
-## 8. 关键文件索引
+## 9. 关键文件索引
 
 | 文件 | 职责 |
 |---|---|
-| [keymap.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/keymap.rs) | Trie 数据结构、查找算法、合并逻辑 |
-| [keymap/macros.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/keymap/macros.rs) | `keymap!` / `key!` 等宏定义 |
-| [keymap/default.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/keymap/default.rs) | 默认键映射 |
-| [ui/editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/ui/editor.rs) | EditorView 事件处理与命令执行 |
-| [compositor.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/compositor.rs) | 组件层事件冒泡机制 |
-| [config.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/config.rs) | 配置加载与键映射合并 |
-| [input.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-view/src/input.rs) | KeyEvent 定义与字符串解析 |
-| [keyboard.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-view/src/keyboard.rs) | KeyCode / KeyModifiers 定义 |
-| [application.rs](file:///d:/fz/0601/solo-dogfeeding/code/263-helix/helix-term/src/application.rs) | 主事件循环与终端事件接入 |
+| [helix-term/src/keymap.rs](helix-term/src/keymap.rs) | Trie 数据结构、查找算法、合并逻辑 |
+| [helix-term/src/keymap/macros.rs](helix-term/src/keymap/macros.rs) | `keymap!` / `key!` 等宏定义 |
+| [helix-term/src/keymap/default.rs](helix-term/src/keymap/default.rs) | 默认键映射 |
+| [helix-term/src/ui/editor.rs](helix-term/src/ui/editor.rs) | EditorView 事件处理与命令执行 |
+| [helix-term/src/compositor.rs](helix-term/src/compositor.rs) | 组件层事件冒泡机制 |
+| [helix-term/src/config.rs](helix-term/src/config.rs) | 配置加载与键映射合并 |
+| [helix-term/src/commands.rs](helix-term/src/commands.rs) | MappableCommand 定义与 Context |
+| [helix-view/src/input.rs](helix-view/src/input.rs) | KeyEvent 定义与字符串解析 |
+| [helix-view/src/keyboard.rs](helix-view/src/keyboard.rs) | KeyCode / KeyModifiers 定义 |
+| [helix-view/src/document.rs](helix-view/src/document.rs) | Mode 定义 |
+| [helix-term/src/application.rs](helix-term/src/application.rs) | 主事件循环与终端事件接入 |
