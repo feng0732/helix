@@ -410,18 +410,31 @@ fn handle_keymap_event(
 
 `MappableCommand::execute()` 定义位置：[helix-term/src/commands.rs](helix-term/src/commands.rs#L248-L286)
 
-三种变体有完全不同的落地路径：
+三种变体有完全不同的落地路径，下表先做对比，再分别展开：
+
+| | Static | Typable | Macro |
+|---|---|---|---|
+| **分发方式** | 直接调用函数指针 | 按名称查表再分发 | 封装按键回调注入事件循环 |
+| **执行时机** | 同步，当前函数栈 | 同步，当前函数栈 | 延迟，下一轮事件循环 |
+| **Context** | `commands::Context`（含 count/register） | `compositor::Context`（无 count/register） | `compositor::Context` |
+| **命令来源** | `static_commands!` 宏生成的 `const` 常量 | 用户 TOML 配置中的冒号命令 | `@` 寄存器录制的按键序列 |
+| **典型示例** | `move_char_left`、`insert_mode` | `:write`、`:buffer-close` | `@miw` |
+
+---
 
 #### Static —— 直接函数调用
+
 ```rust
 Self::Static { fun, .. } => (fun)(cx),
 ```
-- **执行方式**：直接调用函数指针 `fn(cx: &mut Context)
+
+- **执行方式**：直接调用函数指针 `fn(cx: &mut Context)`
 - **典型场景**：绝大多数编辑命令（移动、删除、插入模式切换等）
 - **命令来源**：由 `static_commands!` 宏在编译期生成的 `const` 常量
-- **运行时开销**：零，仅一次函数调用
+- **运行时开销**：分发本身仅一次函数指针调用，但被调函数内部的逻辑开销因命令而异（如 `move_char_left` 只移动光标，而 `global_search` 会启动异步搜索）
 
 #### Typable —— 命令行命令分发
+
 ```rust
 Self::Typable { name, args, doc: _ } => {
     if let Some(command) = typed::TYPABLE_COMMAND_MAP.get(name.as_str()) {
@@ -430,20 +443,25 @@ Self::Typable { name, args, doc: _ } => {
             cx.editor.set_error(format!("{}", e));
         }
     } else {
-            cx.editor.set_error(format!("no such command: '{name}'"));
+        cx.editor.set_error(format!("no such command: '{name}'"));
     }
 }
 ```
+
 - **执行方式**：从 `TYPABLE_COMMAND_MAP` 按名称查找，再调用 `typed::execute_command`
 - **典型场景**：用户在 TOML 配置中通过 `:write`、`:buffer-close` 等冒号命令绑定的键
 - **命令来源**：用户 TOML 配置，或 `keymap!` 宏中的字符串命令名（如 `"buffer-close"`）
 - **Context 差异**：使用 `compositor::Context` 而非 `commands::Context`，不带 `count` 和 `register`
+- **容错**：若 `name` 在 `TYPABLE_COMMAND_MAP` 中查不到，设置错误提示而非 panic
 
 #### Macro —— 按键序列重放
+
 ```rust
 Self::Macro { keys, .. } => {
     if cx.editor.macro_replaying.contains(&'@') {
-        cx.editor.set_error("Cannot execute macro because the [@] register is already playing a macro");
+        cx.editor.set_error(
+            "Cannot execute macro because the [@] register is already playing a macro",
+        );
         return;
     }
     cx.editor.macro_replaying.push('@');
@@ -453,16 +471,17 @@ Self::Macro { keys, .. } => {
             compositor.handle_event(&compositor::Event::Key(key), cx);
         }
         cx.editor.macro_replaying.pop();
-    });
+    }));
 }
 ```
+
 - **执行方式**：不直接修改文档，而是将按键序列封装为 Compositor 回调，**将按键重新注入事件循环**
 - **典型场景**：`@` 寄存器回放录制的宏
 - **关键机制**：
   1. 递归保护：检查 `macro_replaying` 防止 `@` 寄存器递归调用
   2. 延迟执行：通过 `cx.callback.push` 将回调交给 Compositor 处理
   3. 事件重放：逐个按键调用 `compositor.handle_event(Event::Key(key))`，经过完整的事件分派链路
-- **重要区别**：Static/Typable 命令直接在当前函数栈执行，Macro 命令则是**异步**在下一轮事件循环中重放按键
+- **重要区别**：Static/Typable 命令同步执行在当前函数栈上，Macro 命令则是**延迟**在下一轮事件循环中重放按键
 
 ---
 
