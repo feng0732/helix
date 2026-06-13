@@ -416,7 +416,8 @@ fn handle_keymap_event(
 |---|---|---|---|
 | **分发方式** | 直接调用函数指针 | 按名称查表再分发 | 封装按键回调注入事件循环 |
 | **执行时机** | 同步，当前函数栈 | 同步，当前函数栈 | 延迟，下一轮事件循环 |
-| **Context** | `commands::Context`（含 count/register） | `compositor::Context`（无 count/register） | `compositor::Context` |
+| **execute() 接收** | `commands::Context`（含 count/register/callback） | `commands::Context`（含 count/register/callback） | `commands::Context`（含 count/register/callback） |
+| **回调接收** | 无回调 | 无回调 | `compositor::Context`（仅 editor/jobs） |
 | **命令来源** | `static_commands!` 宏生成的 `const` 常量 | 用户 TOML 配置中的冒号命令 | `@` 寄存器录制的按键序列 |
 | **典型示例** | `move_char_left`、`insert_mode` | `:write`、`:buffer-close` | `@miw` |
 
@@ -451,13 +452,14 @@ Self::Typable { name, args, doc: _ } => {
 - **执行方式**：从 `TYPABLE_COMMAND_MAP` 按名称查找，再调用 `typed::execute_command`
 - **典型场景**：用户在 TOML 配置中通过 `:write`、`:buffer-close` 等冒号命令绑定的键
 - **命令来源**：用户 TOML 配置，或 `keymap!` 宏中的字符串命令名（如 `"buffer-close"`）
-- **Context 差异**：使用 `compositor::Context` 而非 `commands::Context`，不带 `count` 和 `register`
+- **Context 转换**：`execute()` 接收的是 `commands::Context`，但在内部创建了一个新的 `compositor::Context`（仅保留 `editor` 和 `jobs`，丢失 `count`、`register`、`callback`）
 - **容错**：若 `name` 在 `TYPABLE_COMMAND_MAP` 中查不到，设置错误提示而非 panic
 
 #### Macro —— 按键序列重放
 
 ```rust
 Self::Macro { keys, .. } => {
+    // execute() 接收 commands::Context
     if cx.editor.macro_replaying.contains(&'@') {
         cx.editor.set_error(
             "Cannot execute macro because the [@] register is already playing a macro",
@@ -466,6 +468,7 @@ Self::Macro { keys, .. } => {
     }
     cx.editor.macro_replaying.push('@');
     let keys = keys.clone();
+    // 回调签名使用 compositor::Context
     cx.callback.push(Box::new(move |compositor, cx| {
         for key in keys.into_iter() {
             compositor.handle_event(&compositor::Event::Key(key), cx);
@@ -475,7 +478,42 @@ Self::Macro { keys, .. } => {
 }
 ```
 
-- **执行方式**：不直接修改文档，而是将按键序列封装为 Compositor 回调，**将按键重新注入事件循环**
+**两种 Context 的边界：**
+
+1. **execute() 阶段（commands::Context）**：
+   - `MappableCommand::execute(&self, cx: &mut commands::Context)` 接收完整的 `commands::Context`，包含 `count`、`register`、`callback`、`on_next_key_callback`
+   - 这一阶段检查 `macro_replaying` 防止递归，标记 `'@'` 进入重放状态
+   - 将按键重放逻辑封装为 `compositor::Callback`，push 到 `cx.callback`
+
+2. **回调执行阶段（compositor::Context）**：
+   - 回调签名是 `Box<dyn FnOnce(&mut Compositor, &mut compositor::Context)>`，仅能访问 `editor`、`jobs`、`scroll`
+   - `count`、`register` 等 commands::Context 特有的字段在此边界**丢失**
+
+**回调传递全流程：**
+
+```
+EditorView::handle_event(compositor::Context)
+  ↓ 创建
+commands::Context { callback: Vec::new(), ... }
+  ↓ 调用
+MappableCommand::execute(cx) → push callback 到 cx.callback
+  ↓ 收集（见 ui/editor.rs#L1547-L1575）
+let callbacks = take(&mut cx.callback);
+EventResult::Consumed(Some(Box::new(|compositor, cx| {
+    for cb in callbacks { cb(compositor, cx); }
+})))
+  ↓ 返回给 Compositor
+Compositor::handle_event() → 执行所有 callback（见 compositor.rs#L153-L179）
+  ↓ 回调中调用
+compositor.handle_event(Event::Key(key), cx)  → 完整事件分派
+```
+
+**重放按键的执行边界：**
+- 重放的每个按键都走完整的事件分派链路：Compositor → EditorView → Keymaps::get → MappableCommand::execute
+- 每个被重放的按键都会触发 `EditorView::handle_event` 创建**新的** `commands::Context`，count/register 等上下文会重置
+- 递归保护通过 `editor.macro_replaying` 标志在整个重放过程中生效
+
+- **执行方式总结**：不直接修改文档，而是将按键序列封装为 Compositor 回调，**将按键重新注入事件循环**
 - **典型场景**：`@` 寄存器回放录制的宏
 - **关键机制**：
   1. 递归保护：检查 `macro_replaying` 防止 `@` 寄存器递归调用
