@@ -72,9 +72,174 @@ pub struct Document {
 
 ---
 
-## 二、选择集如何驱动文本变更
+## 二、位置粘附策略 Assoc 详解
 
-### 2.1 变更的底层表示：ChangeSet 与 Operation
+这是理解选择集位置映射的核心。
+
+### 2.1 Assoc 的 6 种策略
+
+[transaction.rs:32-48](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L32-L48)
+
+```rust
+pub enum Assoc {
+    Before,
+    After,
+    AfterWord,
+    BeforeWord,
+    BeforeSticky,
+    AfterSticky,
+}
+```
+
+**基础语义（间隙索引视角）：**
+
+位置 `p` 是第 `p` 个字符之前的间隙。一个位置有"前侧"（第 `p-1` 个字符之后）和"后侧"（第 `p` 个字符之前）。
+
+- **`Before`**：位置粘附在**前侧**的字符上。前侧字符移动时，位置跟着移动。
+- **`After`**：位置粘附在**后侧**的字符上。后侧字符移动时，位置跟着移动。
+- **`BeforeSticky` / `AfterSticky`**：粘性版本，在**等长替换**时行为不同（见下文）。
+- **`BeforeWord` / `AfterWord`**：词边界粘附，主要用于 diagnostics。
+
+### 2.2 insert_offset：纯插入时的行为
+
+[transaction.rs:56-65](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L56-L65)
+
+```rust
+fn insert_offset(self, s: &str) -> usize {
+    let chars = s.chars().count();
+    match self {
+        Assoc::After | Assoc::AfterSticky => chars,
+        Assoc::AfterWord => s.chars().take_while(|&c| char_is_word(c)).count(),
+        Assoc::Before | Assoc::BeforeSticky => 0,
+        Assoc::BeforeWord => chars - s.chars().rev().take_while(|&c| char_is_word(c)).count(),
+    }
+}
+```
+
+**纯插入场景**（位置正好落在插入点上）：
+
+| 策略 | 插入后新位置 | 直观理解 |
+|------|-------------|----------|
+| `Before` / `BeforeSticky` | `new_pos + 0 = new_pos` | 停在插入文本之前 |
+| `After` / `AfterSticky` | `new_pos + s.len()` | 跳到插入文本之后 |
+| `BeforeWord` / `AfterWord` | 停在词边界处 | 用于 diagnostics |
+
+### 2.3 纯删除时的行为
+
+[transaction.rs:462-464](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L462-L464)
+
+```rust
+Delete(_) => {
+    map!(|pos, _| (old_end > pos).then_some(new_pos), i);
+}
+```
+
+**纯删除场景**：所有落在删除范围内的位置，**无论 Assoc 是什么**，都坍缩到删除起始位置 `new_pos`。
+
+原因：删除后，删除范围内的所有"字符"都消失了，位置只能落在删除后留下的单个间隙上。
+
+### 2.4 替换（Insert + Delete）时的行为
+
+[transaction.rs:466-503](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L466-L503)
+
+在 ChangeSet 中，"替换"由 `Insert(new_text)` + `Delete(old_len)` 两个操作连续表示（先构造 Insert，再构造 Delete）。位置映射时将两者合并处理。
+
+替换区域：旧文档 `[old_pos, old_pos + old_len)` → 新文档 `s`（长度 `s_len`）。
+
+对于落在替换区域内的位置 `pos`（`old_pos <= pos < old_pos + old_len`）：
+
+```
+if pos == old_pos 且 stay_at_gaps():
+    → new_pos （替换起始位置）
+else:
+    ins = assoc.insert_offset(s)
+    if old_len == ins 且 assoc.sticky():
+        → new_pos + (pos - old_pos)  // 保持相对偏移（sticky 行为）
+    else:
+        → new_pos + ins               // 跳到插入偏移位置
+```
+
+#### AfterSticky 的替换行为
+
+`AfterSticky` 的 `insert_offset` = `s.len()`（插入文本总长度），因此：
+
+- **等长替换**（`old_len == s.len()`）：`old_len == ins` 条件成立 → **保持相对偏移**（sticky）
+- **不等长替换**：条件不成立 → 跳到**替换区域末尾**（`new_pos + s.len()`）
+
+直观理解：AfterSticky 粘在替换区域后边界上，等长时"跟随"文本保持相对位置，不等长时被"吸"到末尾。
+
+#### BeforeSticky 的替换行为
+
+`BeforeSticky` 的 `insert_offset` = `0`，因此：
+
+- 条件 `old_len == ins` 即 `old_len == 0`（删除长度为 0）
+- 但 `delete(0)` 会被优化掉，不会产生 Delete 操作，也就不会进入替换分支
+- **所以在实际的替换场景中，BeforeSticky 的 sticky 行为从不触发**
+- 结果：所有落在替换区域内的 BeforeSticky 位置，都跳到**替换区域开头**（`new_pos + 0`）
+
+> **注意**：这是代码中的不对称性。`AfterSticky` 的 sticky 在等长替换时生效，`BeforeSticky` 的 sticky 在替换场景中永不生效。两者的注释描述是对称的，但实际实现不对称。
+
+### 2.5 Selection 映射的 Assoc 选择
+
+[selection.rs:490-506](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/selection.rs#L490-L506)
+
+对于每个 Range：
+
+```
+anchor < head （正向选择）:
+    anchor = from   → AfterSticky  （范围起点）
+    head   = to     → BeforeSticky （范围终点）
+
+anchor > head （反向选择）:
+    head   = from   → AfterSticky  （范围起点）
+    anchor = to     → BeforeSticky （范围终点）
+
+anchor == head （零宽光标）:
+    两者都是 → AfterSticky
+```
+
+**规律：范围的起始端（from 侧）用 AfterSticky，范围的结束端（to 侧）用 BeforeSticky。**
+
+### 2.6 选择范围在编辑时的漂移示例
+
+假设有一个正向选择 `[2, 5)`（from=2, to=5），以下是不同编辑操作后的变化：
+
+**场景 1：在位置 2（选择起点）插入 "abc"**
+- from（AfterSticky）：位置 2 在插入点上 → 2 + 3 = 5
+- to（BeforeSticky）：位置 5 > 2，整体后移 3 → 8
+- 新选择：`[5, 8)`（选择扩大，包住了插入文本）✓
+
+**场景 2：在位置 5（选择终点）插入 "abc"**
+- from：位置 2 < 5 → 不变 → 2
+- to（BeforeSticky）：位置 5 在插入点上 → 不变 → 5
+- 新选择：`[2, 5)`（选择不变，插入在选择外）✓
+
+**场景 3：删除位置 [1, 6)（选择完全在删除区内）**
+- from 和 to 都在删除范围内 → 都坍缩到 1
+- 新选择：`[1, 1)`（零宽光标落在删除起始处）
+
+**场景 4：替换 [3, 6) 为 "XY"（2 字符），选择 [2, 5) 跨替换边界**
+- from=2（AfterSticky）：在替换区外（前） → 不变 → 2
+- to=5（BeforeSticky）：在替换区内 → 跳到替换开头 → 3
+- 新选择：`[2, 3)`（终点被"吸"到替换起始处）
+
+**场景 5：替换 [1, 6) 为 "abcde"（5 字符，等长），选择 [2, 4) 完全在替换内**
+- from=2（AfterSticky）：等长替换，保持偏移 → 1 + (2-1) = 2
+- to=4（BeforeSticky）：在替换区内，跳到开头 → 1
+- 新选择：`[2, 1)`（即反向选择 `[1, 2)`）
+
+> 注意场景 5 的不对称性：等长替换时起点保持偏移，但终点跳到开头。
+
+**场景 6：替换 [1, 6) 为 "abc"（3 字符，变短），选择 [2, 4) 完全在替换内**
+- from=2（AfterSticky）：不等长，跳到末尾 → 1 + 3 = 4
+- to=4（BeforeSticky）：跳到开头 → 1
+- 新选择：`[4, 1)`（即反向选择 `[1, 4)`，覆盖整个替换区域）
+
+---
+
+## 三、选择集如何驱动文本变更
+
+### 3.1 变更的底层表示：ChangeSet 与 Operation
 
 [transaction.rs:12-20](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L12-L20)
 
@@ -88,39 +253,18 @@ pub enum Operation {
 
 `ChangeSet` 是 `Operation` 的序列，描述从文档 A 到文档 B 的完整变换。它采用类似 OT（Operational Transformation）的线性表示方式。
 
-#### Assoc —— 位置关联策略
+**ChangeSet 的构造**：替换操作按 `Insert` → `Delete` 顺序构造。
 
-[transaction.rs:32-48](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L32-L48)
+[transaction.rs:556-558](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L556-L558)
 
-编辑时，位置如何随插入/删除而漂移？`Assoc` 定义了 6 种策略：
-
-| 策略 | 含义 | 典型用途 |
-|------|------|----------|
-| `Before` | 粘附到插入点之前 | 普通光标尾部 |
-| `After` | 粘附到插入点之后 | 普通光标头部 |
-| `BeforeWord` | 词边界前粘附 | 诊断起点 |
-| `AfterWord` | 词边界后粘附 | 诊断终点 |
-| `BeforeSticky` | 等长替换时保持偏移 | 选择锚点 |
-| `AfterSticky` | 等长替换时保持偏移 | 选择头部 |
-
-**Selection 映射的 Assoc 选择逻辑**（见 [selection.rs:490-506](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/selection.rs#L490-L506)）：
-
-```
-anchor < head 时（正向选择）:
-  anchor → AfterSticky   （锚点跟随插入起点之后）
-  head   → BeforeSticky  （头部跟随删除终点之前）
-
-anchor > head 时（反向选择）:
-  head   → AfterSticky
-  anchor → BeforeSticky
-
-anchor == head 时（零宽光标）:
-  两者都 → AfterSticky
+```rust
+Some(text) => {
+    changeset.insert(text);
+    changeset.delete(span);
+}
 ```
 
-这种策略确保了：在选择两端插入文本时，选择范围会"包住"新文本；而删除时选择会正确收缩。
-
-### 2.2 Transaction —— 可撤销的变更单元
+### 3.2 Transaction —— 可撤销的变更单元
 
 [transaction.rs:573-577](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L573-L577)
 
@@ -133,7 +277,7 @@ pub struct Transaction {
 
 `Transaction` = `ChangeSet` + 可选的 Selection 覆盖。如果提供了 `selection`，编辑后直接使用该选择；否则通过 `ChangeSet.map` 自动推导。
 
-### 2.3 面向选择集的 Transaction 构造器
+### 3.3 面向选择集的 Transaction 构造器
 
 这是选择集驱动文本变更的核心 API。
 
@@ -147,7 +291,7 @@ where
     F: FnMut(&Range) -> Change,
 ```
 
-**工作原理**：对 Selection 中的每个 Range 调用 `f`，生成一个 `(from, to, replacement)` 三元组，再将这些变更按序合成为 `ChangeSet`。
+**工作原理**：对 Selection 中的每个 Range 调用 `f`，生成一个 `(from, to, replacement)` 三元组，再将这些变更按序合成为 `ChangeSet`。因为 Range 已排序且不重叠，合成时不会产生偏移错乱。
 
 **典型用例：大小写转换**
 
@@ -168,7 +312,7 @@ fn switch_case_impl<F>(cx: &mut Context, change_fn: F) {
 
 [transaction.rs:756-800](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L756-L800)
 
-与 `change_by_selection` 类似，但闭包可返回 `Option<Range>` 来显式指定每个范围编辑后的新位置。适用于编辑后光标位置不能简单推导的场景（如插入后光标要跳到文本末尾）。
+与 `change_by_selection` 类似，但闭包可返回 `Option<Range>` 来显式指定每个范围编辑后的新位置。适用于编辑后光标位置不能通过 map 推导的场景（如插入后光标要跳到文本末尾，或自动配对时需要精确定位）。
 
 **典型用例：插入字符**
 
@@ -213,45 +357,53 @@ pub fn insert(doc: &Rope, selection: &Selection, text: Tendril) -> Self {
 }
 ```
 
-### 2.4 Document::apply —— 事务应用的完整流程
+### 3.4 Document::apply —— 事务应用的完整流程
 
 [document.rs:1435-1626](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-view/src/document.rs#L1435-L1626)
 
 调用链：`Document::apply` → `apply_inner` → `apply_impl`
 
-**apply_impl 执行步骤（Selection 相关部分）：**
+**apply_impl 中 Selection 相关的执行步骤：**
 
 ```
 1. ChangeSet.apply(&mut self.text)     // 实际修改 Rope 文本
 
-2. 若 changes 为空且 transaction 带 selection：
-     直接用提供的 selection 更新（纯光标移动类事务）
+2. 若 changes 为空（纯光标移动类事务）:
+     若 transaction 带 selection → 直接设置，派发 SelectionDidChange
+     返回
 
-3. 若 changes 非空：
-   a. 遍历所有视图的 Selection：
-        selection = selection.map(transaction.changes())
-                         .ensure_invariants(...)
-      （自动更新每个视图的光标位置）
-   b. 更新 view_position（滚动锚点）
+3. 若 changes 非空:
+   a. 对所有视图的 Selection 调用 .map(transaction.changes())
+      → 自动推导每个视图的新光标位置
+   b. 更新 view_position（滚动锚点，Assoc::Before）
    c. 更新 savepoint 回滚事务
    d. 更新 tree-sitter 语法树
-   e. 更新 diagnostics 位置
-   f. 更新 inlay hints 位置
-   g. 更新 document highlights 位置
+   e. 更新 diagnostics 位置（起点 After/AfterWord，终点 Before/BeforeWord）
+   f. 更新 inlay hints 位置（Assoc::After）
+   g. 更新 document highlights 位置（两端都是 After）
    h. 派发 DocumentDidChange 事件
 
 4. 若 transaction 显式指定了 selection：
-     覆盖当前视图的 selection（优先级最高）
+     覆盖当前视图的 selection（优先级高于自动推导）
      派发 SelectionDidChange 事件
 ```
 
 **关键机制**：`Selection::map(ChangeSet)` 内部调用 `ChangeSet::update_positions`，后者通过单次线性扫描 `ChangeSet`，批量映射所有 Range 的 anchor 和 head 位置，时间复杂度 O(N+M)（N 为操作数，M 为位置数）。见 [transaction.rs:388-510](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L388-L510)。
 
+### 3.5 自动推导 vs 显式指定
+
+| 方式 | 时机 | 适用场景 |
+|------|------|----------|
+| 自动推导（Selection::map） | 每次编辑，对所有视图执行 | 普通编辑操作，选择随文本自然漂移 |
+| 显式指定（Transaction::selection） | 编辑后覆盖当前视图 | 光标跳转、模式切换、撤销/重做等需要精确定位的场景 |
+
+**设计权衡**：自动推导保证了所有视图的选择都能正确跟随文本变化，但无法表达语义级别的光标移动（如"删除后光标移到行首"）。显式指定提供了精确控制，但只影响当前视图。
+
 ---
 
-## 三、选择集与撤销/重做机制
+## 四、选择集与撤销/重做机制
 
-### 3.1 History —— 修订树
+### 4.1 History —— 修订树
 
 [history.rs:50-66](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/history.rs#L50-L66)
 
@@ -270,9 +422,9 @@ struct Revision {
 }
 ```
 
-**设计**：每个修订同时存储正向和反向事务。反向事务（inversion）不仅还原文本，还保存了**撤销时要恢复的 Selection**。
+**设计**：每个修订同时存储正向和反向事务。
 
-### 3.2 State —— （文本 + 选择集）快照
+### 4.2 State —— （文本 + 选择集）快照
 
 [history.rs:7-11](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/history.rs#L7-L11)
 
@@ -283,7 +435,7 @@ pub struct State {
 }
 ```
 
-### 3.3 提交修订：Selection 的保存
+### 4.3 提交修订：Selection 的保存
 
 [history.rs:89-110](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/history.rs#L89-L110)
 
@@ -298,13 +450,19 @@ pub fn commit_revision_at_timestamp(
 }
 ```
 
-**inversion 事务的生成**：
+**关键点**：
 - 文本还原：通过 `ChangeSet::invert()` 生成（Delete ↔ Insert 互换）
-- 选择还原：直接使用 `original.selection`（编辑操作前的选择集）
+- 选择还原：**直接保存编辑前的 Selection**，而不是通过反向 ChangeSet 推导
 
-这意味着：**撤销不仅还原文本，还还原到编辑前的光标/选区位置**。
+**为什么不用反向 map 推导？**
+因为 Assoc 策略的映射不是完美可逆的。例如：
+- 选择完全落在替换区域内时，两端会坍缩到替换边界
+- 纯删除时，范围内所有位置都坍缩到同一点
+- 这些信息丢失的操作无法通过反向 map 精确恢复
 
-### 3.4 Document 层的累积与提交
+保存原始 Selection 确保了撤销后选择状态与编辑前完全一致（多光标、方向、所有细节）。
+
+### 4.4 Document 层的累积与提交
 
 Document 并不为每次按键都创建修订。相反，它将连续的编辑操作累积在 `self.changes` 中，在合适的时机（退出插入模式、切换文档、超时等）才一次性提交到 History。
 
@@ -344,36 +502,51 @@ pub fn append_changes_to_history(&mut self, view: &mut View) {
     let changes = std::mem::replace(&mut self.changes, new_changeset);
     let transaction =
         Transaction::from(changes).with_selection(self.selection(view.id).clone());
+        // ★ 正向事务携带"编辑后"的选择
 
     let old_state = self.old_state.take().expect("no old_state available");
 
     let mut history = self.history.take();
-    history.commit_revision(&transaction, &old_state);  // old_state 包含编辑前选择
+    history.commit_revision(&transaction, &old_state);  // old_state 含编辑前选择
     self.history.set(history);
 }
 ```
 
-### 3.5 Undo/Redo 的完整流程
+**提交时两个方向的 Selection：**
+- 正向事务（`transaction`）：携带**编辑后**的 Selection → 用于 redo
+- 反向事务（`inversion`）：携带**编辑前**的 Selection → 用于 undo
+
+### 4.5 Undo/Redo 的完整流程
 
 **Undo**（[document.rs:1665-1687](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-view/src/document.rs#L1665-L1687)）：
 ```
 1. append_changes_to_history()   // 先把当前累积的变更提交掉
 2. history.undo() → 返回 revision.inversion（含旧文本+旧选择）
-3. apply_impl(txn, view.id)      // 应用反向事务，恢复文本和选择
+3. apply_impl(txn, view.id)      // 应用反向事务
+   a. 文本被还原
+   b. 所有视图的 selection 先通过 map 自动推导
+   c. 但 inversion 显式携带了旧 selection，覆盖当前视图
+   d. 结果：当前视图的选择精确回到编辑前状态
 ```
 
 **Redo**：
 ```
 1. 检查 self.changes 是否为空（有未提交的变更则拒绝 redo）
-2. history.redo() → 返回 revision.transaction（含新文本）
+2. history.redo() → 返回 revision.transaction（含新文本+新选择）
 3. apply_impl(txn, view.id)      // 应用正向事务
+   a. 文本被更新
+   b. 所有视图的 selection 先通过 map 自动推导
+   c. 正向事务显式携带了 selection，覆盖当前视图
+   d. 结果：当前视图的选择精确回到编辑后状态
 ```
+
+> **注意**：undo/redo 只影响**当前视图**的 selection（通过显式指定覆盖）。其他视图的 selection 仍通过 map 自动推导，可能产生漂移。这是因为 State 只存了当前视图的 selection。
 
 ---
 
-## 四、选择集如何驱动命令行为
+## 五、选择集如何驱动命令行为
 
-### 4.1 命令的标准模式
+### 5.1 命令的标准模式
 
 绝大多数编辑命令遵循以下模式：
 
@@ -393,11 +566,11 @@ pub fn append_changes_to_history(&mut self, view: &mut View) {
 4. （可选）切换模式、派发事件等
 ```
 
-### 4.2 命令分类与 Selection 的使用
+### 5.2 命令分类与 Selection 的使用
 
 #### A. 纯 Selection 变换类（不修改文本）
 
-这类命令通过 `Selection::transform` 或直接构造新 Selection，调用 `set_selection`。
+这类命令通过 `Selection::transform` 或直接构造新 Selection，调用 `set_selection`。不产生撤销记录。
 
 **示例：翻转选区方向** [commands.rs:3094-3102](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-term/src/commands.rs#L3094-L3102)
 ```rust
@@ -464,7 +637,7 @@ Transaction::change_by_selection(doc.text(), selection, |range| {
 
 每个 range 独立处理，天然支持多光标。例如将选中的"hello"和"world"分别替换为"HELLO"和"WORLD"。
 
-### 4.3 多光标（多 Range）的行为保证
+### 5.3 多光标（多 Range）的行为保证
 
 **Selection 归一化**（[selection.rs:560-587](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/selection.rs#L560-L587)）确保：
 
@@ -474,13 +647,13 @@ Transaction::change_by_selection(doc.text(), selection, |range| {
 
 这使得命令无需关心多光标是否重叠——只需逐 Range 处理，Selection 自身保证一致性。
 
-### 4.4 纯光标移动与事务的关系
+### 5.4 纯光标移动与事务的关系
 
 普通的移动（h/j/k/l、w/b 等）不创建 Transaction，直接调用 `set_selection`。这些操作不产生撤销记录（History 的设计限制，见 [history.rs:41-42](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/history.rs#L41-L42) 的注释："Changes in selections currently don't commit history changes"）。
 
 ---
 
-## 五、数据流总览
+## 六、数据流总览
 
 ```
 用户按键
@@ -500,31 +673,33 @@ Command handler
         ├─ apply_inner
         │    ├─ [首次变更] old_state = (text, selection) 快照
         │    ├─ apply_impl
-        │    │    ├─ ChangeSet.apply(&mut text)        ── 修改文本
+        │    │    ├─ ChangeSet.apply(&mut text)         ── 修改文本
         │    │    │
         │    │    ├─ 对每个视图的 Selection:
-        │    │    │    selection.map(changes)          ── 推导新选择位置
+        │    │    │    selection.map(changes)           ── 自动推导新选择位置
+        │    │    │    （AfterSticky / BeforeSticky 粘附策略）
         │    │    │
         │    │    ├─ 更新 diagnostics / inlay hints
         │    │    ├─ 派发 DocumentDidChange 事件
         │    │    │
-        │    │    └─ [txn 含 selection] 覆盖当前视图选择
+        │    │    └─ [txn 含 selection] 覆盖当前视图选择  ── 优先级最高
         │    │
-        │    └─ changes.compose(txn.changes)          ── 累积到未提交变更
+        │    └─ changes.compose(txn.changes)           ── 累积到未提交变更
         │
         └─ [稍后] append_changes_to_history
-             ├─ 用 old_state 构造 Revision.inversion（含旧选择）
+             ├─ 正向事务携带"编辑后" selection
+             ├─ 用 old_state 构造 Revision.inversion（含编辑前 selection）
              └─ history.commit_revision(...)            ── 写入撤销树
 ```
 
 ---
 
-## 六、关键文件索引
+## 七、关键文件索引
 
 | 文件 | 职责 | 路径 |
 |------|------|------|
 | **selection.rs** | Range/Selection 定义、映射、归一化 | [helix-core/src/selection.rs](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/selection.rs) |
-| **transaction.rs** | ChangeSet/Operation/Transaction、位置映射 Assoc | [helix-core/src/transaction.rs](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs) |
+| **transaction.rs** | ChangeSet/Operation/Transaction、Assoc 粘附策略、位置映射 | [helix-core/src/transaction.rs](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs) |
 | **history.rs** | History/Revision 撤销树、State 快照 | [helix-core/src/history.rs](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/history.rs) |
 | **document.rs** | Document 存储多视图 Selection、apply 流程、历史提交 | [helix-view/src/document.rs](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-view/src/document.rs) |
 | **commands.rs** | 各类编辑命令，展示 Selection→Transaction→apply 的典型用法 | [helix-term/src/commands.rs](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-term/src/commands.rs) |
