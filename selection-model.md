@@ -323,6 +323,79 @@ anchor == head （零宽光标）:
 - to=4（BeforeSticky）：在替换区内，sticky 不生效 → 跳到开头 → 1
 - 新选择：`[4, 1)`（即反向选择 `[1, 4)`，覆盖整个替换区域）
 
+### 2.8 纯插入 vs 选区替换：起点边界的关键差异
+
+这是最容易混淆的两种场景。两者都是"在位置 x 处出现新文本"，但 ChangeSet 的结构不同，导致起点端点的漂移行为完全相反。
+
+#### 差异的代码根源
+
+[transaction.rs:466-500](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L466-L500)
+
+| 场景 | ChangeSet 结构 | 触发分支 | 起点（AfterSticky）映射公式 |
+|------|---------------|----------|---------------------------|
+| 纯插入 | `..., Insert("ABC"), ...` | Insert 单独分支 | `new_pos + s.len()` |
+| 选区替换 | `..., Insert("ABC"), Delete(3), ...` | Insert+Delete 合并分支 | `new_pos`（stay_at_gaps 固定） |
+
+纯插入分支的映射（位置精确等于插入点时）：
+```rust
+new_pos + assoc.insert_offset(s)
+// AfterSticky 的 insert_offset = s.len()
+// 结果：new_pos + s.len()
+```
+
+替换分支的映射（位置等于替换起始点且 stay_at_gaps 时）：
+```rust
+if pos == old_pos && assoc.stay_at_gaps() {
+    new_pos  // ★ 直接返回，不走 insert_offset
+}
+// AfterSticky 的 stay_at_gaps = true
+// 结果：固定为 new_pos
+```
+
+**核心差异**：纯插入在起点处按 `insert_offset` 往后跳；替换在起点处因 `stay_at_gaps` 规则固定在开头。
+
+#### 场景对比：新文本是否被选区包住
+
+假设选择 `[2, 5)`，新文本长度 = 3。
+
+| 场景 | 新文本位置 | from 映射 | to 映射 | 新选择 | 是否包住新文本 |
+|------|-----------|----------|--------|--------|--------------|
+| **纯插入**（在位置 2 插入） | 2..5 | 2 → 5 | 5 → 8 | `[5, 8)` | ❌ 不包住 |
+| **选区替换**（替换 [2,5)） | 2..5 | 2 → 2 | 5 → 5 | `[2, 5)` | ✅ 正好包住 |
+
+（等长替换示例；变长替换时 to = 2 + s.len()，仍然正好包住）
+
+**为什么选区替换后 to 正好在新文本末尾？**
+- to = old_pos + old_len = old_end，即替换区域的右端点
+- 替换区域是 `[old_pos, old_end)`，右端点不在范围内
+- to 由后续 Retain 处理：`new_pos + s.len() + (pos - old_end)` = `new_pos + s.len()`
+- 结果：to 正好落在新文本末尾之后，选区 `[from, to)` = `[new_pos, new_pos + s.len())` = 正好覆盖新文本
+
+#### 选区替换时的选择行为小结
+
+**等长替换（替换 [2,5) → "ABC"，3字符）：**
+- 选择 `[2, 5)` → 新选择 `[2, 5)`（不变）
+- 直观效果：选中内容被替换，选区保持选中状态 ✓
+
+**变长替换（替换 [2,5) → "ABCDEF"，6字符）：**
+- 选择 `[2, 5)` → 新选择 `[2, 8)`
+- 直观效果：选中内容被替换为更长的文本，选区自动扩展覆盖新文本 ✓
+
+**反向选择（head=2, anchor=5，即选中 [2,5) 但光标在开头）：**
+- head = from = 2，AfterSticky → 固定为 2
+- anchor = to = 5，BeforeSticky → 正好在替换区外，由后续 Retain 映射
+- 新选择：head=2, anchor=2+s.len() → 方向仍为反向
+- 直观效果：替换后光标仍在选区首，保持反向选择方向
+
+#### 为什么替换起始点用 stay_at_gaps 而不是 sticky 规则
+
+`stay_at_gaps()` 的语义是「停留在间隙上」—— 当位置正好在替换的起始间隙时，不"进入"替换文本内部，而是停留在那个间隙点。
+
+设计意图：
+1. **选区替换的正确性**：确保选区替换后选区正好覆盖新文本（而不是光标跳到文本末尾）
+2. **选择边界的稳定性**：替换区域的边界点不会因为替换而被吸入文本内部
+3. **与删除行为一致**：删除起始点的位置也会固定在删除前的位置
+
 ---
 
 ## 三、选择集如何驱动文本变更
@@ -521,14 +594,111 @@ pub fn insert(doc: &Rope, selection: &Selection, text: Tendril) -> Self {
 
 但由于 Selection 的规范化（不重叠、排序），逐 Range 编辑不会交叉干扰，合成的 ChangeSet 天然正确。
 
-#### 5. 替换操作的选择行为
+#### 5. 选区替换的天然正确性
 
-当编辑操作本身是由选择集驱动的「选区替换」时（如 change_by_selection 产生的 Replace），插入点正好是每个 Range 的 from 位置，即「选择起点边界插入」场景。根据场景 A，新文本不进入选区——但实际上替换完成后，选区通常需要被精确设置为新文本的范围。
+当编辑操作是「选区替换」（替换范围正好等于选择范围，即 change_by_selection 的典型用法）时，纯 map 推导天然正确：
 
-这就是为什么：
-- **纯 map 推导不够用**：如果仅依赖自动推导，替换后选区可能坍缩或跳过新文本
-- **需要 change_by_and_with_selection**：显式返回新 Range，指定编辑后光标位置
-- **或使用 with_selection**：Transaction 携带最终选择覆盖自动推导结果
+- `from` = 替换起点，AfterSticky + stay_at_gaps → 固定在新文本开头
+- `to` = 替换终点（正好在替换区外），由后续 Retain 映射 → 落在新文本末尾
+- 结果：新选择 `[new_pos, new_pos + s.len())` 正好覆盖新文本 ✓
+
+这解释了为什么 **`change_by_selection` 不需要显式指定选择**也能正确工作——选区替换时 map 推导的结果正好符合预期（选中状态保持，选区自动适配新文本长度）。
+
+#### 6. 纯插入 vs 选区替换的语义差异
+
+同一个「在位置 x 出现新文本」的操作，ChangeSet 结构不同，选择漂移方向完全相反：
+
+| 场景 | 选择行为 | 交互语义 |
+|------|---------|----------|
+| **纯插入**（在光标处输入） | 选区/光标跳到新文本之后 | 「输入字符，光标跟着走」—— 连续输入的直觉 |
+| **选区替换**（选中替换） | 选区包住新文本，保持选中状态 | 「选中内容被替换，仍保持选中」—— 编辑选区的直觉 |
+
+**为什么 Transaction::insert 用 change_by_selection 也能正确工作？**
+
+[transaction.rs:866-870](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L866-L870)
+
+```rust
+pub fn insert(doc: &Rope, selection: &Selection, text: Tendril) -> Self {
+    Self::change_by_selection(doc, selection, |range| {
+        (range.head, range.head, Some(text.clone()))
+    })
+}
+```
+
+`insert` 也是替换（零宽替换 = 插入），替换范围 `[head, head)` 是零宽的。这时：
+- 替换起始点 = head，AfterSticky + stay_at_gaps → 固定为 new_pos
+- 替换终点 = head，也正好是替换起始点（零宽）
+- 但因为是零宽替换，`to` 也是 head...
+
+等等，让我们仔细分析零宽替换：
+- 替换范围 `[head, head)`，old_pos = head, old_len = 0
+- from = head = old_pos，AfterSticky → stay_at_gaps → 固定为 new_pos
+- to = head = old_pos，BeforeSticky → stay_at_gaps？
+
+BeforeSticky 的 stay_at_gaps = true，所以 to = head 也会固定为 new_pos？
+
+那结果 from = to = new_pos，零宽选择，位置在新文本开头？这不对啊...
+
+让我们重新验证。零宽替换（即纯插入）：
+- Insert + Delete(0) = 零宽替换
+- 但代码中 `Delete(len)` 中 len = 0 时... 实际上 Insert 后面跟一个 Delete(0) 是没有意义的。
+
+再看 `change_by_selection` 的实现：当 `from == to` 且 replacement 是 Some 时，生成的是 Insert + Delete(0) 吗？
+
+让我们回到 from_changes 的代码：
+```rust
+Some(text) => {
+    changeset.insert(text);
+    changeset.delete(span);
+}
+```
+
+如果 span.len() == 0（即 from == to），则 delete(0)。而在 update_positions 中，`iter.peek()` 看到 Delete(0) 也会当作替换。
+
+零宽替换时：
+- old_pos = head, old_len = 0
+- from = head = old_pos, AfterSticky, stay_at_gaps = true → new_pos
+- to = head = old_pos, BeforeSticky, stay_at_gaps = true → new_pos
+
+结果 from = to = new_pos？但这和纯 Insert 的行为不同！纯 Insert 时 from = head 映射为 new_pos + s.len()。
+
+等等，这里有个矛盾。让我重新检查...
+
+实际上，`Transaction::insert` 生成的是 Insert（没有后续 Delete 因为 span.len() == 0 ？还是有 Delete(0)？）
+
+让我看 ChangeSet::delete：
+```rust
+fn delete(&mut self, n: usize) {
+    if n == 0 {
+        return;
+    }
+    ...
+}
+```
+
+哦！delete(0) 是 no-op，什么都不做。所以当 span.len() == 0 时，只有 Insert 被添加，没有 Delete。因此：
+- `Transaction::insert` 生成的是纯 Insert，不是替换
+- 所以 `from = head` 按纯 Insert 规则映射 → `new_pos + s.len()`（AfterSticky）
+- 结果正确：光标跳到插入文本之后
+
+这验证了纯插入和零宽替换的区别：零宽替换在实际代码中不会发生，因为 delete(0) 被优化掉了。
+
+**回到语义差异总结**：
+- **纯插入**（光标处输入）：Insert 操作，光标跳到新文本之后 → 符合输入直觉
+- **选区替换**（选中内容替换）：Insert+Delete 操作，选区保持选中状态 → 符合编辑直觉
+- 两者在代码层面是不同的 ChangeSet 结构，导致了不同的边界漂移行为
+- 这就是为什么 `change_by_selection` 既能处理纯插入（零宽范围），又能处理选区替换（非零宽范围），且两者都符合直觉
+
+#### 7. 何时需要显式选择覆盖
+
+虽然选区替换时 map 推导天然正确，但以下场景仍需显式指定 selection：
+
+1. **编辑后需要取消选中**：如删除选区后光标落在开头，而不是保持零宽选择
+2. **编辑范围 ≠ 选择范围**：如在选区开头插入注释符，编辑范围只在起点，不在整个选区
+3. **语义级光标移动**：如换行后光标移到行首缩进位置
+4. **撤销/重做**：需要精确还原编辑前/后的选择状态
+
+这些场景下 `with_selection()` 或 `change_by_and_with_selection()` 提供精确控制，覆盖自动推导结果。
 
 ---
 
@@ -740,7 +910,45 @@ pub fn append_changes_to_history(&mut self, view: &mut View) {
 - 视图 B（另一个分屏）：同样的选择 `[2, 4)`
 - 撤销删除后，视图 A 的选择精确还原为 `[2, 4)`，但视图 B 通过反向 map 可能得到不同结果（如坍缩到 `[2, 2)`）
 
-这是多视图架构的设计权衡：State 结构只存一个 Selection，属于「当前视图」。
+#### 4. 纯插入与选区替换：撤销方向的不对称性
+
+纯插入和选区替换在正向 map 时行为不同，在反向 map（撤销推导）时也有不同的可逆性。
+
+**纯插入的反向（删除）：**
+- 正向：选择 `[2, 5)` + 在位置 2 插入 "ABC" → 新选择 `[5, 8)`（整体后移）
+- 反向操作：删除 `[2, 5)` 的 "ABC"
+- 反向 map 推导：from=5（在删除区内）→ 坍缩到 2；to=8（>5）→ 后移 -3 → 5 → 结果 `[2, 5)` ✓
+- **结论**：纯插入场景下，反向 map 是可逆的
+
+**选区替换的反向（反向替换）：**
+- 正向：选择 `[2, 5)` + 替换 `[2, 5)` 为 "ABC" → 新选择 `[2, 5)`（选区正好覆盖新文本）
+- 反向操作：替换 `[2, 5)` 为原文本（假设原文本也是 3 字符，等长）
+- 反向 map 推导：
+  - from=2，AfterSticky，stay_at_gaps → 固定为 2 ✓
+  - to=5，BeforeSticky，正好在替换区外 → 由后续 Retain 映射 → 5 ✓
+  - 结果 `[2, 5)` ✓（等长替换时可逆）
+
+**选区替换变长的反向（不可逆场景）：**
+- 正向：选择 `[2, 4)`（在替换区内但不等于替换范围）+ 替换 `[1, 6)` 为 "abc"（3 字符，变短）
+- 正向结果：from=4（AfterSticky，不等长）→ 1 + 3 = 4；to=1（BeforeSticky，替换起始点，stay_at_gaps）→ 1
+- 新选择：`[4, 1)`（即反向选择 `[1, 4)`）
+- 反向操作：替换 `[1, 4)` 为原 5 个字符
+- 反向 map 推导：
+  - from=4（反向选择的 from = 原 to = 1？不对，方向已反转）
+  - 让我们重新理：新选择是 `[1, 4)`（正向选择），from=1, to=4
+  - 反向替换 `[1, 4)` → 原 5 字符，替换后位置 1 之后有 5 个新字符
+  - from=1，AfterSticky，stay_at_gaps → 固定为 1 ✓（正好是原 from？不，原 from 是 2）
+  - to=4，BeforeSticky，在替换区内（< 1+3=4？不，old_len 是 3 字符 "abc"，替换区是 `[1, 4)`）
+  - to=4 正好在替换区外 → 由后续 Retain 映射 → 1 + 5 = 6
+  - 反向 map 结果：`[1, 6)`
+  - 原始选择：`[2, 4)` ✗ 不匹配
+
+**核心问题**：当选择范围与替换范围不完全重合时，
+- 正向 map 中，选择起点/终点如果正好落在替换边界上，stay_at_gaps 会把它固定在边界
+- 但原始选择的起点/终点可能在替换区域内部，只是正向映射后落到了边界上
+- 反向 map 无法区分「本来就在边界上」和「从内部映射到边界上」两种情况
+
+**这进一步证明了保存原始 Selection 快照的必要性**——即使是看似简单的替换操作，由于边界规则和方向的不对称性，反向 map 也无法保证还原原始选择。
 
 ---
 
