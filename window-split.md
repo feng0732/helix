@@ -134,46 +134,228 @@ fn split(editor: &mut Editor, action: Action) {
 
 **文件**: [tree.rs](file:///d:/fz/0601/solo-dogfeeding/code/273-helix/helix-view/src/tree.rs#L355-L442)
 
-布局计算使用**栈式深度优先遍历**：
+布局计算使用**栈式深度优先遍历**，从根容器开始，自上而下为每个节点分配屏幕区域。
+
+### 水平分割（Layout::Horizontal，上下排列）
 
 ```rust
-pub fn recalculate(&mut self) {
-    self.stack.push((self.root, self.area));
-
-    while let Some((key, area)) = self.stack.pop() {
-        match &mut node.content {
-            Content::View(view) => {
-                view.area = area;  // 叶子节点直接分配区域
-            }
-            Content::Container(container) => {
-                container.area = area;
-                // 根据布局方向计算子节点区域
-                match container.layout {
-                    Layout::Horizontal => { /* 上下均分高度 */ },
-                    Layout::Vertical => { /* 左右均分宽度 */ },
-                }
-                // 将子节点压入栈继续处理
-            }
+Layout::Horizontal => {
+    let len = container.children.len();
+    let height = area.height / len as u16;
+    let mut child_y = area.y;
+    for (i, child) in container.children.iter().enumerate() {
+        let mut area = Rect::new(container.area.x, child_y, container.area.width, height);
+        child_y += height;   // 无间隔！直接累加高度
+        if i == len - 1 {
+            area.height = container.area.y + container.area.height - area.y;
         }
+        self.stack.push((*child, area));
     }
 }
 ```
 
-**垂直分割细节**:
-- 子视图之间有 1px 间隔（`inner_gap = 1`）
-- 最后一个子视图占用剩余宽度（处理整除余数）
-- 总间隔 = `inner_gap * (len - 1)`
+**水平分割要点**：
+- **无间隔**（没有 inner_gap）
+- 高度 = 容器高度 / 子视图数（整除）
+- 每个子视图 x 坐标相同，y 依次累加高度
+- **最后一个子视图**：`height = 容器底部 - 当前 y**（补全整除余数）
 
-**水平分割细节**:
-- 子视图高度均分
-- 最后一个子视图占用剩余高度
+例：容器高 80，3 个视图
+- height = 80/3 = 26
+- 视图0：y=0, h=26；视图1：y=26, h=26；视图2：y=52, h=80-52=**28**
+- 总高度 = 26 + 26 + 28 = 80 ✓
 
-**触发 recalculate 的时机**:
-1. `insert` — 插入新视图
-2. `split` — 拆分视图
-3. `remove` — 移除视图
+---
+
+### 垂直分割（Layout::Vertical，左右排列）
+
+垂直分割的间隔计算比较**不直观**，需要仔细分析。核心代码如下：
+
+```rust
+Layout::Vertical => {
+    let len = container.children.len();
+    let len_u16 = len as u16;
+
+    let inner_gap = 1u16;
+    let total_gap = inner_gap * len_u16.saturating_sub(2);  // ⚠️ 关键：是 len-2，不是 len-1
+
+    let used_area = area.width.saturating_sub(total_gap);
+    let width = used_area / len_u16;
+
+    let mut child_x = area.x;
+
+    for (i, child) in container.children.iter().enumerate() {
+        let mut area = Rect::new(child_x, container.area.y, width, container.area.height);
+        child_x += width + inner_gap;   // 每个视图之后都 +1（包括最后一个！）
+
+        if i == len - 1 {
+            // ⚠️ 最后一个视图的 width 被强制修正
+            area.width = container.area.x + container.area.width - area.x;
+        }
+
+        self.stack.push((*child, area));
+    }
+}
+```
+
+#### 关键设计解析
+
+**1. 为什么是 `len-2` 而不是 `len-1`？**
+
+直觉上 N 个视图左右相邻应该有 **N-1 个 gap**。但代码中 `total_gap = len-2`，这是因为：
+
+- 循环中 `child_x += width + inner_gap` **对每个子视图（包括最后一个）都加了 `inner_gap`**
+- 然而最后一个子视图的 width **之后会被强制修正**为"容器右端 - 当前x"
+- 这意味着**最后一个 gap 的 1px 空间被最后一个视图"吃掉"了**
+- 所以在计算基础宽度时，只需要扣除 `len-2` 个 gap 的空间
+
+**2. 完整的宽度计算流程**
+
+步骤说明（以容器宽度 W、N 个视图为例）：
+1. `total_gap = 1 * (N - 2)` &nbsp;&nbsp;—— 预扣 N-2 个间隔
+2. `used_area = W - (N-2)` &nbsp;&nbsp;—— 剩余可用宽度
+3. `base_width = used_area / N` &nbsp;&nbsp;—— 每个视图的基础宽度（整除）
+4. 循环分配：
+   - 前 N-1 个视图：宽度 = base_width，下一个视图的 x = 当前x + base_width + **1**
+   - 最后一个视图：**width = 容器右端 - 当前x**（覆盖掉原本的 gap 空间）
+5. 结果：实际存在 **N-1 个间隔**（前 N-1 个视图之后各有 1px gap，最后一个没有），最后一个视图宽度 = base_width + 余数 + **1**（吸收掉最后一个 gap）
+
+#### 数值验证（测试用例 1）
+
+**测试名**：`all_vertical_views_have_same_width`
+- 容器总宽：**180**，视图数：**3**
+- total_gap = 1 × (3-2) = 1
+- used_area = 180 - 1 = **179**
+- base_width = 179 / 3 = **59**
+
+循环过程：
+
+- **i=0（第1个视图）**：
+  - x = 0，width = 59
+  - child_x = 0 + 59 + 1 = **60**
+  - 范围：[0, 59]，gap 位于 x=59
+
+- **i=1（第2个视图）**：
+  - x = 60，width = 59
+  - child_x = 60 + 59 + 1 = **120**
+  - 范围：[60, 119]，gap 位于 x=119
+
+- **i=2（第3个视图，最后一个）**：
+  - x = 120
+  - **强制修正**：width = 180 - 120 = **60**
+  - 范围：[120, 179]
+
+**最终宽度**：[59, 59, 60]
+**总占用验证**：59（视图0）+ 1（gap0）+ 59（视图1）+ 1（gap1）+ 60（视图2）= 180 ✓
+**实际 gap 数**：2 个 = 3-1 ✓（total_gap 只预扣了 1 个，因为最后 1 个 gap 被视图 2 的修正宽度吸收了）
+
+与测试断言完全一致：
+```rust
+vec![180/3 - 1, 180/3 - 1, 180/3]  // [59, 59, 60] ✓
+```
+
+---
+
+#### 数值验证（测试用例 2）
+
+**测试名**：`vsplit_gap_rounding`
+- 容器总宽：**80**，视图数：**10**
+- total_gap = 1 × (10-2) = **8**
+- used_area = 80 - 8 = **72**
+- base_width = 72 / 10 = **7**
+
+循环过程（前 9 个视图）：
+- 每个视图 width = 7
+- 每次 child_x 增加 7+1 = 8
+- 9 次之后 child_x = 9 × 8 = **72**
+
+第 10 个视图（i=9，最后一个）：
+- x = 72
+- **强制修正**：width = 80 - 72 = **8**
+
+**最终宽度**：9 个 7 + 1 个 8 = [7,7,7,7,7,7,7,7,7, 8]
+**总占用验证**：
+- 视图宽度合计：9×7 + 8 = 71
+- gap 合计：9 个 × 1 = 9
+- 总计：71 + 9 = 80 ✓
+
+与测试断言一致：
+```rust
+std::iter::repeat_n(7, 9).chain(Some(8))  // ✓
+```
+
+---
+
+### 拆分后的尺寸变化（逐步场景）
+
+以容器总宽 180px 为例，观察每次 vsplit（垂直拆分）后各视图宽度的变化：
+
+| 阶段 | 视图数 N | total_gap(N-2) | used_area | base_width | 各视图实际宽度 | 实际 gap 数 |
+|------|---------|---------------|-----------|-----------|----------------|------------|
+| 初始 | 1 | 0（saturating_sub） | 180 | 180 | [180] | 0 |
+| 第1次 vsplit | 2 | 0 | 180 | 90 | [90, 89] | 1 |
+| 第2次 vsplit | 3 | 1 | 179 | 59 | [59, 59, 60] | 2 |
+| 第3次 vsplit | 4 | 2 | 178 | 44 | [44, 44, 44, 45] | 3 |
+
+**逐阶段说明**：
+
+**N=1**（初始单视图）：
+- total_gap = 1.saturating_sub(2) = 0
+- base_width = 180 / 1 = 180
+- 最后一个（也是唯一）视图被修正为 width = 180 - 0 = **180**
+- 无 gap
+
+**N=2**（第一次垂直拆分）：
+- total_gap = 2 - 2 = 0
+- base_width = 180 / 2 = 90
+- 视图0：x=0, w=90 → child_x=91
+- 视图1（最后）：x=91, w=180-91 = **89**
+- 实际宽度：[90, 89]，1 个 gap（在 x=90）
+- 验证：90 + 1 + 89 = 180 ✓
+- ⚠️ 注意：这里不是 [90, 90]！因为第一个 gap（在视图0之后）的 1px 被视图1的修正"吃"掉了 1px，所以视图1是 89
+
+**N=3**（第二次垂直拆分）：
+- total_gap = 3 - 2 = 1
+- base_width = (180-1)/3 = 59
+- 视图0：w=59, x=0→60
+- 视图1：w=59, x=60→120
+- 视图2（最后）：x=120, w=60
+- 实际宽度：[59, 59, 60]，2 个 gap
+- 59+1+59+1+60 = 180 ✓
+
+**N=4**（第三次垂直拆分）：
+- total_gap = 4 - 2 = 2
+- base_width = (180-2)/4 = 178/4 = **44**
+- 视图0：w=44, x=0 → child_x = 45
+- 视图1：w=44, x=45 → child_x = 90
+- 视图2：w=44, x=90 → child_x = 135
+- 视图3（最后）：x=135, w = 180-135 = **45**
+- 实际宽度：[44, 44, 44, 45]，3 个 gap
+- 44+1+44+1+44+1+45 = 180 ✓
+
+---
+
+### 两种布局的对比
+
+| 特性 | 水平分割 (Horizontal) | 垂直分割 (Vertical) |
+|------|----------------------|---------------------|
+| 排列方向 | 上下堆叠 | 左右并排 |
+| 分配维度 | 高度 | 宽度 |
+| 间隔 inner_gap | **无**（0） | **有**（1px） |
+| gap 预扣公式 | 无 | N-2 个 |
+| 基础尺寸公式 | height / N | (W - (N-2)) / N |
+| 最后一个处理 | 补全高度余数 | 补全宽度余数 + 吸收最后 1 个 gap |
+
+---
+
+### 触发 recalculate 的时机
+
+1. `insert` — 在当前焦点后插入新视图
+2. `split` — 拆分视图（水平或垂直）
+3. `remove` — 移除视图（可能触发容器合并）
 4. `resize` — 窗口大小变化
-5. `transpose` — 转置布局方向
+5. `transpose` — 转置父容器布局方向（Horizontal ↔ Vertical）
+6. `swap_split_in_direction` — 与相邻视图交换位置（交换 area）
 
 ---
 
