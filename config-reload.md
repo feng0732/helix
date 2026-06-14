@@ -260,7 +260,7 @@ Document 实例私有字段
 | 文档私有字段 | reload 时是否更新 | 调用的函数 |
 |-------------|------------------|-----------|
 | `language_config` | ✅ 更新 | `detect_language(&lang_loader)` |
-| `editor_config` | ✅ 更新 | `detect_editor_config()` |
+| `editor_config` | ⚠️ 条件更新 | `detect_editor_config()`：仅当 `editor.editor_config = true` 时重新检测；为 `false` 时不清空旧缓存 |
 | `indent_style` | ❌ **不更新** | ❌ 不调用 `detect_indent_and_line_ending()` |
 | `line_ending` | ❌ **不更新** | ❌ 不调用 `detect_indent_and_line_ending()` |
 | `language_servers`（已连接的 LS 进程） | ❌ **不重启** | ❌ 不调用 `refresh_language_servers()` |
@@ -270,8 +270,13 @@ Document 实例私有字段
 > - `refresh_doc_language()` 时 [helix-view/src/editor.rs#L1721](helix-view/src/editor.rs#L1721)
 > - `reload_from_disk()` 时 [helix-view/src/document.rs#L1298](helix-view/src/document.rs#L1298)
 > - 手动 `:language` 命令时 [helix-term/src/commands/typed.rs#L2329](helix-term/src/commands/typed.rs#L2329)
->
+> 
 > 但 `:config-reload` 路径中**不包含**上述调用。
+> 
+> **关于 `editor_config` 开关的重要说明**：
+> - `detect_editor_config()` 在 [helix-view/src/document.rs#L1233-L1239](helix-view/src/document.rs#L1233-L1239) 中定义：开关为 `true` 时重新检测，为 `false` 时 **什么都不做（不清空缓存）**
+> - 保存文件时，`insert_final_newline()` 和 `trim_trailing_whitespace()` 方法 [helix-view/src/document.rs#L2017-L2027](helix-view/src/document.rs#L2017-L2027) **直接读取缓存值，不检查开关**
+> - 因此：开关关闭后，已缓存的 EditorConfig 值仍会影响保存行为，`:config-reload` 无法清除，必须重开文档
 
 ### 4.4 生效边界总表
 
@@ -290,7 +295,7 @@ Document 实例私有字段
 | 单词补全开关 | `editor.word_completion.enable` | `ConfigDidChange` hook 重建/清空索引 |
 | LSP 文档高亮 | `editor.lsp.auto_document_highlight` | `ConfigDidChange` hook 请求/清除高亮 |
 | 语言配置 | `[[language]]` 所有项 | 重建 `syn_loader`，`detect_language()` 重新识别 |
-| EditorConfig | `.editorconfig` 文件变更 | `detect_editor_config()` 重扫祖先目录 |
+| EditorConfig | `.editorconfig` 文件变更 | `detect_editor_config()` 重扫祖先目录（仅当 `editor.editor_config = true` 时） |
 
 #### ⚠️ 部分生效（需注意副作用）
 
@@ -302,7 +307,7 @@ Document 实例私有字段
 | `editor.shell` | 只影响后续执行的 shell 命令 | 已运行的 `:sh` 终端不受影响 |
 | `editor.workspace_lsp_roots` | 只影响后续 LSP root_uri 计算 | 重启 LS 才能改变已建立会话的根 |
 | `editor.insecure`（信任） | reload 时重新判定，仅影响 config.toml/languages.toml 加载 | 变为信任时系统会自动触发 Refresh |
-| `editor.editor_config`（总开关） | 若关闭，已检测到的 `Document.editor_config` 仍保留 | 关闭后对**新打开**文档生效，已打开文档需 `:config-reload` 重置 |
+| `editor.editor_config`（总开关） | 开关关闭后：① `:config-reload` **不会清空**已打开文档的 `Document.editor_config` 缓存；② 缓存值**仍会继续影响保存行为**（`insert_final_newline` / `trim_trailing_whitespace` 直接读缓存，不检查开关）；③ 仅对**新打开**文档才会初始化为空值 | 关闭后需重开文档才能完全清除 EditorConfig 影响，`:config-reload` 无法重置已打开文档的缓存 |
 | 文档 `indent_style` / `line_ending` | `:config-reload` 不会重新检测，保持原值 | 如需更新，手动调用 `:language` 或重开文档 |
 | 已连接的 LSP 会话 | 不会重启，新的 LS 配置参数不生效 | `:lsp-restart` |
 
@@ -347,6 +352,6 @@ Document 实例私有字段
 
 3. **原子替换 + 部分更新风险**：`ArcSwap` 保证了 Config 读取的原子性，但中间步骤中只有 `terminal.reconfigure()` 失败时才会出现不一致——此时 `syn_loader`、主题、文档级配置已更新，但全局 `Config` 的 ArcSwap 尚未写入。
 
-4. **文档级配置惰性保留**：`indent_style` 和 `line_ending` 一旦检测完成就不随 `:config-reload` 重置，避免打扰用户的编辑状态。
+4. **文档级配置惰性保留**：`indent_style`、`line_ending` 一旦检测完成就不随 `:config-reload` 重置；`editor_config` 缓存也不会因总开关关闭而被清空，且仍会继续影响保存行为（`insert_final_newline` / `trim_trailing_whitespace`），需重开文档才能完全清除。
 
 5. **LSP 配置不联动**：已建立的 LSP 会话不会因配置变更而重启或收到通知，保持了编辑会话的稳定性，但也意味着 LS 配置变更需要手动干预。
