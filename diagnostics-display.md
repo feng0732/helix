@@ -419,13 +419,24 @@ pub fn immediately_show_diagnostic(&self, doc: &Document, view: ViewId) {
 
 #### 4.5.1 调用场景
 
-| 命令 | 快捷键 | 代码位置 |
-|------|--------|----------|
-| `goto_first_diag` | `[d` | [commands.rs#L4115-L4124](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4115-L4124) |
-| `goto_last_diag` | `]d` | [commands.rs#L4127-L4136](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4127-L4136) |
-| `goto_next_diag` | `]d` | [commands.rs#L4139-L4160](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4139-L4160) |
-| `goto_prev_diag` | `[d` | [commands.rs#L4166-L4190](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4166-L4190) |
-| diagnostics picker 选择 | `space-d` | [lsp.rs#L301-L305](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands/lsp.rs#L301-L305) |
+**快捷键绑定**定义在 [keymap/default.rs](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/keymap/default.rs#L111-L128) 和 [keymap/default.rs](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/keymap/default.rs#L229-L235)：
+
+```
+左括号前缀 [   右括号前缀 ]   空格前缀 space
+  [d → prev        ]d → next       space d → 当前文档诊断
+  [D → first       ]D → last       space D → 工作区诊断
+```
+
+| 命令 | 快捷键 | 动作 | 代码位置 |
+|------|--------|------|----------|
+| `goto_prev_diag` | `[d`（小写 d） | 跳到光标前的上一个诊断 | [commands.rs#L4166-L4190](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4166-L4190) |
+| `goto_next_diag` | `]d`（小写 d） | 跳到光标后的下一个诊断 | [commands.rs#L4139-L4160](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4139-L4160) |
+| `goto_first_diag` | `[D`（大写 D = Shift+D） | 跳到文档第一个诊断 | [commands.rs#L4115-L4124](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4115-L4124) |
+| `goto_last_diag` | `]D`（大写 D = Shift+D） | 跳到文档最后一个诊断 | [commands.rs#L4127-L4136](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4127-L4136) |
+| diagnostics picker（当前文档） | `space d`（小写 d） | 打开 picker，选择后跳转 | [lsp.rs#L569-L576](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands/lsp.rs#L569-L576) |
+| workspace diagnostics picker | `space D`（大写 D） | 打开 picker，选择后跳转 | [lsp.rs#L578-L583](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands/lsp.rs#L578-L583) |
+
+**注意**：两个 diagnostics picker 最终都调用同一个 `diag_picker` 函数，其回调中都调用了 `immediately_show_diagnostic`（见 [lsp.rs#L301-L305](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands/lsp.rs#L301-L305)）。
 
 #### 4.5.2 完整路径（以 `goto_next_diag` 为例）
 
@@ -433,49 +444,75 @@ pub fn immediately_show_diagnostic(&self, doc: &Document, view: ViewId) {
 用户按 ]d 触发 goto_next_diag
     │
     ▼
-1. 查找下一个诊断
+1. 查找下一个诊断（commands.rs#L4148-L4151）
    let diag = doc.diagnostics().iter()
        .find(|diag| diag.range.start > cursor_pos);
+   └─ 依赖 doc.diagnostics 已按 range 排序（replace_diagnostics 保证）
     │
     ▼
-2. 移动光标到诊断位置
-   let selection = Selection::single(diag.range.start, diag.range.end);
+2. 推入跳转栈 + 移动光标（commands.rs#L4152-L4158）
+   push_jump(view, doc);
    doc.set_selection(view.id, selection);
+   │
+   └─ set_selection 内部会 dispatch SelectionDidChange 事件
+      （document.rs#L1385），但该事件不触发诊断刷新
     │
     ▼
-3. 跳过 350ms 延迟，立即显示
+3. 调用 immediately_show_diagnostic（commands.rs#L4159-L4160）
    view.diagnostics_handler.immediately_show_diagnostic(doc, view.id);
    │
-   ├─ last_doc = doc.id()        ← 记录当前文档
-   ├─ last_cursor_line = new_line ← 记录新行号
-   └─ active_generation = generation ← 强制相等，跳过延迟
+   ├─ last_doc = doc.id()            ← 记录当前文档
+   ├─ last_cursor_line = new_line    ← 记录新行号
+   └─ active_generation = generation ← 强制相等，跳过 350ms 延迟
     │
     ▼
-4. 下一帧渲染（EditorView::render）
+4. 下一帧渲染（EditorView::render，editor.rs#L197-L199）
    let enable_cursor_line = view.diagnostics_handler
        .show_cursorline_diagnostics(doc, view.id);
    │
-   ├─ active == true（非 Insert 模式）
-   ├─ last_cursor_line == cursor_line → 匹配
-   ├─ last_doc == doc.id() → 匹配
-   └─ generation == active_generation → 相等，返回 true
+   ├─ active == true（非 Insert 模式时）
+   ├─ last_cursor_line == cursor_line → 匹配（步骤 3 已更新）
+   ├─ last_doc == doc.id() → 匹配（步骤 3 已更新）
+   └─ generation == active_generation → 相等（步骤 3 已强制相等），返回 true
     │
     ▼
-5. 准备 inline 配置（enable_cursor_line=true）
+5. 准备 inline 配置（editor.rs#L200）
    let inline_diagnostic_config = config.inline_diagnostics
        .prepare(width, enable_cursor_line=true);
    │
-   └─ enable_cursor_line=true → cursor_line 不降级，使用原配置
+   └─ enable_cursor_line=true → cursor_line 配置不降级，使用原 Enable(Warning)
     │
     ▼
-6. InlineDiagnostics 正常绘制
-   render_virt_lines 中：
-   ├─ filter = cursor_line filter（Enable(Warning)）
-   ├─ compute_line_diagnostics 保留 severity >= Warning 的诊断
-   └─ draw_diagnostics 绘制行下诊断文本
+6. 创建 InlineDiagnostics 装饰器（editor.rs#L201-L207）
+   decorations.add_decoration(InlineDiagnostics::new(
+       doc, theme, primary_cursor,
+       inline_diagnostic_config,  // 含 Enable(Warning)
+       config.end_of_line_diagnostics,  // Enable(Hint)
+   ));
+    │
+    ▼
+7. InlineDiagnostics 渲染（render_virt_lines）
+   ├─ compute_line_diagnostics：filter=Enable(Warning)
+   │   └─ stack 保留 severity >= Warning 的诊断
+   ├─ EOL 诊断：severity 在 [Hint, Warning) 区间 → Hint/Info 显示在本行尾
+   └─ draw_diagnostics：Warning/Error 显示在行下方，带 Box-drawing 连接线
 ```
 
-#### 4.5.3 与普通光标移动的对比
+#### 4.5.3 四个跳转命令的差异
+
+| 命令 | 诊断查找方式 | Selection 方向 | 是否使用 apply_motion |
+|------|-------------|---------------|----------------------|
+| goto_first_diag | `doc.diagnostics().first()` | 正向（start→end） | ❌ 直接执行 |
+| goto_last_diag | `doc.diagnostics().last()` | 正向（start→end） | ❌ 直接执行 |
+| goto_next_diag | `.find(\|d\| d.range.start > cursor)` 正向查找 | 正向（start→end） | ✅ apply_motion |
+| goto_prev_diag | `.rev().find(\|d\| d.range.start < cursor)` 反向查找 | 反向（end→start，光标落在 range.end） | ✅ apply_motion |
+
+**设计意图**：
+- `first/last` 是绝对定位，不需要 motion 语义
+- `next/prev` 是相对移动，使用 `apply_motion` 以便与其他 motion 行为一致（如扩展选择等）
+- `prev` 的 selection 为反向 `(end, start)`，确保光标落在 range 的 end 位置（上一个诊断的末尾），再次按 `[d` 不会重复命中同一诊断
+
+#### 4.5.4 与普通光标移动的对比
 
 | 步骤 | 普通光标移动 | 诊断跳转（immediately_show） |
 |------|-------------|-----------------------------|
