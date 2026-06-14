@@ -48,13 +48,22 @@
               语言服务器进程 (stdin/stdout)
 ```
 
+涉及的主要文件：
+- `helix-lsp/src/client.rs` — LSP 客户端核心实现
+- `helix-lsp/src/transport.rs` — 传输层与 JSON-RPC 消息收发
+- `helix-lsp/src/jsonrpc.rs` — JSON-RPC 协议类型定义
+- `helix-lsp/src/lib.rs` — 多客户端注册表 Registry
+- `helix-view/src/handlers/lsp.rs` — LSP 事件处理与状态维护
+- `helix-term/src/application.rs` — 主事件循环与消息分发
+- `helix-term/src/commands/lsp.rs` — 用户层 LSP 命令
+
 ---
 
 ## 二、连接建立流程
 
 ### 2.1 启动入口
 
-[lib.rs::start_client](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/lib.rs#L895-L973)
+文件：`helix-lsp/src/lib.rs`，函数 `start_client`，第 895-973 行
 
 ```
 用户打开文档 → Registry::get() → start_client()
@@ -67,8 +76,9 @@
 
 ### 2.2 进程启动
 
-[client.rs::Client::start](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/client.rs#L209-L271)
+文件：`helix-lsp/src/client.rs`，函数 `Client::start`，第 209-271 行
 
+函数签名：
 ```rust
 pub fn start(...) -> Result<(Self, UnboundedReceiver<(LanguageServerId, Call)>, Arc<Notify>)>
 ```
@@ -117,7 +127,7 @@ pub fn start(...) -> Result<(Self, UnboundedReceiver<(LanguageServerId, Call)>, 
 
 ### 2.3 传输层启动
 
-[transport.rs::Transport::start](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/transport.rs#L50-L88)
+文件：`helix-lsp/src/transport.rs`，函数 `Transport::start`，第 50-88 行
 
 启动 **三个独立的异步任务**：
 
@@ -132,7 +142,7 @@ pub fn start(...) -> Result<(Self, UnboundedReceiver<(LanguageServerId, Call)>, 
      └─────────┘  └─────────┘  └─────────┘
 ```
 
-**recv 任务** — [transport.rs::recv](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/transport.rs#L255-L321)
+**recv 任务** — 文件 `helix-lsp/src/transport.rs`，第 255-321 行
 
 - 循环读取 LSP 消息头（Content-Length 协议）
 - 解析 JSON-RPC 消息
@@ -146,7 +156,7 @@ Content-Length: 123\r\n
 <JSON body>
 ```
 
-**send 任务** — [transport.rs::send](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/transport.rs#L338-L441)
+**send 任务** — 文件 `helix-lsp/src/transport.rs`，第 338-441 行
 
 - 从 `client_rx` 接收 Payload：
   - `Payload::Request { chan, value }`
@@ -159,13 +169,13 @@ Content-Length: 123\r\n
   - 其他请求缓存到 `pending_messages: Vec<Payload>`
   - `initialize_notify` 触发后，一次性发送所有排队消息
 
-**err 任务** — [transport.rs::err](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/transport.rs#L323-L336)
+**err 任务** — 文件 `helix-lsp/src/transport.rs`，第 323-336 行
 
 - 读取 stderr 并打印日志
 
 ### 2.4 异步初始化
 
-[lib.rs::start_client](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/lib.rs#L948-L970)
+文件：`helix-lsp/src/lib.rs`，第 948-970 行
 
 ```rust
 tokio::spawn(async move {
@@ -183,7 +193,7 @@ tokio::spawn(async move {
 });
 ```
 
-**initialize 请求** — [client.rs::initialize](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/client.rs#L569-L773)
+**initialize 请求** — 文件 `helix-lsp/src/client.rs`，函数 `initialize`，第 569-773 行
 
 发送客户端能力声明：
 - workspace 能力（workspace_folders, apply_edit, file_operations 等）
@@ -201,12 +211,12 @@ tokio::spawn(async move {
 
 **示例：goto_definition**
 
-1. **命令层**：commands/lsp.rs
+1. **命令层**：`helix-term/src/commands/lsp.rs`
    ```rust
    // 用户按 gd → 调用 language_server.goto_definition(...)
    ```
 
-2. **客户端层** — [client.rs::goto_definition](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/client.rs#L1448-L1467)
+2. **客户端层** — 文件 `helix-lsp/src/client.rs`，函数 `goto_definition`，第 1448-1467 行
    ```rust
    pub fn goto_definition(...) -> Option<impl Future<Output = Result<Option<lsp::GotoDefinitionResponse>>>> {
        // capability 检查
@@ -214,7 +224,7 @@ tokio::spawn(async move {
    }
    ```
 
-3. **通用请求方法** — [client.rs::call](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/client.rs#L437-L499)
+3. **通用请求方法** — 文件 `helix-lsp/src/client.rs`，函数 `call`，第 437-499 行
 
    ```rust
    fn call<R: lsp::request::Request>(&self, params: R::Params) -> impl Future<Output = Result<R::Result>>
@@ -238,7 +248,7 @@ tokio::spawn(async move {
 4. 返回 Future: 等待 rx.recv() + timeout
 ```
 
-**pending_requests 映射** — [transport.rs::send_payload_to_server](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/transport.rs#L160-L179)
+**pending_requests 映射** — 文件 `helix-lsp/src/transport.rs`，函数 `send_payload_to_server`，第 160-179 行
 
 ```rust
 // 请求发送时注册
@@ -248,7 +258,7 @@ self.pending_requests
     .insert(value.id.clone(), chan);
 ```
 
-**响应匹配** — [transport.rs::process_request_response](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/transport.rs#L223-L253)
+**响应匹配** — 文件 `helix-lsp/src/transport.rs`，函数 `process_request_response`，第 223-253 行
 
 ```rust
 // 收到 ServerMessage::Output 时：
@@ -275,7 +285,7 @@ match msg {
 }
 ```
 
-**2. Registry 聚合** — [lib.rs::Registry](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/lib.rs#L581-L587)
+**2. Registry 聚合** — 文件 `helix-lsp/src/lib.rs`，结构体 `Registry`，第 581-587 行
 
 ```rust
 pub struct Registry {
@@ -287,7 +297,7 @@ pub struct Registry {
 
 所有 LSP 客户端的 incoming receiver 被 `select_all` 合并到一个流中。
 
-**3. 主事件循环** — [editor.rs::wait_event](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-view/src/editor.rs#L2389-L2390)
+**3. 主事件循环** — 文件 `helix-view/src/editor.rs`，函数 `wait_event`，第 2389-2390 行
 
 ```rust
 tokio::select! {
@@ -297,7 +307,7 @@ tokio::select! {
 }
 ```
 
-**4. 应用层分发** — [application.rs::handle_language_server_message](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-term/src/application.rs#L762-L954)
+**4. 应用层分发** — 文件 `helix-term/src/application.rs`，函数 `handle_language_server_message`，第 762-954 行
 
 ```rust
 match call {
@@ -333,7 +343,7 @@ match call {
 
 ### 4.1 Client 状态字段
 
-[client.rs::Client](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/client.rs#L56-L71)
+文件：`helix-lsp/src/client.rs`，结构体 `Client`，第 56-71 行
 
 | 字段 | 类型 | 用途 |
 |------|------|------|
@@ -353,7 +363,7 @@ match call {
 
 ### 4.2 Transport 状态
 
-[transport.rs::Transport](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/transport.rs#L43-L47)
+文件：`helix-lsp/src/transport.rs`，结构体 `Transport`，第 43-47 行
 
 | 字段 | 类型 | 用途 |
 |------|------|------|
@@ -410,7 +420,7 @@ match call {
 
 ### 4.4 文档生命周期状态
 
-通过事件钩子维护：[handlers/lsp.rs::register_hooks](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-view/src/handlers/lsp.rs#L386-L430)
+通过事件钩子维护：文件 `helix-view/src/handlers/lsp.rs`，函数 `register_hooks`，第 386-430 行
 
 ```
 DocumentDidOpen → text_document_did_open
@@ -418,7 +428,7 @@ DocumentDidChange → text_document_did_change
 DocumentDidClose → text_document_did_close
 ```
 
-**text_document_did_change** — [client.rs::text_document_did_change](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/client.rs#L1054-L1097)
+**text_document_did_change** — 文件 `helix-lsp/src/client.rs`，函数 `text_document_did_change`，第 1054-1097 行
 
 根据服务器能力选择同步策略：
 - `TextDocumentSyncKind::FULL` → 发送完整文档
@@ -433,7 +443,7 @@ DocumentDidClose → text_document_did_close
 
 初始化阶段有两层丢弃逻辑：传输层和应用层。
 
-**传输层丢弃** — [transport.rs::send](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/transport.rs#L413-L425)
+**传输层丢弃** — 文件 `helix-lsp/src/transport.rs`，第 413-425 行
 
 ```rust
 // send 任务中
@@ -468,7 +478,7 @@ msg = client_rx.recv() => {
 | 其他 Notification | 直接丢弃（continue） |
 | 其他 Request | 入队 `pending_messages` |
 
-**应用层检查** — [application.rs::handle_language_server_message](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-term/src/application.rs#L822-L826)
+**应用层检查** — 文件 `helix-term/src/application.rs`，第 822-826 行
 
 即使通知通过了传输层，应用层也会做额外检查：
 ```rust
@@ -480,7 +490,7 @@ if !language_server.is_initialized() {
 }
 ```
 
-**内部注入的 Initialized 通知** — [transport.rs::send](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/transport.rs#L387-L400)
+**内部注入的 Initialized 通知** — 文件 `helix-lsp/src/transport.rs`，第 387-400 行
 
 `initialize_notify` 被触发时，传输层会"注入"一个 `initialized` 通知到 client_tx，模拟从服务器收到了 initialized 通知，以触发应用层的初始化后逻辑：
 
@@ -500,7 +510,7 @@ transport.process_server_message(&client_tx, notification, language_server_name)
 
 **路径 1：正常关闭（客户端主动）**
 
-[lib.rs::Registry::stop](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/lib.rs#L692-L707)
+文件：`helix-lsp/src/lib.rs`，函数 `Registry::stop`，第 692-707 行
 
 ```
 用户执行 :lsp-stop
@@ -511,7 +521,7 @@ transport.process_server_message(&client_tx, notification, language_server_name)
       → tokio::spawn(async { client.force_shutdown().await })
 ```
 
-[client.rs::force_shutdown](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/client.rs#L792-L798)
+文件：`helix-lsp/src/client.rs`，函数 `force_shutdown`，第 792-798 行
 ```rust
 pub async fn force_shutdown(&self) -> Result<()> {
     if let Err(e) = self.shutdown().await {
@@ -524,7 +534,7 @@ pub async fn force_shutdown(&self) -> Result<()> {
 
 **路径 2：服务器异常退出**
 
-[transport.rs::recv](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/transport.rs#L283-L317)
+文件：`helix-lsp/src/transport.rs`，第 283-317 行
 
 ```
 stdout 读取到 EOF → Error::StreamClosed
@@ -536,7 +546,7 @@ stdout 读取到 EOF → Error::StreamClosed
 
 **路径 3：未初始化时关闭**
 
-[transport.rs::send](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/transport.rs#L415-L417)
+文件：`helix-lsp/src/transport.rs`，第 415-417 行
 
 ```
 is_pending && is_shutdown(&msg)
@@ -544,7 +554,7 @@ is_pending && is_shutdown(&msg)
   → break （直接结束 send 任务）
 ```
 
-**应用层清理** — [application.rs::handle_language_server_message](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-term/src/application.rs#L927-L953)
+**应用层清理** — 文件 `helix-term/src/application.rs`，第 927-953 行
 
 收到 `Notification::Exit` 时：
 1. 设置状态栏消息
@@ -556,7 +566,7 @@ is_pending && is_shutdown(&msg)
 
 ### 5.3 多工作区管理
 
-**核心逻辑** — [client.rs::try_add_doc](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/client.rs#L74-L156)
+**核心逻辑** — 文件 `helix-lsp/src/client.rs`，函数 `try_add_doc`，第 74-156 行
 
 ```
 打开新文档 → 计算文档的 root
@@ -589,7 +599,7 @@ try_add_doc
             └─ 不支持 → return false（需要新 Client）
 ```
 
-**添加工作区目录** — [client.rs::add_workspace_folder](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/client.rs#L158-L183)
+**添加工作区目录** — 文件 `helix-lsp/src/client.rs`，函数 `add_workspace_folder`，第 158-183 行
 
 ```rust
 fn add_workspace_folder(&self, root_uri: Option<lsp::Url>, change_notifications: ...) {
@@ -607,13 +617,13 @@ fn add_workspace_folder(&self, root_uri: Option<lsp::Url>, change_notifications:
 }
 ```
 
-**Registry 中的多实例管理** — [lib.rs::Registry::get](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/lib.rs#L709-L756)
+**Registry 中的多实例管理** — 文件 `helix-lsp/src/lib.rs`，函数 `Registry::get`，第 709-756 行
 
 - `inner_by_name: HashMap<Name, Vec<Arc<Client>>>` — 同名服务器可能有多个实例（不同 workspace root）
 - 打开新文档时遍历同名所有 client，调用 `try_add_doc` 判断能否复用
 - 不能复用时启动新的 client 实例
 
-**手动停止的墓碑机制** — [lib.rs::Registry::stop](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/lib.rs#L692-L707)
+**手动停止的墓碑机制** — 文件 `helix-lsp/src/lib.rs`，函数 `Registry::stop`，第 692-707 行
 
 - `stop()` 不直接删除 `inner_by_name` 中的条目
 - 而是 `drain(..)` 清空 vec，保留空 vec 作为"墓碑"
@@ -622,7 +632,7 @@ fn add_workspace_folder(&self, root_uri: Option<lsp::Url>, change_notifications:
 
 ### 5.4 诊断状态管理
 
-**存储结构** — [handlers/lsp.rs::handle_lsp_diagnostics](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-view/src/handlers/lsp.rs#L279-L365)
+**存储结构** — 文件 `helix-view/src/handlers/lsp.rs`，函数 `handle_lsp_diagnostics`，第 279-365 行
 
 ```
 Editor.diagnostics: HashMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>
@@ -667,7 +677,7 @@ if let Some((version, doc)) = version.zip(doc.as_ref()) {
 }
 ```
 
-**退出时清理** — [application.rs::handle_language_server_message](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-term/src/application.rs#L927-L953)
+**退出时清理** — 文件 `helix-term/src/application.rs`，第 927-953 行
 
 ```
 Notification::Exit
@@ -684,7 +694,7 @@ Notification::Exit
 
 ### 6.1 Payload 枚举
 
-[transport.rs::Payload](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/transport.rs#L22-L29)
+文件：`helix-lsp/src/transport.rs`，第 22-29 行
 
 ```rust
 pub enum Payload {
@@ -699,7 +709,7 @@ pub enum Payload {
 
 ### 6.2 Call 枚举
 
-[jsonrpc.rs::Call](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/jsonrpc.rs#L245-L254)
+文件：`helix-lsp/src/jsonrpc.rs`，第 245-254 行
 
 ```rust
 pub enum Call {
@@ -711,7 +721,7 @@ pub enum Call {
 
 ### 6.3 MethodCall（客户端解析）
 
-[lib.rs::MethodCall](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/lib.rs#L481-L491)
+文件：`helix-lsp/src/lib.rs`，第 481-491 行
 
 ```rust
 pub enum MethodCall {
@@ -729,7 +739,7 @@ pub enum MethodCall {
 
 ### 6.4 Notification（客户端解析）
 
-[lib.rs::Notification](file:///d:/fz/0601/solo-dogfeeding/code/266-helix/helix-lsp/src/lib.rs#L536-L545)
+文件：`helix-lsp/src/lib.rs`，第 536-545 行
 
 ```rust
 pub enum Notification {
