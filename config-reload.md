@@ -143,7 +143,7 @@ pub enum ConfigEvent {
 
 ### 3.3 热更新完整调用链
 
-核心调度在 [helix-term/src/application.rs#L367-L452](helix-term/src/application.rs#L367-L452)：
+核心调度在 [helix-term/src/application.rs#L367-L452](helix-term/src/application.rs#L367-L452)。请注意：只有标记 ❓`?` 的步骤会传播错误并中断流程，其他步骤均为 fail-soft（失败不中断）：
 
 ```
 用户输入 :config-reload
@@ -152,14 +152,15 @@ typed.rs::refresh_config() 发送 ConfigEvent::Refresh
     ↓
 application.rs::handle_config_events() 接收事件 [L367-L405]
     ├─ Refresh → 调用 refresh_config() 私有方法 [L407-L452]
-    │   ├─ ① Config::load_default() 重新从磁盘读+合并所有 config.toml
-    │   ├─ ② user_lang_loader() 重新从磁盘读+合并所有 languages.toml
+    │   ├─ ① Config::load_default() 重新读+合并 config.toml  ❓?可中断
+    │   ├─ ② user_lang_loader() 重新读+合并 languages.toml  ❓?可中断
     │   │     → self.editor.syn_loader.store(Arc::new(lang_loader))  ⚠️ 立即写入
-    │   ├─ ③ load_configured_theme() 重新加载主题文件
-    │   ├─ ④ 遍历所有打开的 Document：
+    │   ├─ ③ load_configured_theme() 加载主题  ❌无返回值（失败自动回退默认主题）
+    │   ├─ ④ 遍历所有打开的 Document：           ❌无返回值（所有调用均为 ()）
     │   │   ├─ detect_editor_config() 重读 .editorconfig
-    │   │   └─ detect_language() 基于新语言配置重新识别
-    │   ├─ ⑤ terminal.reconfigure() 应用光标形状等终端级设置
+    │   │   ├─ detect_language() 重新识别语言
+    │   │   └─ replace_diagnostics() 刷新诊断
+    │   ├─ ⑤ terminal.reconfigure() 应用终端设置  ❓?可中断
     │   └─ ⑥ self.config.store(Arc::new(default_config)) 写入 ArcSwap
     │
     ├─ Update(new_editor_config) → 只替换 editor 字段
@@ -181,20 +182,36 @@ application.rs::handle_config_events() 接收事件 [L367-L405]
 
 ### 3.4 ⚠️ 重载失败：旧配置是否仍生效？
 
-**结论：大部分情况下旧配置仍生效，但存在「部分更新」的异常状态。**
+**结论：前两步失败时旧配置完整保留；只有 `terminal.reconfigure()` 失败会出现「部分更新」的异常状态。**
 
-`refresh_config()` 闭包内部使用 `?` 传播错误，各步骤失败影响如下：
+#### 关键代码事实核准
 
-| 失败步骤 | 位置 | `syn_loader` 是否已更新 | `config` 是否已更新 | 旧配置是否保留 |
-|---------|------|-----------------------|-------------------|---------------|
-| ① `Config::load_default()` 失败（TOML 错误、信任错误） | L409-L410 | ❌ 未更新 | ❌ 未更新 | ✅ 完整保留 |
-| ② `user_lang_loader()` 失败（languages.toml 错误） | L415 | ❌ 未更新 | ❌ 未更新 | ✅ 完整保留 |
-| ③ `load_configured_theme()` 失败（主题文件找不到） | L417-L422 | ✅ **已更新**（L416 已执行） | ❌ 未更新 | ⚠️ **部分更新**：语言配置已变，全局 Config 保留旧值 |
-| ④ 文档遍历中某文档失败 | L426-L436 | ✅ 已更新 | ❌ 未更新 | ⚠️ 部分更新 |
-| ⑤ `terminal.reconfigure()` 失败 | L438 | ✅ 已更新 | ❌ 未更新 | ⚠️ 部分更新 |
-| ⑥ 全部成功 | L440 | ✅ 已更新 | ✅ 已更新 | ❌ 全部替换 |
+`refresh_config()` 闭包在 [helix-term/src/application.rs#L408-L442](helix-term/src/application.rs#L408-L442) 中定义，返回 `Result<(), Error>` 并用 `?` 传播错误。但各步骤的返回类型**不一致**，并非所有步骤都能中断流程：
 
-> **关键发现**：`syn_loader.store()` 位于第 416 行，早于 `config.store()` 的第 440 行。如果 languages.toml 加载成功但后续任何一步失败，会导致 `syn_loader`（语言配置）已经是新的，而全局 `Config` 仍是旧的，出现**不一致状态**。
+| 步骤 | 函数/语句 | 返回类型 | 是否使用 `?` | 失败时是否中断 |
+|------|----------|---------|-------------|--------------|
+| ① | `Config::load_default()` | `Result<Config, ConfigLoadError>` | ✅ 是 | ✅ **立即中断**，返回错误 |
+| ② | `user_lang_loader()` | `Result<Loader, Error>` | ✅ 是 | ✅ **立即中断**，返回错误 |
+|  | `self.editor.syn_loader.store(...)` | `()` | — | ❌ 不会失败 |
+| ③ | `Self::load_configured_theme(...)` | **`()`**（无 Result） | ❌ 否 | ❌ **永不中断**：失败时 `unwrap_or_else` 回退到默认主题，错误仅打 `log::warn!` |
+| ④ | `for document in ...` 遍历文档 | **`()`**（所有调用均返回 `()`） | ❌ 否 | ❌ **永不中断**：`detect_editor_config()` / `detect_language()` / `replace_diagnostics()` 均无错误返回 |
+| ⑤ | `self.terminal.reconfigure(...)` | `Result<(), Error>` | ✅ 是 | ✅ **立即中断**，返回错误 |
+| ⑥ | `self.config.store(...)` | `()` | — | ❌ 不会失败 |
+
+> **关于 `load_configured_theme()` 的返回值**：函数签名为 `fn load_configured_theme(...)`（无返回值），见 [helix-term/src/application.rs#L454-L491](helix-term/src/application.rs#L454-L491)。内部调用 `editor.set_theme(theme)` 虽然返回 `anyhow::Result<()>`，但被 `let _ = ...` 丢弃。主题加载失败时通过 `unwrap_or_else(|| editor.theme_loader.default_theme(true_color))` 自动回退到默认主题，不会向调用者传播错误。
+
+#### 各失败场景下的状态快照
+
+真实的中断点只有 **①②⑤** 三处，③④ 不可能中断流程：
+
+| 中断场景 | 发生时已完成的步骤 | `syn_loader` | 主题 | 文档 `language_config` / `editor_config` | `config` (ArcSwap) | 旧配置是否保留 |
+|---------|------------------|-------------|------|---------------------------------------|-------------------|---------------|
+| ① `Config::load_default()` 失败 | （无） | ❌ 未更新 | ❌ 未更新 | ❌ 未更新 | ❌ 未更新 | ✅ **完整保留** |
+| ② `user_lang_loader()` 失败 | ① | ❌ 未更新 | ❌ 未更新 | ❌ 未更新 | ❌ 未更新 | ✅ **完整保留** |
+| ⑤ `terminal.reconfigure()` 失败 | ①②③④ | ✅ **已更新** | ✅ **已更新**（失败则回退到默认主题） | ✅ **已重新检测** | ❌ **未更新** | ⚠️ **部分更新**：语言、主题、文档级配置已变，全局 Config 仍为旧值 |
+| 全部成功 | ①②③④⑤⑥ | ✅ 已更新 | ✅ 已更新 | ✅ 已重新检测 | ✅ 已更新 | ❌ 全部替换 |
+
+> **真实风险点**：只有 `terminal.reconfigure()` 失败时会出现不一致——此时 `syn_loader`（L416）、主题（L417-L422）、所有文档的语言/EditorConfig（L426-L436）都已经是新值，只有全局 `Config` 的 ArcSwap（L440）未写入。主题加载失败和文档遍历过程**不会导致中断**，因此不存在之前文档中描述的③④失败场景。
 
 ### 3.5 配置共享机制：`Arc<ArcSwap<Config>>`
 
@@ -328,7 +345,7 @@ Document 实例私有字段
 
 2. **无自动监听**：所有配置变更必须手动触发，避免了文件监听带来的复杂度和平台差异。
 
-3. **原子替换 + 部分更新风险**：`ArcSwap` 保证了 Config 读取的原子性，但 `syn_loader.store()` 与 `config.store()` 不同步可能导致不一致状态。
+3. **原子替换 + 部分更新风险**：`ArcSwap` 保证了 Config 读取的原子性，但中间步骤中只有 `terminal.reconfigure()` 失败时才会出现不一致——此时 `syn_loader`、主题、文档级配置已更新，但全局 `Config` 的 ArcSwap 尚未写入。
 
 4. **文档级配置惰性保留**：`indent_style` 和 `line_ending` 一旦检测完成就不随 `:config-reload` 重置，避免打扰用户的编辑状态。
 
