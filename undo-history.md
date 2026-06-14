@@ -138,11 +138,12 @@ pub fn commit_revision_at_timestamp(&mut self, transaction: &Transaction, origin
 | 触发场景 | 位置 | 说明 |
 |---|---|---|
 | **键事件处理后（非 Insert 模式）** | `helix-term/src/ui/editor.rs#L1561-L1565` | 每次按键命令执行后，若不在 Insert 模式，立即提交。**这是退出 Insert 模式时提交变化的关键路径**——ESC 触发 `normal_mode`，模式切换后下一行判断 `mode != Insert`，立即提交。 |
-| **Paste 事件（非 Insert 模式）** | `helix-term/src/ui/editor.rs#L1462-L1466` | 粘贴后若不在 Insert 模式则提交 |
+| **Paste 事件（非 Insert 模式）** | `helix-term/src/ui/editor.rs#L1462-L1466` | 终端粘贴事件后，若不在 Insert 模式则提交 |
 | **Undo 操作前** | `helix-view/src/document.rs#L1667` | `undo_redo_impl` 中，undo 前先提交 pending changes |
 | **Earlier 操作前** | `helix-view/src/document.rs#L1752` | `earlier_later_impl` 中，earlier 前先提交 |
 | **Redo / Later 操作前（有 pending changes）** | `helix-view/src/document.rs#L1668-L1669` | 若有 pending changes 则 redo/later 直接返回 false，拒绝操作 |
-| **Paste（Insert 模式）** | `helix-term/src/commands.rs#L4922-L4924` | Insert 模式下粘贴**前**先提交，粘贴**后**再次提交 |
+| **粘贴前（Insert 模式）** | `helix-term/src/commands.rs#L4922-L4924` | Insert 模式下调用 `paste_impl`，粘贴**前**先提交一次，作为边界A |
+| **粘贴后（所有模式）** | `helix-term/src/commands.rs#L4990` | `paste_impl` 末尾无条件提交一次，作为边界B |
 | **补全（Completion）确认** | `helix-term/src/ui/completion.rs#L214` | 补全确认**前**先提交 pending changes，使补全前后分离为独立 undo 单元 |
 | **补全（Completion）确认后** | `helix-term/src/ui/editor.rs#L1561-L1565` | 补全 transaction 应用后，由于此时仍在 Insert 模式，**键事件后不会自动提交**，而是留在 changes 中，后续继续打字会 compose 到同一个 undo 单元 |
 | **Jump / Push jump** | `helix-term/src/commands.rs#L3958` | 跳转前提交 |
@@ -155,66 +156,139 @@ pub fn commit_revision_at_timestamp(&mut self, transaction: &Transaction, origin
 
 ### 合并边界：插入模式粘贴详解
 
-插入模式下的粘贴（Bracketed Paste 或剪贴板 `p`/`P`）会**先提交再粘贴再提交**，形成两个明确的 undo 边界。
+粘贴操作共有三条独立入口路径，分属不同模式：
 
-#### 路径一：Bracketed Paste（终端粘贴事件）
+| 入口 | 触发方式 | 所属模式 | 最终调用 |
+|---|---|---|---|
+| 寄存器粘贴 | 插入模式下 `C-r` + 寄存器名 | **Insert 模式** | `paste_impl(mode=Insert, Paste::Cursor)` |
+| 终端粘贴 | Bracketed Paste 事件（`Event::Paste`） | **Insert 模式**（插入时） | `paste_impl(mode=Insert, Paste::Cursor)` |
+| 普通粘贴 | Normal 模式下 `p` / `P` | **Normal 模式**（不属于插入模式） | `paste_impl(mode=Normal, Paste::After/Before)` |
 
-入口在 `helix-term/src/ui/editor.rs#L1450-L1468`：
+**核心机制**：所有粘贴最终都汇聚到 `paste_impl`（`helix-term/src/commands.rs#L4910-L4991`），它根据当前 `mode` 是否为 Insert 决定是否在粘贴前额外提交一次。
 
-```
-Event::Paste(contents)
-    └── paste_bracketed_value(commands.rs#L4993-L5002)
-            │
-            ├── mode == Insert → Paste::Cursor
-            └── paste_impl(commands.rs#L4910-L4991)
-                    ├── [边界A] mode == Insert → append_changes_to_history  ← 粘贴前提交
-                    ├── 构造粘贴 Transaction
-                    ├── doc.apply(&transaction, view.id)  → 变更 compose 到 changes
-                    └── [边界B] append_changes_to_history  ← 粘贴后立即提交
-```
+#### 共同核心：paste_impl 的双重边界
 
-**关键代码** `helix-term/src/commands.rs#L4918-L4991`：
+`paste_impl` 内部有两次 `append_changes_to_history` 调用，形成两个边界：
 
 ```rust
 fn paste_impl(values, doc, view, action, count, mode) {
     if values.is_empty() { return; }
 
-    if mode == Mode::Insert {                    // ← 边界A
-        doc.append_changes_to_history(view);     // 粘贴前：先将之前的打字提交
+    // [边界A] 仅 Insert 模式：粘贴前提交
+    if mode == Mode::Insert {                   
+        doc.append_changes_to_history(view);     
     }
     // ... 构造粘贴 transaction ...
-    doc.apply(&transaction, view.id);            // 粘贴内容应用到文档
-    doc.append_changes_to_history(view);         // ← 边界B：粘贴后立即提交
+    doc.apply(&transaction, view.id);            // 变更 compose 到 changes
+    // [边界B] 所有模式：粘贴后立即提交（无条件）
+    doc.append_changes_to_history(view);         
 }
 ```
 
-**Bracketed Paste 完成后**，回到 `Event::Paste` 处理流程，由于 Insert 模式判断（`mode != Insert` 为 false），**不会**再次触发 `append_changes_to_history`（`helix-term/src/ui/editor.rs#L1464`）。
+- **边界A**（`helix-term/src/commands.rs#L4922-L4924`）：仅 Insert 模式下执行，将粘贴**之前**的累积编辑提交，使粘贴成为新的独立起点。
+- **边界B**（`helix-term/src/commands.rs#L4990`）：所有模式下无条件执行，将粘贴**本身**立即提交为独立 undo 单元。
 
-**因此，Bracketed Paste 在 Insert 模式下形成 3 个独立 undo 单元：**
+---
 
-| 阶段 | undo 单元 | 包含内容 | 触发提交点 |
-|---|---|---|---|
-| 1 | 粘贴前的打字 | 从进入 Insert 模式或上次边界到粘贴前的所有编辑 | `paste_impl` 内边界A |
-| 2 | 粘贴本身 | 粘贴的全部内容 | `paste_impl` 内边界B |
-| 3 | 粘贴后的打字 | 粘贴后继续输入的字符，直到退出 Insert 模式或下次边界 | 退出 Insert 时由按键后检查提交 |
+#### 入口一：插入模式寄存器粘贴（C-r + 寄存器名）
 
-#### 路径二：Normal 模式下 `p`/`P` 剪贴板粘贴
-
-入口在 `helix-term/src/commands.rs#L5087-L5095`，由键命令触发：
+这是插入模式下最常用的粘贴方式。完整流程如下：
 
 ```
-Key: p (Normal模式)
-    └── paste_after / paste_before
-            └── paste(editor, register, pos, count)
-                    └── paste_impl(mode = Normal)
-                            ├── mode != Insert → 跳过边界A
-                            ├── doc.apply(&transaction)
-                            └── append_changes_to_history (边界B)
-    └── 键事件后检查 mode != Insert → 再次调用 append_changes_to_history
-                                    （此时 changes 已空，无实际作用）
+用户按 C-r (Insert 模式)
+    │
+    ├── keymap 命中 insert_register (helix-term/src/commands.rs#L6019-L6040)
+    │     └── cx.on_next_key(...) 注册回调，等待下一个按键
+    │
+    ├── mode 仍为 Insert
+    └── 键事件后检查：mode != Insert ? → false → 不提交  ← (此时还没粘贴，只有 C-r 按下)
+
+用户按下寄存器名 (如 '+' 或 '*')
+    │
+    ├── keymap 查找：单字符键在 Insert 模式下 → NotFound
+    │
+    ├── on_next_key 回调被触发 (OnKeyCallbackKind::Fallback)
+    │     │
+    │     └── paste(editor, register, Paste::Cursor, count)
+    │           │
+    │           └── paste_impl(mode = Insert)
+    │                 ├── [边界A] append_changes_to_history  ← 粘贴前提交
+    │                 ├── 构造粘贴 Transaction
+    │                 ├── doc.apply(&transaction, view.id)
+    │                 │     → 走 apply_inner 路径
+    │                 │     → 变更 compose 到 changes
+    │                 │     → 首次变更时设置 old_state
+    │                 └── [边界B] append_changes_to_history  ← 粘贴后立即提交
+    │
+    └── 键事件后检查：mode != Insert ? → false → 不提交
 ```
 
-**Normal 模式粘贴**只有 1 个 undo 单元（粘贴本身），且由 `paste_impl` 内部的边界B 提交。
+**撤销边界标注**（插入模式寄存器粘贴产生 3 个独立 undo 单元）：
+
+| 阶段 | undo 单元 | 包含内容 | 提交触发点 | 对应代码 |
+|---|---|---|---|---|
+| 1 | 粘贴前的打字 | 从进入 Insert 或上次边界到 C-r 前的所有编辑 | `paste_impl` 内边界A | `helix-term/src/commands.rs#L4923` |
+| 2 | 粘贴内容本身 | 寄存器中的全部文本，支持 count 重复 | `paste_impl` 内边界B | `helix-term/src/commands.rs#L4990` |
+| 3 | 粘贴后的打字 | 粘贴后继续输入的字符，直到退出 Insert 或下次边界 | 退出 Insert 时由键事件后检查提交 | `helix-term/src/ui/editor.rs#L1563-L1564` |
+
+---
+
+#### 入口二：插入模式终端粘贴（Bracketed Paste）
+
+终端粘贴由 `Event::Paste` 事件触发（非按键事件），常见于终端鼠标右键粘贴或 `Ctrl+Shift+V`。
+
+```
+Event::Paste(contents) 到达 EditorView.handle_event
+    │
+    ├── self.handle_non_key_input(&mut cx)
+    ├── cx.count = cx.editor.count
+    ├── paste_bracketed_value (helix-term/src/commands.rs#L4993-L5002)
+    │     ├── mode 判断:
+    │     │   Insert / Select → Paste::Cursor
+    │     │   Normal          → Paste::Before
+    │     └── paste_impl(..., mode = Insert)
+    │           ├── [边界A] mode == Insert → append_changes_to_history
+    │           ├── 构造粘贴 Transaction
+    │           ├── doc.apply(&transaction, view.id)
+    │           └── [边界B] append_changes_to_history
+    │
+    ├── cx.editor.count = None
+    ├── view.ensure_cursor_in_view(doc, config.scrolloff)
+    │
+    └── 事件后检查：mode != Insert ? → false → 不提交
+          (helix-term/src/ui/editor.rs#L1462-L1466)
+```
+
+**撤销边界**：与寄存器粘贴完全相同 —— 边界A + 边界B 形成 3 段 undo 单元。
+
+**注意**：终端粘贴是 `Event::Paste` 而非 `Event::Key`，因此不经过 keymap 查找，也不会触发 `on_next_key` 逻辑。它直接调用 `paste_bracketed_value` 进入粘贴流程。
+
+---
+
+#### 入口三：普通模式 p/P 粘贴（不属于插入模式）
+
+Normal 模式下按 `p` / `P` 触发的粘贴，属于 Normal 模式命令，**不属于插入模式粘贴**。
+
+```
+用户按 p (Normal 模式)
+    │
+    ├── keymap 命中 paste_after / paste_before
+    │     └── paste(editor, register, Paste::After/Before, count)
+    │           └── paste_impl(mode = Normal)
+    │                 ├── mode != Insert → 跳过边界A
+    │                 ├── 构造粘贴 Transaction
+    │                 ├── doc.apply(&transaction, view.id)
+    │                 └── [边界B] append_changes_to_history  ← 唯一一次提交
+    │
+    └── 键事件后检查：mode != Insert ? → true → 再次调用 append_changes_to_history
+                                                                       （此时 changes 已空，无实际作用）
+```
+
+**撤销边界**：只有 1 个 undo 单元（粘贴本身），由边界B 提交。键事件后的检查是冗余调用，不产生新单元。
+
+**与插入模式粘贴的本质区别**：
+- Normal 模式粘贴是"独立命令"，本身就是一个完整的 undo 单元
+- Insert 模式粘贴会"打断"当前正在进行的插入会话，将粘贴前后的打字与粘贴本身分为三个独立 undo 单元
 
 ---
 
