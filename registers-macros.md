@@ -2,7 +2,13 @@
 
 ## 概述
 
-本文档梳理 Helix 编辑器中寄存器（Registers）与宏（Macros）的代码处理路径，聚焦**录制**、**存储**、**回放**三种核心操作，以及它们之间的**组合边界**（录制中触发回放、回放按键不写回录制、嵌套与递归保护）。特别深入分析**嵌套宏回放的触发条件**、**寄存器选择机制**、**默认寄存器**以及**递归栈如何确定回放目标**。
+本文档梳理 Helix 编辑器中寄存器（Registers）与宏（Macros）的代码处理路径，聚焦**录制**、**存储**、**回放**三种核心操作，以及它们之间的**组合边界**（录制中触发回放、回放按键不写回录制、嵌套与递归保护）。特别深入分析：
+
+1. **嵌套宏回放的触发条件**：宏内容中 `"` + `{reg}` + `q` 三键序列如何选择并触发另一寄存器的回放
+2. **寄存器选择机制**：`selected_register` → `cx.register` 的传递路径，`on_next_key` 在回放中的工作方式
+3. **默认寄存器**：宏操作默认 `'@'` vs yank/paste 默认 `'"'` 的两套独立默认值
+4. **递归栈阻断间接递归（A→B→A）的精确机制**：修正了之前的错误分析，完整追踪目标寄存器确定的两条路径（显式选择 vs 隐式默认值），以及 `contains` 全栈搜索如何同时阻断直接递归和间接递归
+
 
 ---
 
@@ -515,41 +521,100 @@ fn replay_macro(cx: &mut Context) {
 | `@`→`a` 中触发 `@` | `['@', 'a']` | `'@'` | `['@', 'a']` → true | ❌ 禁止（间接递归） |
 | `@`→`a` 中触发 `b` | `['@', 'a']` | `'b'` | `['@', 'a']` → false | ✅ 允许（多层嵌套） |
 
-### 7.3 间接递归的检测
+### 7.3 间接递归的检测：A→B→A 路径的阻断
 
-**场景**: 宏 `@` 调用 `a`，宏 `a` 调用 `@`
+**场景设置**:
+- 宏 A 存储在寄存器 `@`，内容为 `"aq`（选择寄存器 a，然后回放）— 即调用宏 B
+- 宏 B 存储在寄存器 `a`，内容有两种方式尝试调用回宏 A：
+  - **方式一（显式）**：`"@q` — 显式选择寄存器 @，然后回放
+  - **方式二（隐式默认值）**：`q` — 不选择寄存器，直接使用默认值 `'@'`
+
+#### 7.3.1 方式一：宏 B 显式选择寄存器 `@`
+
+宏 B 内容为 `"@q`（双引号 + @ + q）
 
 ```
-用户按 q 回放 @
+用户按 q（触发回放宏 @）
   ↓
 replay_macro('@')
-  macro_replaying = []
-  contains('@')? → false
-  push('@') → ['@']
+  cx.register = None → reg = None.unwrap_or('@') = '@'  ⭐ 目标寄存器确定
+  macro_replaying = [] → contains('@')? → false ✅
+  macro_replaying.push('@') → ['@']
   注册回调
 
-回调执行:
-  回放宏 @ 的内容
-    ...
-    遇到 "a  → selected_register = Some('a')
-    遇到 q   → replay_macro('a')
-                 contains('a')? → ['@'] → false
-                 push('a') → ['@', 'a']
-                 注册回调
-                 
-                 回调执行:
-                   回放宏 a 的内容
-                     ...
-                     遇到 "a  → selected_register = Some('a')
-                     遇到 q   → replay_macro('a')
-                                  contains('a')? → ['@', 'a'] → true ⛔
-                                  set_error + return
-                                  ❌ 间接递归被阻止
-                   pop('a') → ['@']
-  pop('@') → []
+回调执行: 回放宏 @ 的内容（按键序列: Key('"'), Key('a'), Key('q')）
+  │
+  ├─ 第1键 Key('"')
+  │   └─ select_register() → 注册 on_next_key 回调
+  │
+  ├─ 第2键 Key('a')
+  │   └─ on_next_key(PseudoPending) 执行回调
+  │       selected_register = Some('a')  ⭐ 宏 A 选择目标寄存器 a
+  │
+  └─ 第3键 Key('q')
+      ├─ cx.register = selected_register.take() = Some('a')
+      ├─ replay_macro()
+      │   reg = Some('a').unwrap_or('@') = 'a'  ⭐ 目标是 a
+      │   macro_replaying = ['@'] → contains('a')? → false ✅
+      │   macro_replaying.push('a') → ['@', 'a']
+      │   注册回调
+      │
+      └─ 阶段③: 执行宏 B 回放回调
+          │
+          └─ 回放宏 B 的内容（按键序列: Key('"'), Key('@'), Key('q')）
+              │
+              ├─ 第1键 Key('"')
+              │   └─ select_register() → 注册 on_next_key 回调
+              │
+              ├─ 第2键 Key('@')
+              │   └─ on_next_key 执行回调
+              │       selected_register = Some('@')  ⭐ 宏 B 选择目标寄存器 @
+              │
+              └─ 第3键 Key('q')
+                  ├─ cx.register = selected_register.take() = Some('@')
+                  ├─ replay_macro()
+                  │   reg = Some('@').unwrap_or('@') = '@'  ⭐ 目标是 @
+                  │   macro_replaying = ['@', 'a']
+                  │   contains('@')? → true ⛔  全栈搜索命中！
+                  │   set_error + return
+                  │   ❌ 间接递归被阻止
+                  │
+                  macro_replaying.pop('a') → ['@']
+  macro_replaying.pop('@') → []
 ```
 
-**结论**: `.contains(&reg)` 是全栈搜索，不是只检查栈顶。这确保了任何形式的递归（直接或间接）都被阻止。
+#### 7.3.2 方式二：宏 B 不选寄存器，使用默认值 `'@'`
+
+宏 B 内容为 `q`（直接按 q，无前缀）
+
+```
+用户按 q（触发回放宏 @）
+  ↓
+... 同上，进入宏 B 回放回调 ...
+  │
+  └─ 回放宏 B 的内容（按键序列: Key('q')）
+      │
+      └─ 第1键 Key('q')
+          ├─ selected_register = None （宏 B 中没有选择过寄存器）
+          ├─ cx.register = selected_register.take() = None
+          ├─ replay_macro()
+          │   reg = None.unwrap_or('@') = '@'  ⭐ 隐式默认值就是 '@'
+          │   macro_replaying = ['@', 'a']
+          │   contains('@')? → true ⛔  全栈搜索命中！
+          │   set_error + return
+          │   ❌ 间接递归被阻止
+          │
+          macro_replaying.pop('a') → ['@']
+```
+
+#### 7.3.3 两种方式的对比
+
+| 方式 | 宏 B 内容 | selected_register | cx.register | reg 结果 |
+|------|----------|-------------------|-------------|----------|
+| 显式 | `"@q` | 先被设为 `Some('@')`，然后被 `take()` | `Some('@')` | `'@'` |
+| 隐式 | `q` | 保持 `None` | `None` | `'@'`（默认值） |
+
+**结论**: 无论宏 B 选择哪种方式，目标寄存器最终都是 `'@'`，而 `'@'` 已经在 `macro_replaying` 栈 `['@', 'a']` 中，`.contains(&reg)` 的全栈搜索必然命中，间接递归被阻断。
 
 ### 7.4 递归保护的代价
 
@@ -733,36 +798,61 @@ compositor 阶段③:
 │   └─ pop('@') → []
 ```
 
-### 10.2 递归保护的调用链
+### 10.2 递归保护的调用链（目标寄存器确定 + 全栈检查）
 
 ```
-replay_macro(reg)
+[外层] 用户按 q 回放宏 @
 │
-├─ let reg = cx.register.unwrap_or('@')  ⭐ 目标寄存器确定
+│ [replay_macro 被调用]
 │
-├─ if macro_replaying.contains(&reg):   ⭐ 全栈检查
-│   ├─ set_error
-│   └─ return  ❌
+├─ ① 目标寄存器确定：
+│   let reg = cx.register.unwrap_or('@')
+│     ├── 如果之前有 " 前缀 → cx.register = Some(reg)
+│     └── 如果没有前缀 → cx.register = None → reg = '@'（默认值）
 │
-├─ macro_replaying.push(reg)            ⭐ 入栈
-├─ cx.callback.push(closure)
+├─ ② 全栈检查（不是只检查栈顶）：
+│   if macro_replaying.contains(&reg)
+│     ├── true → set_error + return ❌
+│     └── false → 继续
 │
-└─ 回调执行:
-    for key in keys:
-      compositor.handle_event(key)
-      │
-      ├─ 阶段①: macro_replaying 非空 → 不捕获
-      │
-      └─ 阶段②: 如果 key 映射到 replay_macro
-          │
-          ├─ replay_macro(reg2):
-          │   ├─ reg2 确定
-          │   └─ macro_replaying.contains(&reg2)?  ⭐ 再次检查
-          │       ├─ true → ❌ 阻止
-          │       └─ false → 继续嵌套
-          │
-    macro_replaying.pop()               ⭐ 出栈
+├─ ③ 入栈：macro_replaying.push(reg)
+│
+├─ ④ 注册回调：cx.callback.push(closure)
+│
+└─ ⑤ 回调执行（compositor 阶段③）：
+    │
+    ├─ for key in 宏内容按键:
+    │   │
+    │   ├─ compositor.handle_event(key)
+    │   │   │
+    │   │   ├─ 阶段①: 录制捕获守卫（macro_replaying 非空 → 跳过）
+    │   │   │
+    │   │   └─ 阶段②: 命令处理
+    │   │       │
+    │   │       ├─ 遇到 '"' 键 → select_register()
+    │   │       │   └─ cx.on_next_key(closure)  ← 注册下一键回调
+    │   │       │
+    │   │       ├─ 遇到字符键 → on_next_key 回调执行
+    │   │       │   └─ selected_register = Some(ch)  ← 目标寄存器暂存
+    │   │       │
+    │   │       └─ 遇到 'q' 键 → replay_macro() 再次被调用
+    │   │           │
+    │   │           ├─ ① 目标寄存器确定：
+    │   │           │   cx.register = selected_register.take()
+    │   │           │   ├── 有前缀 → Some(reg2)
+    │   │           │   └── 无前缀 → None → reg2 = '@'（默认）
+    │   │           │
+    │   │           └─ ② 全栈检查：
+    │   │               macro_replaying.contains(&reg2)?
+    │   │               ├── true → ❌ 阻断（直接或间接递归）
+    │   │               └── false → 继续嵌套（入栈 reg2 → 回放 → 出栈）
+    │   │
+    │   └─ 阶段③: 内层回调（如有）
+    │
+    └─ ⑥ 出栈：macro_replaying.pop()  ← 本层回放完全结束
 ```
+
+**关键不变量**：在整个回放过程中（步骤⑤的所有按键处理期间），本层的 `reg` 始终保持在 `macro_replaying` 栈中。因此任何内层 `replay_macro` 的全栈检查 `.contains(&reg)` 必然命中，阻断返回本层寄存器的递归调用。
 
 ---
 
@@ -790,9 +880,17 @@ if macro_recording.is_some() && macro_replaying.is_empty()
 
 `on_next_key` 回调是 EditorView 的状态，与事件来源无关。宏内容中的 `"` + `reg` + `q` 序列可以正确选择并回放不同的寄存器。
 
-### 11.5 递归保护是按寄存器名全栈检查
+### 11.5 递归保护是按寄存器名全栈检查 + 默认值加持的双重阻断
 
-使用 `.contains(&reg)` 而非只检查栈顶，因此**间接递归**（A→B→A）也能被检测到。代价是无法在宏 B 中回放正在外层执行的宏 A，即使这不是真正的无限递归。
+目标寄存器的确定有两条路径：
+1. **显式选择**：宏内容中 `"` + `reg` + `q` → `selected_register` → `cx.register = Some(reg)` → `reg = cx.register.unwrap_or('@')` = `reg`
+2. **隐式默认值**：宏内容中直接 `q`（无前缀）→ `cx.register = None` → `reg = None.unwrap_or('@')` = `'@'`
+
+递归保护使用 `macro_replaying.contains(&reg)` 做**全栈搜索**（不是只检查栈顶），因此：
+- **直接递归**（A→A）：当前栈顶就是 A，`.contains(&'@')` → true → 阻断
+- **间接递归**（A→B→A）：A 在外层栈中，无论 B 中用显式 `"@q` 还是隐式默认 `q`，目标都是 `'@'`，`.contains(&'@')` → true → 阻断
+
+代价是：无法在宏 B 中回放正在外层执行的宏 A，即使这不是真正的无限递归。
 
 ### 11.6 push/pop 的时序是递归保护生效的关键
 
