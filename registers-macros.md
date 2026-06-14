@@ -8,6 +8,9 @@
 2. **寄存器选择机制**：`selected_register` → `cx.register` 的传递路径，`on_next_key` 在回放中的工作方式
 3. **默认寄存器**：宏操作默认 `'@'` vs yank/paste 默认 `'"'` 的两套独立默认值
 4. **递归栈阻断间接递归（A→B→A）的精确机制**：修正了之前的错误分析，完整追踪目标寄存器确定的两条路径（显式选择 vs 隐式默认值），以及 `contains` 全栈搜索如何同时阻断直接递归和间接递归
+5. **寄存器特殊行为**：
+   - 剪贴板对应关系：`'*'` → 主剪贴板（ClipboardType::Selection），`'+'` → 系统剪贴板（ClipboardType::Clipboard）—— 修正了之前写反的错误
+   - 反向存储下 `push` 操作的物理追加与逻辑前置关系，以及 O(1) 时间复杂度的设计原理
 
 
 ---
@@ -33,10 +36,45 @@ pub struct Registers {
 | `#` 选区索引 | 动态生成选区编号 | 拒绝写入 |
 | `.` 选区内容 | 动态返回当前选区文本 | 拒绝写入 |
 | `%` 文档路径 | 动态返回当前文件名 | 拒绝写入 |
-| `*` 系统剪贴板 | 优先读剪贴板，回退到缓存 | 同时写剪贴板和缓存 |
-| `+` 主剪贴板 | 同上 | 同上 |
+| `*` 主剪贴板（X11 选中即复制） | 优先读 `ClipboardType::Selection`，回退到缓存 | 同时写 `ClipboardType::Selection` 和缓存 |
+| `+` 系统剪贴板 | 优先读 `ClipboardType::Clipboard`，回退到缓存 | 同时写 `ClipboardType::Clipboard` 和缓存 |
 
-**存储策略**: `write` 时 `values.reverse()` 反向存储，`read` 时 `.rev()` 再反转回来。目的是让 `push` 操作（向末尾追加）在反向后的向量头部插入，保持 O(1)。
+**剪贴板对应关系（代码事实）**:
+- `'*'` → `ClipboardType::Selection` → **主剪贴板**（Primary selection，X11 中选中即复制）
+- `'+'` → `ClipboardType::Clipboard` → **系统剪贴板**（System clipboard，Ctrl+C/V 操作的剪贴板）
+
+⚠️ **注意**：register.rs 第 22-23 行的文档注释写反了，但代码事实（第 67-70 行、87-91 行、110-114 行、170-171 行、209-212 行）始终一致。
+
+**存储策略**: 
+- `write` 时 `values.reverse()` 反向存储
+- `read` 时 `.rev()` 再次反转，还原逻辑顺序
+- 设计目的：让 `push` 操作（物理追加到向量末尾）在逻辑上表现为**前置**（最新的值在逻辑最前面），保持 O(1) 时间复杂度
+
+#### 反向存储的物理与逻辑关系
+
+```
+用户操作: write(["A", "B", "C"])
+            ↓
+物理存储: values.reverse() → ["C", "B", "A"]  ← 反向存储
+            ↓
+用户读取: read() → .rev() → ["A", "B", "C"]  ← 还原逻辑顺序
+
+用户操作: push("D")
+            ↓
+物理存储: Vec::push("D") → ["C", "B", "A", "D"]  ← 物理追加到末尾（O(1)）
+            ↓
+用户读取: read() → .rev() → ["D", "A", "B", "C"]  ← D 在逻辑最前面（前置效果）
+```
+
+**关键不变量**：
+- 物理向量的 **末尾** = 逻辑上的 **开头**
+- 物理向量的 **开头** = 逻辑上的 **末尾**
+- `push` 的物理追加 = 逻辑前置（最新的值最先被读到）
+
+**push 操作的使用场景**：
+- 搜索历史追加（[commands.rs:2515](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/commands.rs#L2515)）：向搜索寄存器追加新的搜索模式
+- 剪贴板追加（[register.rs:105-141](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-view/src/register.rs#L105-L141)）：向剪贴板寄存器追加内容，需要先验证剪贴板内容与本地缓存一致
+
 
 ### 1.2 宏状态字段
 
