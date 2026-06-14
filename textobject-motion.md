@@ -256,14 +256,18 @@ pub fn goto_treesitter_object(
 
 **执行流程**：
 
-1. **捕获查询优先级与回退**：调用 `capture_nodes_any(&[Movement, Around, Inside], ...)`，按数组顺序依次尝试三种捕获名（详见下文 4.6.1）。
-2. **Forward 方向**：找 `start_byte > cursor_byte` 的节点，按 `(start_byte, Reverse(end_byte))` 排序取最小（最近、最短的对象）。
-3. **Backward 方向**：找 `end_byte < cursor_byte` 的节点，按 `(end_byte, Reverse(start_byte))` 排序取最大（最近、最短的对象）。
+1. **捕获声明检查（阶段 1）**：调用 `capture_nodes_any(&[Movement, Around, Inside], ...)`，按数组顺序检查捕获声明是否存在，选中第一个存在声明的捕获（详见下文 4.6.1）。
+2. **捕获节点提取（阶段 2）**：只提取选中捕获对应的节点，不回退。
+3. **候选过滤与排序**：
+   - **Forward 方向**：过滤 `start_byte > cursor_byte` 的节点，按 `(start_byte, Reverse(end_byte))` 取最小 → **先最近、同起点时选最长/外层对象**（详见 4.6.7）。
+   - **Backward 方向**：过滤 `end_byte < cursor_byte` 的节点，按 `(end_byte, Reverse(start_byte))` 取最大 → **先最近、同终点时选最长/外层对象**（详见 4.6.7）。
 4. 循环 count 次逐步跳转，直到无法继续。
 
-**返回值**：始终返回 Forward 方向的完整对象 Range：`Range::new(start_char, end_char)`。
+**返回值**：始终返回 Forward 方向的 **捕获节点范围** Range：`Range::new(start_char, end_char)`。注意：这不一定是完整对象的范围，取决于选中的捕获指向哪个子节点（如 movement 可能仅指向函数名）。
 
-> **关键校正**：函数内注释 "head of range should be at beginning" 与代码不符。实际代码 `Range::new(start_char, end_char)` 中 head 在 `end_char`（对象终点），anchor 在 `start_char`（对象起点）。返回值是覆盖整个对象的 Forward Range。
+> **关键校正 1**：之前将返回值描述为"完整对象范围"不准确。实际返回的是捕获声明所附加的那个节点的范围。当 `.movement` 被选中时，可能只覆盖函数名等子节点，而非完整对象。
+>
+> **关键校正 2**：函数内注释 "head of range should be at beginning" 与代码不符。实际代码 `Range::new(start_char, end_char)` 中 head 在 `end_char`（捕获节点终点），anchor 在 `start_char`（捕获节点起点）。
 
 #### 4.6.1 两阶段捕获选择机制（[syntax.rs](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/helix-core/src/syntax.rs#L1045-L1069)）
 
@@ -295,37 +299,53 @@ Some(mat.nodes_for_capture(capture).cloned().collect())
 - 即使选中的捕获匹配到 0 个节点（iterator 为空），也**不会**回头尝试其他捕获
 
 对于 `goto_treesitter_object`，传入的捕获名数组顺序是：
-**`[Movement, Around, Inside]`** — 阶段 1 的检查顺序。
+**`[Movement, Around, Inside]`** — 这是阶段 1 的检查顺序。
 
-| 优先级 | 捕获名 | 在阶段 1 的检查 | 选中后的节点范围 |
+| 检查顺序 | 捕获名 | 阶段 1 触发条件 | 选中后的节点范围 |
 |--------|--------|----------------|-----------------|
-| 1（最高） | `{name}.movement` | 第一个检查 | 通常是对象的关键标识部分（如函数名、参数名） |
-| 2 | `{name}.around` | 仅当 movement 未声明时才检查 | 整个对象范围（含边界） |
-| 3（最低） | `{name}.inside` | 仅当 movement 和 around 均未声明时才检查 | 对象的内容范围（不含边界） |
+| 1（最先） | `{name}.movement` | 只要 .scm 文件中声明了该捕获，无论其节点范围多小 | 通常是对象的关键标识子节点（如函数名、参数名） |
+| 2 | `{name}.around` | 仅当 movement **未声明**时才会被检查到 | 整个对象范围（含边界） |
+| 3（最后） | `{name}.inside` | 仅当 movement 和 around **均未声明**时才会被检查到 | 对象的内容范围（不含边界） |
 
-> **核心规则**：回退**只发生在"捕获未声明"时**。一旦某个捕获被声明（即使它对应的节点可能为空），后续捕获就不再被考虑。
+> **关于"优先级"的精确表述**：这不是基于范围合理性或远近的智能"优先级"，而是纯粹的**声明存在性检查顺序**。只要 `.movement` 在查询文件中被声明过一次（哪怕仅指向一个 identifier 子节点），它就会覆盖 around/inside。这就是为什么 KDL 中 `]f` 跳转到函数名而非整个函数 — 因为 KDL 声明了 `@function.movement`。
+>
+> **常见现实**：大多数语言（如 Rust、Python、Go 等）的 textobject 查询中**不声明 `.movement`**，因此实际使用中绝大多数情况下选中的是 `.around`。只有 PHP、KDL、GraphQL 等少数语言为特定对象类型声明了专属 `.movement`。
 
 #### 4.6.2 KDL 示例：三种同时声明时的精确行为
 
 KDL 查询文件（[kdl/textobjects.scm](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/runtime/queries/kdl/textobjects.scm)）中 function 的完整定义：
 
 ```scm
-; pattern 1: 定义了 .around 和 .inside，指向不同子节点
+; pattern 1: 定义了 .around 和 .inside，指向不同节点
+;   - @function.around → 整个 node 节点（完整对象范围）
+;   - @function.inside → node_children 子节点（内容范围）
 (node
     children: (node_children)? @function.inside) @function.around
 
-; pattern 2: 定义了 .movement，仅指向 identifier 子节点
+; pattern 2: 定义了 .movement
+;   - @function.movement → identifier 子节点（仅函数名，非完整对象）
 (node (identifier) @function.movement)
 ```
 
 **三种捕获都已声明**。阶段 1 的执行过程：
 
 1. 检查 `function.movement` → 在 pattern 2 中声明了 → 返回 Some → **选中 movement 捕获**
-2. **不再检查** around 和 inside（即使它们也声明了且可能有更多匹配）
+2. **不再检查** around 和 inside（即使它们也声明了且指向范围更大的节点）
 
-阶段 2 执行：
-- 只从 match 中提取 `@function.movement` 对应的节点 → 即 `identifier`（函数名）
+**阶段 2 执行 — 捕获节点范围 vs 完整对象范围**：
+- 选中的捕获：`@function.movement` → 节点 = `identifier`（函数名）
+- **跳转的 Range = `[identifier.start, identifier.end]`**（仅函数名，例如 6 个字符宽）
+- **不是**完整对象 `@function.around` 的 `[node.start, node.end]`（整个函数，可能几十行）
 - 跳转到下一个函数名的位置，而不是整个 function 范围
+
+**对比选区操作**：
+| 操作 | 使用捕获 | 选区覆盖范围 |
+|------|---------|-------------|
+| `]f`（跳转） | movement（因声明存在而被选中） | 仅 identifier 子节点（函数名） |
+| `ma f`（选 around） | function.around（精确指定，无回退） | 整个 node 节点（完整函数） |
+| `mi f`（选 inside） | function.inside（精确指定，无回退） | node_children 子节点（函数体） |
+
+> **关键校正**：容易混淆的地方是，"function 对象跳转"并不一定跳转到完整函数范围。跳转的范围完全取决于选中的捕获指向哪个 AST 节点。`.movement` 的设计目的就是允许跳转目标与选区目标不同 —— 跳转时快速定位到函数名等关键标识，而不是选中整个大对象。
 
 **无匹配节点的情况**：如果当前光标位于文件末尾，之后再无 `(node (identifier) ...)` pattern 匹配，则阶段 2 的 iterator 为空，`min_by_key` 返回 None，跳转失败。**不会**回退尝试使用 `function.around` 或 `function.inside`。
 
@@ -381,10 +401,81 @@ last_range  // 返回原始 range，不移动
 |------|----------------------------------------|--------------------------------------|
 | 调用方法 | `capture_nodes(&single_name)` | `capture_nodes_any(&[three_names])` |
 | 捕获选择 | 精确匹配单个捕获名 | `[Movement, Around, Inside]` 数组 |
-| 阶段 1 回退 | **无** — 仅检查一个捕获 | **有** — 捕获未声明时回退到下一个 |
+| 阶段 1 回退 | **无** — 仅检查一个捕获的声明 | **有** — 捕获未声明时回退 |
 | 阶段 2 回退 | **无** | **无** — 选中捕获无匹配节点时直接失败 |
-| 设计原则 | 精确匹配用户意图（Inside 就是 Inside） | 容错优先，"能用就行"但仅限声明层面 |
-| 失败原因 | 捕获未声明 **或** 无匹配节点 | 三者都未声明 **或** 已选捕获无匹配节点 |
+| 节点筛选逻辑 | 包含 byte_pos 的节点，按字节长度取最小（最内层） | Forward：start_byte > byte_pos 取最近；Backward：end_byte < byte_pos 取最近 |
+| 同边界候选排序 | 不需要（最内层 = 最短即唯一最小） | **同边界选最长/外层**（详见 4.6.7） |
+| 设计原则 | 精确匹配用户意图（Inside 就是 Inside） | 容错优先（声明层面），但选中后不回退 |
+| 失败原因 | 捕获未声明 **或** 无节点包含 byte_pos | 三者都未声明 **或** 已选捕获无符合方向条件的节点 |
+
+#### 4.6.7 同边界候选排序取舍（[movement.rs](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/helix-core/src/movement.rs#L594-L601)）
+
+排序逻辑是 `min_by_key` / `max_by_key` 配合元组键，实现两级排序：
+
+```rust
+// Forward 方向
+.min_by_key(|n| (n.start_byte(), Reverse(n.end_byte())))
+
+// Backward 方向
+.max_by_key(|n| (n.end_byte(), Reverse(n.start_byte())))
+```
+
+**Forward 方向详解**：
+
+| 排序键 | 含义 | 取值规则 |
+|--------|------|---------|
+| 第一键 `start_byte` | 候选的起点位置 | 升序（min_by_key）→ **越靠近光标（越早开始）越优先** |
+| 第二键 `Reverse(end_byte)` | 候选的终点位置（取反） | `Reverse(x)` 在 min 中意味着 x 越大越优先 → **同起点时选越长（end_byte 越大）的对象** |
+
+**Backward 方向详解**：
+
+| 排序键 | 含义 | 取值规则 |
+|--------|------|---------|
+| 第一键 `end_byte` | 候选的终点位置 | 降序（max_by_key）→ **越靠近光标（越晚结束）越优先** |
+| 第二键 `Reverse(start_byte)` | 候选的起点位置（取反） | `Reverse(x)` 在 max 中意味着 x 越小越优先（Reverse(x) 越大）→ **同终点时选越长（start_byte 越小）的对象** |
+
+**对称规则总结**：无论方向如何，同边界的多个候选中，总是选**范围更大/外层嵌套**的对象。
+
+| 场景 | Forward | Backward |
+|------|---------|----------|
+| 同起点边界 | end_byte 大者优先（更长） | - |
+| 同终点边界 | - | start_byte 小者优先（更长） |
+| 共同逻辑 | 最近优先，同近选最长/外层 | 最近优先，同近选最长/外层 |
+
+> **设计意图**：嵌套结构中，外层对象的边界通常与内层对象对齐。从光标视角看，"下一个对象"应该优先选择更外层的容器，而不是内层的微小片段。这与 `textobject_treesitter` 选"最内层包含光标的对象"形成对称 —— 选区向内收缩，跳转向外扩展。
+
+#### 4.6.8 捕获节点范围 vs 完整对象范围的区别
+
+这是最容易混淆的一个概念。`]f` / `[f` 的返回值是**捕获声明所附加的那个 AST 节点的范围**，而不一定是"完整对象"的范围。
+
+| 概念 | 含义 | 由什么决定 |
+|------|------|-----------|
+| **完整对象范围** | 对象本身的完整 AST 节点（如整个 function 定义） | AST 结构本身 |
+| **捕获节点范围** | `@捕获名` 所附加的那个具体节点（可能是完整对象，也可能是其子节点） | .scm 查询文件中 `@capture` 的写法 |
+
+三种捕获在实际查询文件中的典型含义：
+
+| 捕获类型 | 典型附加位置 | 范围大小 | 跳转结果 |
+|---------|-------------|---------|---------|
+| `.around` | 整个对象节点（如 function_definition） | 最大（完整对象） | 跳到整个对象 |
+| `.inside` | 对象的内容节点（如 block） | 中（不含边界） | 跳到对象内容（罕见，需 around 也未声明） |
+| `.movement` | 对象的关键标识（如 identifier、name） | 最小（仅子节点） | 跳到函数名等标识（KDL/PHP/GraphQL 中常见） |
+
+**同一对象类型，三种捕获可能指向三种不同节点**：
+
+```
+┌──────────────────────────────────────────────┐
+│  整个 node（.around 范围）                     │
+│  ┌──────────── identifier ────────────────┐   │
+│  │  fn_name  ← .movement 范围（仅函数名）  │   │
+│  └────────────────────────────────────────┘   │
+│  ┌────── node_children (.inside 范围) ──────┐ │
+│  │   { ... function body ... }              │ │
+│  └──────────────────────────────────────────┘ │
+└──────────────────────────────────────────────┘
+```
+
+> **直觉**：`.movement` 的设计目的是让跳转操作快速定位到对象的"名称"，而不是选中整个大段代码。这符合跳转的使用场景 —— 你只想快速跳到下一个函数的名字处，而不是让光标落在函数体末尾。大多数语言不定义 `.movement`，此时跳转回退到 `.around`，即整个对象范围。
 
 ### 4.7 父节点端点移动：move_parent_node_end（[movement.rs](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/helix-core/src/movement.rs#L637-L699)）
 
@@ -622,16 +713,19 @@ Range 的方向决定了可见光标的"朝向"，这对理解 `with_direction` 
 | 维度 | TextObject 选区 (ma/mi) | Motion 跳转 (]f/[f) |
 |------|------------------------|---------------------|
 | 目标 | 当前光标所在的对象 | 下一个/上一个对象 |
-| 输出 | 覆盖整个对象的 Range（Forward） | 覆盖捕获节点范围的 Range（方向由跳转方向决定） |
+| 输出 Range 来源 | 捕获附加节点的范围（由精确指定的捕获名决定） | 捕获附加节点的范围（取决于声明检查顺序） |
 | 方向 | 始终 Forward（由调用方决定是否调整） | Normal 模式下由 `with_direction(direction)` 决定 |
-| Select 模式 | 不适用（本身就是选区替换） | 保留原 anchor，扩展 head 到对象的近端或远端 |
-| count 语义 | 嵌套层级（括号）/ 段落数 | 跳过的对象个数 |
-| 光标位置 | 对象内部（覆盖整个对象） | 捕获节点边缘（Forward 在末尾，Backward 在开头） |
-| **捕获策略** | 单个精确捕获名（如 `function.inside`） | `[Movement, Around, Inside]` 优先级数组 |
+| Select 模式 | 不适用（本身就是选区替换） | 保留原 anchor，扩展 head 到捕获节点的近端或远端 |
+| count 语义 | 嵌套层级（括号）/ 段落数 | 跳过的捕获节点个数 |
+| 光标最终位置 | 对象内部（覆盖整个捕获节点） | 捕获节点边缘（Forward 在末尾，Backward 在开头） |
+| **节点筛选** | 包含 byte_pos 的节点，取**最内层**（字节长度最小） | 方向最近的节点，同边界取**最外层**（字节长度最大） |
+| **同边界取舍** | 不需要（最短唯一） | 同边界选最长/外层对象（详见 4.6.7） |
+| **捕获策略** | 单个精确捕获名（如 `function.inside`） | `[Movement, Around, Inside]` 声明检查顺序 |
 | **阶段 1 回退** | 无 — 仅检查指定捕获的声明 | 有 — 捕获未声明时依次回退 |
 | **阶段 2 回退** | 无 — 指定捕获无匹配节点时直接返回原 Range | 无 — 选中捕获无匹配节点时直接返回原 Range |
-| **movement 捕获** | 不使用 — 仅 Around/Inside 有效 | 优先使用 — 若声明则跳过 Around/Inside |
-| **设计原则** | 精确匹配用户意图 | 容错优先（声明层面），但选中后不回退 |
+| **movement 捕获** | 不使用 — 仅 Around/Inside 有效 | 优先使用 — 若声明则覆盖 Around/Inside |
+| **范围含义** | 一定是捕获所指节点（通常 around 是完整对象） | **不一定是完整对象** — movement 可能仅指向子节点（如函数名） |
+| **设计原则** | 精确匹配用户意图，向内收缩 | 容错优先（声明层面），向外扩展同边界 |
 
 ---
 
