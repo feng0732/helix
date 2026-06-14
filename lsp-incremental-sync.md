@@ -400,13 +400,19 @@ Content-Length: {len}\r\n\r\n{json}
 
 **版本语义**：LSP 协议规定此 version 指向**所有 content_changes 应用之后**的文档版本（helix-lsp-types/src/lib.rs#L2266-L2273 的注释）。在 Helix 中，`version` 递增发生在 `dispatch(DocumentDidChange)` 之前（helix-view/src/document.rs#L1464），因此 Handler 通过 `event.doc.versioned_identifier()`（helix-view/src/document.rs#L2110-L2112）拿到的 version 恰好是"应用后"的值，语义正确。
 
-**对齐机制**：服务器收到 `didChange` 后，按 version 单调递增的顺序应用变更。如果服务器发现收到的 version 不大于它已知的最新版本，就知道这是一个过时的通知可以忽略。协议层面不要求版本号连续，只需单调递增——这对幽灵事务场景很重要（见第 10 节）。
+**客户端可证明的版本保证**：
 
-**时序保证**：
-1. `apply_impl()` 内部，version 递增和 dispatch 在同一个同步调用栈中完成
-2. Handler 同步调用 `text_document_did_change()` → `notify()` → `server_tx.send()`
-3. Transport 的 send 任务按 channel 接收顺序写入 stdin
-4. 因此，写入 stdin 的 `didChange` 消息的 version 严格单调递增
+1. **递增时机**：`apply_impl()` 中，`self.version += 1`（helix-view/src/document.rs#L1464）在 `dispatch(DocumentDidChange)` 之前执行，因此 Handler 拿到的 `doc.version()` 一定是递增后的值。
+
+2. **携带方式**：Handler 调用 `event.doc.versioned_identifier()`（helix-view/src/document.rs#L2110-L2112）构造 `VersionedTextDocumentIdentifier { uri, version }`，将其作为 `DidChangeTextDocumentParams.text_document` 发出（helix-lsp/src/client.rs#L1092-L1095）。
+
+3. **协议语义**：LSP 规范规定 `DidChangeTextDocumentParams.text_document.version` 指向所有 content_changes 应用之后的文档版本（helix-lsp-types/src/lib.rs#L2266-L2273 的注释）。由于第 1 点，Helix 发出的 version 恰好满足此语义。LSP 规范还声明版本号不需要连续（helix-lsp-types/src/lib.rs#L978），这对幽灵事务场景很重要（见第 10 节）。
+
+4. **发送顺序**：
+   - `apply_impl()` 在主线程同步执行 version 递增和 dispatch
+   - Handler 同步调用 `text_document_did_change()` → `notify()` → `server_tx.send()`
+   - Transport 的 send 任务按 unbounded channel 的 FIFO 顺序写入 stdin
+   - 因此，写入 stdin 的 `didChange` 消息的 version 严格单调递增
 
 ```
 Document.apply_impl()                  Transport::send()
@@ -477,7 +483,7 @@ if let Some(version) = version {
 | 方向 | 编辑器 → 服务器 | 服务器 → 编辑器 | 服务器 → 编辑器 |
 | version 含义 | 应用后文档版本 | 诊断所基于的文档版本 | 编辑应精确匹配的文档版本 |
 | version 字段 | 必选 `i32` | 可选 `Option<i32>` | 可选 `Option<i32>` |
-| 不匹配时 | 服务器自行忽略旧版本 | 整批诊断丢弃 | 拒绝应用，返回错误 |
+| 不匹配时 | 客户端保证 version 单调递增，不匹配情况由服务器自行处理 | 整批诊断丢弃 | 拒绝应用，返回错误 |
 | 无 version 时 | 不存在此情况 | 跳过校验，正常处理 | 跳过校验，直接应用 |
 | 消息语义 | 通知（无需响应） | 通知（无需响应） | 请求（必须响应） |
 
