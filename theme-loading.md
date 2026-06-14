@@ -517,20 +517,81 @@ buffers: [Buffer; 2],  // 前后双缓冲
 current: usize,        // 当前缓冲索引
 ```
 
-渲染流程：
-1. 组件渲染写入当前缓冲（前缓冲）
-2. 与上一帧的后缓冲比较差异
-3. 只输出变化的部分到终端
-4. 交换前后缓冲
+#### 普通渲染流程（每帧 `draw()` 调用）
 
-`terminal.clear()` 强制全量重绘 [helix-tui/src/terminal.rs#L238-L243](helix-tui/src/terminal.rs#L238-L243)：
+```
+① 组件渲染写入当前缓冲 buffers[current]（本帧新内容）
+
+② flush() — 差异比较 [terminal.rs#L151-L156]
+   previous_buffer = buffers[1 - current]  ← 上一帧的渲染结果
+   current_buffer  = buffers[current]      ← 本帧新渲染内容
+   updates = previous_buffer.diff(current_buffer)  ← 逐单元格比较
+   backend.draw(updates)                   ← 只输出变化的单元格到终端
+
+③ 交换前后缓冲 [terminal.rs#L207-L209]
+   buffers[1 - current].reset()  ← 清空即将成为新当前缓冲的那个缓冲
+   current = 1 - current         ← 交换索引
+
+   交换后：
+   - 新的当前缓冲 = 刚被 reset() 清空的缓冲 → 供下一帧组件渲染写入
+   - 新的后缓冲   = 上一帧的渲染结果         → 供下一帧 diff 比较
+```
+
+**关键点**：每一帧都经过 `diff()` 逐单元格比较，只输出与上一帧不同的内容。
+
+#### `diff()` 比较算法 [helix-tui/src/buffer.rs#L730-L755](helix-tui/src/buffer.rs#L730-L755)
+
+```rust
+pub fn diff<'a>(&self, other: &'a Buffer) -> Vec<(u16, u16, &'a Cell)> {
+    let previous_buffer = &self.content;       // 后缓冲（旧帧）
+    let next_buffer = &other.content;          // 当前缓冲（新帧）
+    for (i, (current, previous)) in next_buffer.iter().zip(previous_buffer.iter()).enumerate() {
+        if (current != previous || invalidated > 0) && to_skip == 0 {
+            updates.push((x, y, &next_buffer[i]));  // 只收集差异单元格
+        }
+        // ... 处理双宽字符的 invalidated/to_skip 逻辑
+    }
+    updates
+}
+```
+
+#### `terminal.clear()` 清屏后发生了什么 [helix-tui/src/terminal.rs#L237-L243](helix-tui/src/terminal.rs#L237-L243)
+
 ```rust
 pub fn clear(&mut self) -> io::Result<()> {
-    self.backend.clear()?;                   // 发送清屏控制序列
-    self.buffers[1 - self.current].reset();  // 重置后缓冲，强制全量重绘
+    self.backend.clear()?;                   // ① 发送清屏控制序列到终端
+    self.buffers[1 - self.current].reset();  // ② 重置后缓冲为空白状态
     Ok(())
 }
 ```
+
+**清屏后的 `draw()` 流程**：
+
+```
+① clear() 已执行：后缓冲被 reset() 为全空白
+
+② 组件渲染写入当前缓冲（本帧新内容）
+
+③ flush() — 差异比较
+   previous_buffer = 被清空的后缓冲（全空白）
+   current_buffer  = 本帧新渲染内容
+   diff() 逐单元格比较：空白 vs 有内容 → 每个单元格都不同
+   → updates 包含所有单元格 → 等效于全量输出
+
+④ 交换前后缓冲（同普通流程）
+```
+
+**关键区别**：清屏后**仍然经过 `diff()` 比较**，不是绕过比较直接全量输出。但因为后缓冲被重置为空白，比较结果自然是所有单元格都不同，输出效果等同于全量输出。
+
+#### 普通帧 vs 清屏帧的缓冲对比
+
+| 步骤 | 普通帧 | 清屏帧（`clear()` 后） |
+|------|--------|----------------------|
+| 后缓冲内容 | 上一帧渲染结果 | 全空白（被 `reset()`） |
+| 当前缓冲内容 | 本帧新渲染内容 | 本帧新渲染内容 |
+| `diff()` 结果 | 只输出差异单元格 | **所有单元格都不同**，等效全量输出 |
+| 终端输出量 | 小（仅变化部分） | 大（全部内容） |
+| 前置操作 | 无 | `backend.clear()` 清屏 + 后缓冲 `reset()` |
 
 ### 5.4 三条重绘触发路径
 
@@ -697,9 +758,9 @@ signal::SIGCONT => {
 
 ##### 此路径特点
 
-- 清除整个终端屏幕 + 重置后缓冲
-- 下一帧所有内容都需要重新绘制和输出（无差异优化）
-- 性能开销大，仅用于 `:redraw` 命令等极端场景
+- 清除整个终端屏幕 + 重置后缓冲为空白
+- 后续 `flush()` 仍经过 `diff()` 比较，但因后缓冲为空白，所有单元格都不同，等效全量输出
+- 性能开销大（全量输出 + 前置清屏），仅用于 `:redraw` 命令等极端场景
 
 ---
 
@@ -711,9 +772,9 @@ signal::SIGCONT => {
 | **关键标志** | 无标志，事件处理完直接调用 | `Editor.needs_redraw` + `redraw_timer` | `Compositor.full_redraw` |
 | **防抖机制** | 无（立即响应） | 33ms 合并请求 | 无 |
 | **触发 `render()` 位置** | `handle_editor_event()` / `handle_terminal_events()` / 信号处理 | `handle_editor_event(EditorEvent::Redraw)` / `handle_idle_timeout()` | `render()` 内部检查标志 |
-| **清屏行为** | 默认不清屏（SIGCONT 例外） | 不清屏 | 先清屏 + 重置后缓冲 |
-| **缓冲策略** | 双缓冲差异渲染 | 双缓冲差异渲染 | 无差异，全量输出 |
-| **性能开销** | 小（差异优化） | 小（差异优化） | 大（全量重绘） |
+| **清屏行为** | 默认不清屏（SIGCONT 例外） | 不清屏 | 先 `backend.clear()` 清屏 + 后缓冲 `reset()` |
+| **缓冲策略** | 双缓冲差异渲染 | 双缓冲差异渲染 | 双缓冲差异渲染（但后缓冲为空白，等效全量输出） |
+| **性能开销** | 小（差异优化） | 小（差异优化） | 大（等效全量输出 + 前置清屏） |
 | **典型场景** | 主题切换、保存文件、配置变更 | 光标移动、LSP 诊断、状态消息更新 | `:redraw` 命令、屏幕乱码恢复 |
 
 **主题切换走路径一**：直接 `render()`，不经过 `needs_redraw`，不触发 `full_redraw`。双缓冲会检测到所有字符样式变化，实际效果接近全量重绘，但技术上属于路径一的差异渲染优化范畴。
@@ -725,6 +786,11 @@ signal::SIGCONT => {
 ```rust
 async fn render(&mut self) {
     // ┌─ 路径三的清屏处理（仅 full_redraw=true 时执行）
+    // │  terminal.clear() 做两件事：
+    // │  ① backend.clear() 发送清屏控制序列
+    // │  ② buffers[1-current].reset() 将后缓冲重置为空白
+    // │  后续 flush() 的 diff() 会比较空白后缓冲 vs 当前缓冲
+    // │  → 所有单元格都不同 → 等效全量输出（但仍走 diff 路径）
     // ▼
     if self.compositor.full_redraw {
         self.terminal.clear().expect("Cannot clear the terminal");
@@ -740,13 +806,21 @@ async fn render(&mut self) {
     let surface = self.terminal.current_buffer_mut();
 
     // ┌─ 逐层渲染所有组件（路径一、二、三共同执行）
+    // │  组件渲染写入当前缓冲
     // ▼
     self.compositor.render(area, surface, &mut cx);
     
     // 计算光标位置
     let (pos, kind) = self.compositor.cursor(area, &self.editor);
     
-    // 双缓冲差异比较 → 输出到终端
+    // ┌─ 双缓冲差异比较 → 输出到终端（路径一、二、三共同执行）
+    // │  draw() 内部：
+    // │  ① flush() → diff(后缓冲, 当前缓冲) → 只输出差异单元格
+    // │  ② 交换前后缓冲（新当前缓冲 reset 为空白，供下一帧渲染）
+    // │  ③ backend.flush() 刷新输出
+    // │  清屏帧：后缓冲为空白 → diff 结果 = 全部单元格 → 等效全量输出
+    // │  普通帧：后缓冲为上一帧 → diff 结果 = 仅差异单元格
+    // ▼
     self.terminal.draw(pos, kind).unwrap();
 }
 ```
