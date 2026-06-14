@@ -265,9 +265,11 @@ pub fn goto_treesitter_object(
 
 > **关键校正**：函数内注释 "head of range should be at beginning" 与代码不符。实际代码 `Range::new(start_char, end_char)` 中 head 在 `end_char`（对象终点），anchor 在 `start_char`（对象起点）。返回值是覆盖整个对象的 Forward Range。
 
-#### 4.6.1 捕获优先级与回退机制（[syntax.rs](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/helix-core/src/syntax.rs#L1045-L1069)）
+#### 4.6.1 两阶段捕获选择机制（[syntax.rs](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/helix-core/src/syntax.rs#L1045-L1069)）
 
-优先级由 `capture_nodes_any` 内部的 `find_map` 逻辑决定：
+`capture_nodes_any` 的选择过程分为**两个独立阶段**，需要严格区分：
+
+**阶段 1：捕获存在性检查（一次性选择，有回退）**
 
 ```rust
 let capture = capture_names
@@ -275,61 +277,114 @@ let capture = capture_names
     .find_map(|cap| self.query.get_capture(cap))?;
 ```
 
-`find_map` 按数组顺序遍历，返回第一个 `Some(_)` 结果。这意味着优先级是严格的**数组顺序优先**。
+这一步只检查 .scm 查询文件中是否**声明了**该捕获名（即 `@capture_name` 是否出现过）：
+- 有声明 → `get_capture` 返回 `Some(capture_index)`，选中该捕获，**立即停止检查后续捕获**
+- 未声明 → 返回 `None`，`find_map` 继续尝试下一个捕获名
+
+这是**唯一发生回退的地方**，回退依据是"捕获声明是否存在"。
+
+**阶段 2：节点匹配与过滤（无回退）**
+
+```rust
+let mat = cursor.next_match()?;
+Some(mat.nodes_for_capture(capture).cloned().collect())
+```
+
+一旦在阶段 1 中选中了某个捕获，整个查询过程就**只使用这个捕获的索引**：
+- 遍历所有 query pattern match，从每个 match 中提取该捕获对应的节点
+- 即使选中的捕获匹配到 0 个节点（iterator 为空），也**不会**回头尝试其他捕获
 
 对于 `goto_treesitter_object`，传入的捕获名数组顺序是：
-**`[Movement, Around, Inside]`** — 优先级从高到低。
+**`[Movement, Around, Inside]`** — 阶段 1 的检查顺序。
 
-| 优先级 | 捕获名 | 存在时的行为 |
-|--------|--------|-------------|
-| 1（最高） | `{name}.movement` | 使用该捕获的节点范围，通常是对象的关键标识部分（如函数名、参数名） |
-| 2 | `{name}.around` | 使用整个对象范围（含边界） |
-| 3（最低） | `{name}.inside` | 使用对象的内容范围（不含边界） |
+| 优先级 | 捕获名 | 在阶段 1 的检查 | 选中后的节点范围 |
+|--------|--------|----------------|-----------------|
+| 1（最高） | `{name}.movement` | 第一个检查 | 通常是对象的关键标识部分（如函数名、参数名） |
+| 2 | `{name}.around` | 仅当 movement 未声明时才检查 | 整个对象范围（含边界） |
+| 3（最低） | `{name}.inside` | 仅当 movement 和 around 均未声明时才检查 | 对象的内容范围（不含边界） |
 
-**回退触发条件**：`query.get_capture(cap)` 返回 `None` 表示当前查询文件中没有定义该捕获名。此时 `find_map` 继续尝试下一个捕获名。
+> **核心规则**：回退**只发生在"捕获未声明"时**。一旦某个捕获被声明（即使它对应的节点可能为空），后续捕获就不再被考虑。
 
-**实际查询文件示例**（[php/textobjects.scm](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/runtime/queries/php/textobjects.scm)）：
-```
-(array_element_initializer (_) @entry.inside) @entry.around @entry.movement
-```
-这个查询同时定义了三种捕获，`entry.movement` 和 `entry.around` 指向同一个节点范围。
+#### 4.6.2 KDL 示例：三种同时声明时的精确行为
 
-**查询文件示例**（[kdl/textobjects.scm](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/runtime/queries/kdl/textobjects.scm)）：
-```
+KDL 查询文件（[kdl/textobjects.scm](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/runtime/queries/kdl/textobjects.scm)）中 function 的完整定义：
+
+```scm
+; pattern 1: 定义了 .around 和 .inside，指向不同子节点
+(node
+    children: (node_children)? @function.inside) @function.around
+
+; pattern 2: 定义了 .movement，仅指向 identifier 子节点
 (node (identifier) @function.movement)
 ```
-这个查询只为 function 定义了 `movement` 捕获，指向 `identifier` 节点（函数名）。此时 `]f` 会优先跳转到函数名位置，而非整个函数范围。
 
-#### 4.6.2 回退链与最终失败处理
+**三种捕获都已声明**。阶段 1 的执行过程：
 
-完整的回退链：
-1. 尝试 `{name}.movement` — 如果查询文件有定义，使用它
-2. 如果没有，回退到 `{name}.around` — 如果有定义，使用它
-3. 如果也没有，回退到 `{name}.inside` — 如果有定义，使用它
-4. 如果三者都没有定义，`find_map` 返回 `None`，通过 `?` 传播，`get_range` 闭包返回 `None`
+1. 检查 `function.movement` → 在 pattern 2 中声明了 → 返回 Some → **选中 movement 捕获**
+2. **不再检查** around 和 inside（即使它们也声明了且可能有更多匹配）
 
-**最终失败处理**（[movement.rs](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/helix-core/src/movement.rs#L616-L623)）：
+阶段 2 执行：
+- 只从 match 中提取 `@function.movement` 对应的节点 → 即 `identifier`（函数名）
+- 跳转到下一个函数名的位置，而不是整个 function 范围
+
+**无匹配节点的情况**：如果当前光标位于文件末尾，之后再无 `(node (identifier) ...)` pattern 匹配，则阶段 2 的 iterator 为空，`min_by_key` 返回 None，跳转失败。**不会**回退尝试使用 `function.around` 或 `function.inside`。
+
+#### 4.6.3 PHP entry 示例：同一节点的三种捕获
+
+PHP 查询文件（[php/textobjects.scm](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/runtime/queries/php/textobjects.scm)）：
+
+```scm
+(list_literal
+  (_) @entry.inside @entry.around @entry.movement)
+```
+
+同一个子节点同时带有三种捕获。阶段 1 检查：
+1. `entry.movement` → 已声明 → 选中
+2. 不再检查 around 和 inside
+
+阶段 2 提取 movement 捕获的节点。由于三种捕获指向**同一节点**，结果范围相同。此时三种捕获无行为差异。
+
+#### 4.6.4 回退链的实际触发场景
+
+| 场景 | 阶段 1 行为 | 选中捕获 |
+|------|------------|---------|
+| 三种都声明了（KDL function） | movement 存在 → 停止 | movement |
+| 仅 around + inside 声明（如大多数 Rust 对象） | movement 不存在 → around 存在 → 停止 | around |
+| 仅 inside 声明 | movement 不存在 → around 不存在 → inside 存在 | inside |
+| 三者都未声明 | 全部 None → `?` 返回 None | 跳转失败，返回原 Range |
+
+> **常见模式**：大多数语言的查询文件中只声明 `around` 和 `inside`，不声明 `movement`。因此实际回退通常发生在 "movement 未声明 → 回退到 around" 这一步。只有少数语言（PHP、KDL、GraphQL）为某些对象类型声明了专属的 `movement` 捕获。
+
+#### 4.6.5 最终失败处理（[movement.rs](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/helix-core/src/movement.rs#L616-L623)）
+
 ```rust
 let mut last_range = range;
 for _ in 0..count {
     match get_range(last_range) {
         Some(r) if r != last_range => last_range = r,
-        _ => break,  // 捕获不存在或无匹配节点时跳出循环
+        _ => break,  // 捕获未声明 / 无匹配节点 / 范围越界时跳出
     }
 }
 last_range  // 返回原始 range，不移动
 ```
 
-当所有捕获都不存在或没有找到匹配节点时，返回**原始 Range**，相当于"空操作"。
+触发失败（跳出循环）的三种情况：
+1. **三者都未声明** → 阶段 1 返回 None → `get_range` 返回 None
+2. **已选中的捕获无匹配节点** → 阶段 2 iterator 为空 → `min_by_key` 返回 None
+3. **节点范围越界**（start_byte/end_byte >= len）→ 边界检查返回 None
 
-#### 4.6.3 两种查询入口的对比
+三种情况的最终表现一致：返回原始 Range，不移动。
 
-| 功能 | 调用函数 | 捕获策略 | 回退机制 |
-|------|---------|----------|----------|
-| `mi f` / `ma f` | `textobject_treesitter` | 单个精确捕获名 | **无回退** — 找不到就返回原 Range |
-| `]f` / `[f` | `goto_treesitter_object` | `[Movement, Around, Inside]` 数组 | **三级回退** — 按优先级依次尝试 |
+#### 4.6.6 两种查询入口的对比
 
-> **设计意图**：选区操作需要精确匹配用户的意图（Inside 就是 Inside），而跳转操作更倾向于"能用就行"——即使没有专门的 movement 捕获，也应该能跳到对象范围。
+| 维度 | `mi f` / `ma f`（textobject_treesitter） | `]f` / `[f`（goto_treesitter_object） |
+|------|----------------------------------------|--------------------------------------|
+| 调用方法 | `capture_nodes(&single_name)` | `capture_nodes_any(&[three_names])` |
+| 捕获选择 | 精确匹配单个捕获名 | `[Movement, Around, Inside]` 数组 |
+| 阶段 1 回退 | **无** — 仅检查一个捕获 | **有** — 捕获未声明时回退到下一个 |
+| 阶段 2 回退 | **无** | **无** — 选中捕获无匹配节点时直接失败 |
+| 设计原则 | 精确匹配用户意图（Inside 就是 Inside） | 容错优先，"能用就行"但仅限声明层面 |
+| 失败原因 | 捕获未声明 **或** 无匹配节点 | 三者都未声明 **或** 已选捕获无匹配节点 |
 
 ### 4.7 父节点端点移动：move_parent_node_end（[movement.rs](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/helix-core/src/movement.rs#L637-L699)）
 
@@ -567,14 +622,16 @@ Range 的方向决定了可见光标的"朝向"，这对理解 `with_direction` 
 | 维度 | TextObject 选区 (ma/mi) | Motion 跳转 (]f/[f) |
 |------|------------------------|---------------------|
 | 目标 | 当前光标所在的对象 | 下一个/上一个对象 |
-| 输出 | 覆盖整个对象的 Range（Forward） | 覆盖整个对象的 Range（方向由跳转方向决定） |
+| 输出 | 覆盖整个对象的 Range（Forward） | 覆盖捕获节点范围的 Range（方向由跳转方向决定） |
 | 方向 | 始终 Forward（由调用方决定是否调整） | Normal 模式下由 `with_direction(direction)` 决定 |
 | Select 模式 | 不适用（本身就是选区替换） | 保留原 anchor，扩展 head 到对象的近端或远端 |
 | count 语义 | 嵌套层级（括号）/ 段落数 | 跳过的对象个数 |
-| 光标位置 | 对象内部（覆盖整个对象） | 对象边缘（Forward 在末尾，Backward 在开头） |
-| **捕获策略** | 单个精确捕获名 | `[Movement, Around, Inside]` 优先级数组 |
-| **回退机制** | 无 — 找不到就返回原 Range | 三级回退 — Movement → Around → Inside |
-| **设计原则** | 精确匹配用户意图 | 容错优先，"能用就行" |
+| 光标位置 | 对象内部（覆盖整个对象） | 捕获节点边缘（Forward 在末尾，Backward 在开头） |
+| **捕获策略** | 单个精确捕获名（如 `function.inside`） | `[Movement, Around, Inside]` 优先级数组 |
+| **阶段 1 回退** | 无 — 仅检查指定捕获的声明 | 有 — 捕获未声明时依次回退 |
+| **阶段 2 回退** | 无 — 指定捕获无匹配节点时直接返回原 Range | 无 — 选中捕获无匹配节点时直接返回原 Range |
+| **movement 捕获** | 不使用 — 仅 Around/Inside 有效 | 优先使用 — 若声明则跳过 Around/Inside |
+| **设计原则** | 精确匹配用户意图 | 容错优先（声明层面），但选中后不回退 |
 
 ---
 
