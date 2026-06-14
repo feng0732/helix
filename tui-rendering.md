@@ -383,17 +383,54 @@ pub enum Layout {
             stack.push((child, area))
 ```
 
-#### 分栏示例（三文件垂直分栏 + 一个水平分栏）
+#### 分栏示例（三文件垂直分栏）
+
+真实算法特点：`total_gap` 用 `len.saturating_sub(2)`（少估 1 个 gap），每个孩子后都加 `inner_gap`，最后一个孩子通过 `container.right() - area.x` 修正占满剩余空间。
+
+**示例 1：终端宽度 180px，3 个垂直分栏**
 
 ```
-终端宽度 = 180px
-3 个垂直分栏 → 宽度 = (180 - 2*1) / 3 = 178/3 = 59
-  前两个 59px，第三个 = 180 - 59 - 1 - 59 - 1 = 60px
-  ┌─────────┬─┬─────────┬─┬──────────┐
-  │  59px   │1│  59px   │1│  60px    │
-  │         │ │         │ │          │
-  └─────────┴─┴─────────┴─┴──────────┘
+计算过程：
+  inner_gap = 1
+  total_gap = 1 * (3-2) = 1        ← 近似值（实际有 2 个 gap）
+  used_area = 180 - 1 = 179
+  width = 179 / 3 = 59             ← 整数除法
+  （由于少估了 1 个 gap，每个孩子的 width 会略偏大）
+
+布局推演：
+  child_x 初始 = 0
+  列0: Rect(0, y, 59, h)          → 占 0~58 列
+  child_x += 59 + 1 = 60
+  列1: Rect(60, y, 59, h)         → 占 60~118 列（中间 59 列是 gap 竖线）
+  child_x += 59 + 1 = 120
+  列2（最后一个）: Rect(120, y, 180-120=60, h)  → 占 120~179 列
+    （修正后宽度 = 60，比其他列略宽 1px）
+
+┌─────────┬─┬─────────┬─┬──────────┐
+│  59px   │1│  59px   │1│   60px   │
+│         │ │         │ │          │
+└─────────┴─┴─────────┴─┴──────────┘
+  列0       列1        列2
 ```
+
+**示例 2：终端宽度 100px，3 个垂直分栏**（体现最后一列更窄的情况）
+
+```
+计算过程：
+  total_gap = 1, used_area = 99, width = 33
+
+布局推演：
+  列0: 0~32 (33px)
+  列1: 34~66 (33px)
+  列2: 68~99 (32px)  ← 修正后更窄，因为 width 估大了
+
+┌─────────┬─┬─────────┬─┬────────┐
+│  33px   │1│  33px   │1│  32px  │
+│         │ │         │ │        │
+└─────────┴─┴─────────┴─┴────────┘
+```
+
+> **关键结论**：最后一列宽度由 `container.right() - x` 决定，可能比其他列宽或窄，取决于 `used_area / len` 的整数除法舍入方向。设计意图是先给每个孩子一个近似宽度，最后靠最后一列"收边"占满。
 
 ---
 
@@ -1663,11 +1700,11 @@ Application::render() (helix-term/src/application.rs:255)
 ### 两个垂直分栏（左右分）的宽度怎么算？
 - 在 `Tree::recalculate()` (helix-view/src/tree.rs:408-437) 中：
   - `inner_gap = 1`（左右分栏间 1px 竖线）
-  - `total_gap = inner_gap * len.saturating_sub(2)`（用 len-2 近似，不是 len-1）
+  - `total_gap = inner_gap * len.saturating_sub(2)`（用 len-2 近似，少估 1 个 gap）
   - `used_area = editor_area.width - total_gap`
   - `width = used_area / len(children)`（每个孩子等分，整数除法）
   - 每个孩子 x = child_x，child_x += width + inner_gap（每个孩子后都跳过分隔线）
-  - 最后一个孩子 width 修正为占满剩余空间（因此通常比其他孩子略小）
+  - 最后一个孩子 width 修正为 `container.right() - area.x` 占满剩余空间（可能比其他列宽或窄，取决于整除舍入方向）
 - 注意：水平分栏（上下分）完全没有间隔线，直接 `height = area.height / len` 等分
 
 ### 如何让某个 View 获得自己的 inner_area（文本区）？
