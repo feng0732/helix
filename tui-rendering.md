@@ -66,7 +66,7 @@ Editor 状态 → Component::render() → Buffer(Cell 网格) → diff 更新 �
 
 ## 渲染主循环
 
-一切渲染的入口：[Application::render()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/application.rs#L255-L286)
+一切渲染的入口：`Application::render()` (helix-term/src/application.rs:255-286)
 
 ### 完整步骤（逐行解析）
 
@@ -95,7 +95,7 @@ let mut cx = crate::compositor::Context {
 ```rust
 let area = self.terminal.autoresize().expect("Unable to determine terminal size");
 ```
-- 调用链：[Terminal::autoresize()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/terminal.rs#L169-L175) → `Backend::size()` → `terminal.resize()`
+- 调用链：`Terminal::autoresize()` (helix-tui/src/terminal.rs:169-175) → `Backend::size()` → `terminal.resize()`
 - 如果检测到尺寸变化，会 resize 两个缓冲区并触发清屏
 
 **步骤 4：获取当前缓冲区（前缓冲）**
@@ -130,7 +130,7 @@ self.terminal.draw(pos, kind).unwrap();
 
 ### 主循环中的渲染触发时机
 
-在 [event_loop_until_idle()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/application.rs#L301-L365) 中，以下情况会调用 `self.render().await`：
+在 `event_loop_until_idle()` (helix-term/src/application.rs:301-365) 中，以下情况会调用 `self.render().await`：
 1. 键盘/鼠标终端事件处理返回 `should_redraw = true`
 2. 异步 Jobs 回调完成
 3. Editor 内部事件（Redraw、DocumentSaved、ConfigEvent...）
@@ -141,7 +141,7 @@ self.terminal.draw(pos, kind).unwrap();
 
 ## 合成器（Compositor）层
 
-[Compositor](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/compositor.rs#L78-L227) 是组件的容器与调度器，借鉴了 Cursive 的设计。
+`Compositor` (helix-term/src/compositor.rs:78-227) 是组件的容器与调度器，借鉴了 Cursive 的设计。
 
 ### 数据结构
 ```rust
@@ -161,7 +161,7 @@ pub struct Compositor {
 
 ### Component trait：所有 UI 元素的统一接口
 
-[Component](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/compositor.rs#L40-L76) trait 是渲染管线的核心抽象：
+`Component` (helix-term/src/compositor.rs:40-76) trait 是渲染管线的核心抽象：
 
 ```rust
 pub trait Component: Any + AnyComponent {
@@ -187,7 +187,7 @@ pub trait Component: Any + AnyComponent {
 
 ### Compositor::render：层叠渲染流程
 
-[Compositor::render()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/compositor.rs#L184-L188)
+`Compositor::render()` (helix-term/src/compositor.rs:184-188)
 
 ```rust
 pub fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
@@ -204,7 +204,7 @@ pub fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
 
 ### Compositor::cursor：光标冒泡
 
-[Compositor::cursor()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/compositor.rs#L190-L197)
+`Compositor::cursor()` (helix-term/src/compositor.rs:190-197)
 
 ```rust
 pub fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
@@ -221,7 +221,7 @@ pub fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKi
 
 ## 组件渲染层
 
-以最复杂的 [EditorView](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/ui/editor.rs) 为例，展示组件内部如何协作。
+以最复杂的 `EditorView` (helix-term/src/ui/editor.rs) 为例，展示组件内部如何协作。
 
 ### EditorView::render 内部工作流
 
@@ -261,7 +261,7 @@ self.render_status(chunks[2], surface, cx);
 
 ### Widget trait：无状态可消耗部件
 
-[Widget](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/widgets/mod.rs#L46-L49) 是更轻量的渲染单元，用于 Block、Table 等"即绘即弃"的元素：
+`Widget` (helix-tui/src/widgets/mod.rs:46-49) 是更轻量的渲染单元，用于 Block、Table 等"即绘即弃"的元素：
 
 ```rust
 pub trait Widget {
@@ -301,7 +301,7 @@ Helix 使用**两套布局系统**：
 
 ### 编辑器分栏布局（Tree）
 
-编辑器的窗口分割（`:vsplit` / `:hsplit`）由独立的 [Tree](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-view/src/tree.rs) 数据结构管理，不使用 Cassowary。
+编辑器的窗口分割（`:vsplit` / `:hsplit`）由独立的 `Tree` (helix-view/src/tree.rs) 数据结构管理，不使用 Cassowary。
 
 #### Tree 数据结构
 
@@ -337,7 +337,7 @@ pub enum Layout {
 
 #### Tree::recalculate()：递归平分算法
 
-[Tree::recalculate()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-view/src/tree.rs#L355-L442)
+`Tree::recalculate()` (helix-view/src/tree.rs:355-442)
 
 每次打开/关闭分栏、调整终端大小时触发，使用迭代式深度优先遍历（避免递归栈溢出）：
 
@@ -396,7 +396,7 @@ pub enum Layout {
 
 ### EditorView 内部区域划分
 
-[EditorView::render()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/ui/editor.rs#L1603-L1698) 接收整个终端区域，手动"切蛋糕"：
+`EditorView::render()` (helix-term/src/ui/editor.rs:1603-1698) 接收整个终端区域，手动"切蛋糕"：
 
 ```
 整个终端 area:
@@ -458,7 +458,7 @@ fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
 
 ### 单个 View 内部区域划分
 
-每个 View 获得 Tree 分配的 `view.area` 后，[render_view()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/ui/editor.rs#L77-L247) 继续细分：
+每个 View 获得 Tree 分配的 `view.area` 后，`render_view()` (helix-term/src/ui/editor.rs:77-247) 继续细分：
 
 ```
 view.area（Tree 分配给该视图的矩形）:
@@ -477,14 +477,14 @@ view.area（Tree 分配给该视图的矩形）:
 **区域计算公式**：
 
 ```rust
-// [View::inner_area()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-view/src/view.rs#L210-L212)
+// `View::inner_area()` (helix-view/src/view.rs:210-212)
 pub fn inner_area(&self, doc: &Document) -> Rect {
     self.area
         .clip_left(self.gutter_offset(doc))  // 扣除左侧行号栏
         .clip_bottom(1)                      // 扣除底部状态栏
 }
 
-// [View::gutter_offset()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-view/src/view.rs#L226-L238)
+// `View::gutter_offset()` (helix-view/src/view.rs:226-238)
 // 累加所有 gutter 类型的宽度：
 // - 行号：数字位数决定宽度（1-5 列）
 // - 诊断图标：1 列（错误/警告/提示）
@@ -523,7 +523,7 @@ if viewport.right() != view.area.right() {
 
 #### Popup 布局流程（补全菜单、签名帮助等）
 
-[Popup::render()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/ui/popup.rs#L317-L385)
+`Popup::render()` (helix-term/src/ui/popup.rs:317-385)
 
 ```
 步骤：
@@ -553,7 +553,7 @@ if viewport.right() != view.area.right() {
 
 #### Overlay 布局流程（居中浮层，如文件选择器）
 
-[Overlay::render()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/ui/overlay.rs#L45-L49)
+`Overlay::render()` (helix-term/src/ui/overlay.rs:45-49)
 
 ```rust
 fn render(&mut self, area: Rect, frame: &mut Buffer, ctx: &mut Context) {
@@ -582,7 +582,7 @@ fn clip_rect_relative(rect: Rect, percent_h: u8, percent_v: u8) -> Rect {
 
 ### 状态栏三段式布局详解
 
-每个 View 独立拥有自己的状态栏，由 [statusline::render()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/ui/statusline.rs#L53-L120) 实现，分为**左/中/右**三段，中间留空隙：
+每个 View 独立拥有自己的状态栏，由 `statusline::render()` (helix-term/src/ui/statusline.rs:53-120) 实现，分为**左/中/右**三段，中间留空隙：
 
 ```
 view.area 的最后一行（1 行高）:
@@ -649,7 +649,7 @@ surface.set_spans(center_x, viewport.y, &parts.center, center_width);
 
 ### 命令行栏（Prompt）布局详解
 
-[Prompt::render_prompt()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/ui/prompt.rs#L404-L523) 用于命令输入（`:` 模式、搜索 `/` 模式等），位于**整个终端的底部 1 行**，但会向上扩展出补全窗口和帮助窗口：
+`Prompt::render_prompt()` (helix-term/src/ui/prompt.rs:404-523) 用于命令输入（`:` 模式、搜索 `/` 模式等），位于**整个终端的底部 1 行**，但会向上扩展出补全窗口和帮助窗口：
 
 ```
 整个终端 height=N 行:
@@ -760,7 +760,7 @@ if self.truncate_start && self.cursor == self.anchor {
 
 ### Bufferline（标签页栏）布局
 
-在 [EditorView::render()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/ui/editor.rs#L1616-L1627) 中，当需要时 `bufferline` 会占用**整个终端顶部的 1 行**：
+在 `EditorView::render()` (helix-term/src/ui/editor.rs:1616-1627) 中，当需要时 `bufferline` 会占用**整个终端顶部的 1 行**：
 
 ```
 终端 area 顶部 1 行:
@@ -831,7 +831,7 @@ if use_bufferline {
 
 ### Cassowary 约束布局系统
 
-[Layout](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/layout.rs) 基于 **Cassowary 线性约束求解器**实现通用组件的子区域划分。
+`Layout` (helix-tui/src/layout.rs) 基于 **Cassowary 线性约束求解器**实现通用组件的子区域划分。
 
 #### 核心类型
 
@@ -855,7 +855,7 @@ pub struct Layout {
 
 #### Layout::split() 执行流程
 
-[Layout::split()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/layout.rs#L179-L187)
+`Layout::split()` (helix-tui/src/layout.rs:179-187)
 
 ```
 1. 线程本地缓存查询
@@ -940,7 +940,7 @@ self.contents.render(inner, surface, cx);
 
 ## 缓冲区（Buffer）层
 
-[Buffer](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/buffer.rs) 是渲染的**中间表示**：一个由 `Cell` 组成的二维网格，所有组件都往这里写。
+`Buffer` (helix-tui/src/buffer.rs) 是渲染的**中间表示**：一个由 `Cell` 组成的二维网格，所有组件都往这里写。
 
 ### 核心数据结构
 
@@ -1003,7 +1003,7 @@ content[i] 的坐标:
 
 ### Buffer::diff()：增量更新的核心算法
 
-[Buffer::diff()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/buffer.rs#L730-L755)
+`Buffer::diff()` (helix-tui/src/buffer.rs:730-755)
 
 对比前后两帧的 buffer，只输出变化了的单元格，减少终端 I/O。
 
@@ -1043,7 +1043,7 @@ invalidated 机制确保 index 1 也会被标记为需要刷新
 
 ## 终端（Terminal）双缓冲层
 
-[Terminal](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/terminal.rs) 是 Buffer 与 Backend 之间的桥梁。
+`Terminal` (helix-tui/src/terminal.rs) 是 Buffer 与 Backend 之间的桥梁。
 
 ### 双缓冲设计
 
@@ -1076,7 +1076,7 @@ pub struct Terminal<B: Backend> {
 
 ### Terminal::draw()：完整提交流程
 
-[Terminal::draw()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/terminal.rs#L179-L214)
+`Terminal::draw()` (helix-tui/src/terminal.rs:179-214)
 
 ```rust
 pub fn draw(&mut self, cursor_position: Option<(u16, u16)>, cursor_kind: CursorKind) -> io::Result<()> {
@@ -1106,7 +1106,7 @@ pub fn draw(&mut self, cursor_position: Option<(u16, u16)>, cursor_kind: CursorK
 
 ### flush()：diff 到后端
 
-[Terminal::flush()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/terminal.rs#L151-L156)
+`Terminal::flush()` (helix-tui/src/terminal.rs:151-156)
 
 ```rust
 pub fn flush(&mut self) -> io::Result<()> {
@@ -1121,7 +1121,7 @@ pub fn flush(&mut self) -> io::Result<()> {
 
 ## 后端（Backend）转义序列层
 
-[Backend trait](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/backend/mod.rs#L26-L52) 定义了终端抽象接口，有三种实现：
+`Backend` trait (helix-tui/src/backend/mod.rs:26-52) 定义了终端抽象接口，有三种实现：
 - Windows: `CrosstermBackend<Stdout>`（基于 crossterm 库）
 - Linux/macOS: `TerminaBackend`（基于 termina 库）
 - 测试: `TestBackend`（内存缓冲，用于集成测试）
@@ -1134,7 +1134,7 @@ pub fn flush(&mut self) -> io::Result<()> {
 
 #### 第 1 层：backend/mod.rs 模块级条件编译
 
-[backend/mod.rs](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/backend/mod.rs#L12-L23)
+`backend/mod.rs` (helix-tui/src/backend/mod.rs:12-23)
 
 ```rust
 // 非 Windows + 启用 termina feature → 编译 termina 后端
@@ -1156,7 +1156,7 @@ pub use self::test::TestBackend;
 
 #### 第 2 层：application.rs 类型别名与构造
 
-[application.rs](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/application.rs#L47-L111)
+`application.rs` (helix-term/src/application.rs:47-111)
 
 ```rust
 // 类型别名：根据平台选择后端类型
@@ -1217,7 +1217,7 @@ termina = ["dep:termina", "dep:crossterm"]  # Windows 下 term 功能仍需 cros
 
 ### CrosstermBackend（Windows）
 
-[CrosstermBackend](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/backend/crossterm.rs) 基于 crossterm 库，通过 terminfo 数据库查询终端能力。
+`CrosstermBackend` (helix-tui/src/backend/crossterm.rs) 基于 crossterm 库，通过 terminfo 数据库查询终端能力。
 
 #### 核心数据结构
 
@@ -1233,7 +1233,7 @@ pub struct CrosstermBackend<W: Write> {
 
 #### Backend::draw()：Cell → ANSI 转义序列
 
-[CrosstermBackend::draw()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/backend/crossterm.rs#L228-L291) 核心是**状态机压缩**：只在样式/位置变化时发送转义码。
+`CrosstermBackend::draw()` (helix-tui/src/backend/crossterm.rs:228-291) 核心是**状态机压缩**：只在样式/位置变化时发送转义码。
 
 ```
 输入: Iterator<Item = (u16, u16, &Cell)>  // diff 产生的增量单元格
@@ -1281,7 +1281,7 @@ pub struct CrosstermBackend<W: Write> {
 
 #### ModifierDiff：增量修饰符切换
 
-[ModifierDiff::queue()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/backend/crossterm.rs#L345-L404)
+`ModifierDiff::queue()` (helix-tui/src/backend/crossterm.rs:345-404)
 
 ```
 removed = from - to    // 之前有、现在要去掉的修饰
@@ -1302,7 +1302,7 @@ added = to - from      // 之前没有、现在要加上的修饰
 
 #### 终端能力检测（Capabilities）
 
-[Capabilities::from_env_or_default()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/backend/crossterm.rs#L76-L94)
+`Capabilities::from_env_or_default()` (helix-tui/src/backend/crossterm.rs:76-94)
 
 ```
 从 terminfo 数据库 + 环境变量检测：
@@ -1322,7 +1322,7 @@ added = to - from      // 之前没有、现在要加上的修饰
 
 ### TerminaBackend（Linux/macOS）
 
-[TerminaBackend](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/backend/termina.rs) 基于 termina 库，特点是**主动探测终端能力**而非依赖 terminfo。
+`TerminaBackend` (helix-tui/src/backend/termina.rs) 基于 termina 库，特点是**主动探测终端能力**而非依赖 terminfo。
 
 #### 核心数据结构
 
@@ -1349,7 +1349,7 @@ struct Capabilities {
 
 #### 启动时主动探测终端能力
 
-[TerminaBackend::new()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/backend/termina.rs#L90-L195) 在构造时通过**发送查询转义序列 + 读取响应**主动探测能力：
+`TerminaBackend::new()` (helix-tui/src/backend/termina.rs:90-195) 在构造时通过**发送查询转义序列 + 读取响应**主动探测能力：
 
 ```
 探测流程（同步，带超时）：
@@ -1377,7 +1377,7 @@ struct Capabilities {
 
 #### Backend::draw()：同步输出包装 + 状态机压缩
 
-[TerminaBackend::draw()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/backend/termina.rs#L473-L559) 比 CrosstermBackend 多了**同步输出（Synchronized Output）**包装：
+`TerminaBackend::draw()` (helix-tui/src/backend/termina.rs:473-559) 比 CrosstermBackend 多了**同步输出（Synchronized Output）**包装：
 
 ```rust
 fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
@@ -1548,7 +1548,7 @@ fn end_sychronized_render(&mut self) -> io::Result<()> {
 把所有层串起来，**一帧渲染的完整调用链**：
 
 ```
-Application::render() [helix-term/application.rs:255]
+Application::render() (helix-term/src/application.rs:255)
  │
  ├─ terminal.autoresize()                 ← 查询真实终端尺寸
  │    └─ Backend::size()                  ← ioctl(TIOCGWINSZ) 或同等
@@ -1642,7 +1642,7 @@ Application::render() [helix-term/application.rs:255]
 - 结果就是 `editor_area`，传给 `cx.editor.resize(editor_area)` 触发 Tree::recalculate
 
 ### 两个垂直分栏（左右分）的宽度怎么算？
-- 在 [Tree::recalculate()](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-view/src/tree.rs#L408-L437) 中：
+- 在 `Tree::recalculate()` (helix-view/src/tree.rs:408-437) 中：
   - `inner_gap = 1`（左右分栏间 1px 竖线）
   - `total_gap = inner_gap * (len-1)` = 有几列就有几条分隔线
   - `used_area = editor_area.width - total_gap`
@@ -1678,10 +1678,10 @@ Application::render() [helix-term/application.rs:255]
 - Windows 下的 CrosstermBackend 不支持此特性，完全依赖双缓冲
 
 ### Windows 和 Linux/macOS 编译时选后端的代码在哪？
-- **模块级**：[helix-tui/src/backend/mod.rs](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-tui/src/backend/mod.rs#L12-L23)
+- **模块级**：`helix-tui/src/backend/mod.rs` (helix-tui/src/backend/mod.rs:12-23)
   - `#[cfg(all(feature="termina", not(windows)))]` → 编译 `mod termina`
   - `#[cfg(all(feature="termina", windows))]` → 编译 `mod crossterm`
-- **类型别名级**：[helix-term/src/application.rs](file:///d:/fz/0601/solo-dogfeeding/code/280-helix/helix-term/src/application.rs#L47-L61)
+- **类型别名级**：`helix-term/src/application.rs` (helix-term/src/application.rs:47-61)
   - `type TerminalBackend = TerminaBackend`（非 Windows）
   - `type TerminalBackend = CrosstermBackend<Stdout>`（Windows）
 - **构造级**：`Application::new()` 中按平台 `TerminaBackend::new(config)` / `CrosstermBackend::new(stdout, config)`
