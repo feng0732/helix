@@ -9,6 +9,7 @@ Helix 编辑器的文件 IO 与编码处理主要分布在以下几个核心模�
 - [editor_config.rs](helix-core/src/editor_config.rs)：EditorConfig 配置解析（含编码设置）
 - [editor.rs](helix-view/src/editor.rs)：编辑器层面的文件操作封装
 - [typed.rs](helix-term/src/commands/typed.rs)：命令层的文件操作入口
+- [commands.rs](helix-term/src/commands.rs)：普通模式编辑命令（换行、粘贴、o/O等）
 - [application.rs](helix-term/src/application.rs)：应用层的保存事件处理
 
 编码功能基于 `encoding_rs` crate 实现，自动检测使用 `chardetng` crate。
@@ -162,7 +163,7 @@ pub const NATIVE_LINE_ENDING: LineEnding = LineEnding::LF;
 
 ### 2.2 新建文档（无路径）的行尾
 
-[Document::default()](helix-view/src/document.rs) 用于创建空白文档（如 `:new`）：
+[Document::default()](helix-view/src/document.rs) 用于创建空白文档（如 `:new` 命令）：
 
 ```rust
 pub fn default(config, syn_loader) -> Self {
@@ -200,8 +201,9 @@ pub fn detect_indent_and_line_ending(&mut self) {
 行尾元信息 `doc.line_ending` 的确定优先级：
 1. `editor_config.line_ending`（EditorConfig 的 `end_of_line`）
 2. `auto_detect_line_ending(&self.text)`（扫描前 100 行，返回首个匹配的行尾）
+3. 保持 `Document::from()` 中的初始值（`default_line_ending`）
 
-**关键理解**：`doc.line_ending` 只是一个元信息标记，**不影响 Rope 中的实际行尾字符**。它的作用是在需要"插入新行尾"时（如 `insert_final_newline`）决定用 `\n` 还是 `\r\n`。
+**重要理解**：`detect_indent_and_line_ending()` 只设置元信息 `self.line_ending`，**不修改 Rope 中的实际行尾字符**。
 
 ### 2.4 新文件但路径不存在时的行尾
 
@@ -215,7 +217,7 @@ let encoding = encoding.unwrap_or(encoding::UTF_8);
 (Rope::from(line_ending.as_str()), encoding, false)
 ```
 
-Rope 内容 = 一个行尾字符，行尾来源：EditorConfig > 用户配置默认值 > 平台原生。
+Rope 内容 = 一个行尾字符，行尾来源：EditorConfig `end_of_line` > 用户配置默认值 > 平台原生。
 
 ### 2.5 stdin 文档的行尾
 
@@ -224,14 +226,14 @@ Rope 内容 = 一个行尾字符，行尾来源：EditorConfig > 用户配置默
 ```rust
 let (stdin, encoding, has_bom) = crate::document::read_to_string(&mut stdin(), None)?;
 let doc = Document::from(
-    helix_core::Rope::default(),  // 空 Rope
+    helix_core::Rope::default(),  // 先创建空 Rope
     Some((encoding, has_bom)),
     // ...
 );
 // 然后通过 Transaction::insert 将 stdin 内容插入
 ```
 
-stdin 内容通过 `read_to_string()` 解码后原样插入 Rope，行尾不归一化。
+stdin 内容通过 `read_to_string()` 解码后原样插入 Rope，行尾不做归一化。随后 `doc.detect_indent_and_line_ending()` 会根据实际内容检测并设置元信息。
 
 ---
 
@@ -426,7 +428,7 @@ if doc.insert_final_newline() {
 }
 ```
 
-[insert_final_newline()](helix-term/src/commands/typed.rs) 是**行尾与保存交互的关键位置**：
+[insert_final_newline()](helix-term/src/commands/typed.rs)：
 
 ```rust
 fn insert_final_newline(doc: &mut Document, view_id: ViewId) {
@@ -439,7 +441,7 @@ fn insert_final_newline(doc: &mut Document, view_id: ViewId) {
 }
 ```
 
-这里 `doc.line_ending.as_str()` 决定了插入的行尾是 `\n` 还是 `\r\n`。这是 `doc.line_ending` 元信息**直接影响 Rope 内容**的唯一位置。
+这里 `doc.line_ending.as_str()` 决定了插入的行尾是 `\n` 还是 `\r\n`。这是 `doc.line_ending` 元信息影响 Rope 内容的场景之一（详见第十三章）。
 
 是否启用的判断：
 ```rust
@@ -527,7 +529,7 @@ match dst.sync_all().await {
 5. 最后一个空 chunk 触发刷新：writer.write_all() + writer.flush()
 ```
 
-**BOM 写入（[apply_bom()](helix-view/src/document.rs)）：**
+**BOM 写入（apply_bom()）：**
 
 保存时如果 `has_bom = true`，在输出缓冲区开头写入 BOM：
 
@@ -620,13 +622,27 @@ fn encode_from_utf8(&mut self, src: &str, dst: &mut [u8], is_empty: bool)
 | 新建文档 | `default_line_ending` 对应的字符 | `default_line_ending` 转换结果 |
 | 打开混合行尾文件 | 原样保留混合行尾 | 首个检测到的行尾类型 |
 
-**doc.line_ending 的用途**：只在以下场景决定用什么行尾字符：
-1. `insert_final_newline()` — 在文件末尾追加行尾时
-2. 状态栏显示 — 显示当前文档的行尾类型
+**doc.line_ending 的作用**：在需要"插入新行尾字符"的所有编辑路径中决定用哪种行尾（详见第十三章）。
 
-**doc.line_ending 不做的事**：不做行尾转换。Helix 没有 CRLF ↔ LF 的自动转换功能。
+**doc.line_ending 不做的事**：
 
-### 6.4 行尾优先级汇总
+- ❌ 不会自动将已有内容的行尾统一为元信息指定的格式
+- ❌ 不会在保存时做行尾转换
+- ❌ 不会在打开时做行尾归一化
+
+**行尾不归一化原则**：
+
+Helix 的核心设计原则是"所见即所得"——文件在磁盘上是什么行尾，Rope 中就是什么行尾，保存时原样写出。`doc.line_ending` 只是一个"预期的行尾风格"元信息，用于指导后续编辑操作中新行尾的插入，而非强制已有内容的格式。
+
+### 6.4 行尾检测函数
+
+Helix 提供了三个层级的行尾检测函数（详见 13.10 节）：
+
+- `get_line_ending(&RopeSlice)`：检测单行 Rope 切片的行尾，用于遍历文档时
+- `get_line_ending_of_str(&str)`：检测普通字符串的行尾，用于寄存器、剪贴板内容
+- `auto_detect_line_ending(&Rope)`：扫描前 100 行返回首个匹配的行尾，用于打开文件时的自动检测
+
+### 6.5 行尾优先级汇总
 
 **打开文件时 `doc.line_ending` 的确定**：
 
@@ -644,6 +660,13 @@ fn encode_from_utf8(&mut self, src: &str, dst: &mut [u8], is_empty: bool)
 1. EditorConfig end_of_line
    ↓ 未设置
 2. config.default_line_ending（默认 Native → 平台原生）
+```
+
+**编辑操作中新插入行尾的来源**：
+
+```
+始终来自 doc.line_ending.as_str()
+（第十三章详细列出了所有调用位置）
 ```
 
 ---
@@ -664,7 +687,7 @@ UTF-8 字符串片段（&str）
 
 ### 7.2 编码转换发生的精确位置
 
-编码转换的**唯一位置**是 [to_writer()](helix-view/src/document.rs) 中的内层循环：
+编码转换的**唯一位置**是 `to_writer()` 中的内层循环：
 
 ```rust
 let (result, read, written, ..) =
@@ -793,7 +816,7 @@ pub struct Document {
     text: Rope,                                // 文档内容（内部始终 UTF-8）
     encoding: &'static encoding::Encoding,     // 文件编码
     has_bom: bool,                             // 是否有 BOM（影响保存时是否写 BOM）
-    line_ending: LineEnding,                   // 行尾风格（元信息，不控制 Rope 内容）
+    line_ending: LineEnding,                   // 行尾风格（元信息，控制新行尾插入）
     last_saved_time: SystemTime,               // 上次保存时间（用于外部修改检测）
     last_saved_revision: usize,                // 上次保存的修订号
     editor_config: EditorConfig,               // EditorConfig 设置
@@ -861,17 +884,542 @@ pub fn set_encoding(&mut self, label: &str) -> Result<(), Error> {
 
 ---
 
+## 十三、行尾处理边界详解
+
+本章详细说明：显式切换行尾时是否改写已有内容、以及各编辑路径如何按当前行尾元信息插入新行尾。
+
+### 13.1 doc.line_ending 的读取位置汇总
+
+`doc.line_ending.as_str()` 是行尾元信息实际生效的方式。它在代码中的调用位置：
+
+| 位置 | 用途 |
+|------|------|
+| [insert_newline()](helix-term/src/commands.rs) | Enter 键换行时插入行尾 |
+| [open()](helix-term/src/commands.rs) | `o`/`O` 命令在上方/下方开新行时插入行尾 |
+| [add_newline_impl()](helix-term/src/commands.rs) | `<a-j>`/`<a-k>` 在上方/下方添加纯换行时插入 |
+| [paste_impl()](helix-term/src/commands.rs) | 粘贴时用作行尾正则替换的目标 |
+| [replace_selections_with_register()](helix-term/src/commands.rs) | 用寄存器内容替换选区时用作行尾正则替换的目标 |
+| [insert_final_newline()](helix-term/src/commands/typed.rs) | 保存前在末尾追加行尾时插入 |
+| [Document::default()](helix-view/src/document.rs) | 新建空白文档时初始化 Rope 内容 |
+| [Document::open()](helix-view/src/document.rs) | 路径不存在的新文件初始化 Rope 内容 |
+| [expansion::Variable::LineEnding](helix-view/src/expansion.rs) | `$line_ending` 变量扩展返回值 |
+| [Document::snippet_ctx()](helix-view/src/document.rs) | LSP 片段渲染时的行尾上下文 |
+
+### 13.2 显式切换行尾（:line-ending 命令）
+
+`:line-ending` 命令是唯一的**显式行尾切换**入口。完整实现在 [typed.rs](helix-term/src/commands/typed.rs)。
+
+**核心代码：**
+
+```rust
+// 解析参数：crlf / lf 等
+let line_ending = match arg {
+    arg if arg.starts_with("crlf") => Crlf,
+    arg if arg.starts_with("lf") => LF,
+    // ... unicode-lines 额外支持 cr、ff、nel
+    _ => bail!("invalid line ending"),
+};
+
+// 步骤 1：先更新元信息
+let (view, doc) = current!(cx.editor);
+doc.line_ending = line_ending;
+
+// 步骤 2：创建 Transaction 替换所有行的实际行尾字符
+let mut pos = 0;
+let transaction = Transaction::change(
+    doc.text(),
+    doc.text().lines().filter_map(|line| {
+        pos += line.len_chars();
+        match helix_core::line_ending::get_line_ending(&line) {
+            Some(ending) if ending != line_ending => {
+                // 行尾不匹配 → 替换
+                let start = pos - ending.len_chars();
+                let end = pos;
+                Some((start, end, Some(line_ending.as_str().into())))
+            }
+            _ => None,  // 行尾匹配或无行尾 → 跳过
+        }
+    }),
+);
+doc.apply(&transaction, view.id);
+doc.append_changes_to_history(view);
+```
+
+**关键结论：**
+
+| 问题 | 答案 |
+|------|------|
+| 是否修改 `doc.line_ending` 元信息？ | **是**，立即更新 `doc.line_ending = line_ending` |
+| 是否改写 Rope 中已有内容？ | **是**，创建 Transaction 遍历所有行，凡是行尾与目标不同就替换 |
+| 无行尾的行会被修改吗？ | **不会**，`get_line_ending()` 返回 None 的行被跳过（如最后一行没有行尾时） |
+| 可以 undo 吗？ | **可以**，`append_changes_to_history()` 将 Transaction 写入历史 |
+| 混合行尾如何处理？ | 每行独立判断，只替换与目标不同的行尾 |
+
+**处理流程：**
+
+```
+用户输入 :line-ending crlf
+    ↓
+doc.line_ending = Crlf    ← 元信息先更新
+    ↓
+遍历 Rope 所有行:
+  行尾 == LF? → Transaction 变更 (start, end, Some("\r\n"))
+  行尾 == Crlf? → 跳过
+  无行尾? → 跳过
+    ↓
+doc.apply(transaction)    ← 统一执行所有变更
+doc.append_changes_to_history(view)
+```
+
+### 13.3 Enter 键换行（insert_newline）
+
+在插入模式下按 Enter 键触发 [insert_newline()](helix-term/src/commands.rs)。
+
+**核心代码：**
+
+```rust
+pub fn insert_newline(cx: &mut Context) {
+    // ...
+    let text = doc.text().slice(..);
+    let line_ending = doc.line_ending.as_str();  // 关键：读取当前行尾元信息
+    // ...
+    let transaction = Transaction::change_by_selection(contents, selection, |range| {
+        // ...
+        // 场景 1：在行尾处有尾随空白时（常规情况）
+        if let Some(idx) = text.slice(line_start..pos).last_non_whitespace_char() {
+            // ...
+            let local_offs = if let Some(token) = continue_comment_token {
+                // 注释续行
+                new_text.push_str(line_ending);
+                new_text.push_str(&indent);
+                new_text.push_str(token);
+                new_text.push(' ');
+                // ...
+            } else if on_auto_pair {
+                // 在括号对中间换行：插入两行
+                new_text.push_str(line_ending);    // ← 使用元信息
+                new_text.push_str(&inner_indent);
+                // ...
+                new_text.push_str(line_ending);    // ← 使用元信息
+                new_text.push_str(&indent);
+                // ...
+            } else {
+                // 普通换行
+                new_text.push_str(line_ending);    // ← 使用元信息
+                new_text.push_str(&indent);
+                // ...
+            }
+            // ...
+        } else {
+            // 场景 2：整行都是空白
+            new_text.push_str(line_ending);        // ← 使用元信息
+            // ...
+        }
+    });
+    doc.apply(&transaction, view.id);
+    // ...
+}
+```
+
+**关键结论：**
+
+- `doc.line_ending.as_str()` 在函数开头被**一次性提取**为局部变量 `line_ending`
+- 所有 `new_text.push_str(line_ending)` 都使用这个值
+- 如果当前文档是 CRLF 模式，Enter 插入的就是 `\r\n`
+- 如果当前文档是 LF 模式，Enter 插入的就是 `\n`
+- **不会**修改已有内容的行尾，只会在新插入的位置使用元信息指定的行尾
+- 另外会处理尾随空白删除、括号对智能换行、注释续行、自动缩进等
+
+### 13.4 o / O 命令（open_below / open_above）
+
+普通模式下按 `o` 在下方开新行，`O` 在上方开新行。实现位于 [open()](helix-term/src/commands.rs)。
+
+**核心代码：**
+
+```rust
+fn open(cx: &mut Context, open: Open, comment_continuation: CommentContinuation) {
+    enter_insert_mode(cx);
+    let config = cx.editor.config();
+    let (view, doc) = current!(cx.editor);
+    // ...
+
+    let mut transaction = Transaction::change_by_selection(contents, selection, |range| {
+        // ...
+        let mut text = String::with_capacity(1 + indent_len);
+
+        if open == Open::Above && next_new_line_num == 0 {
+            // 在第一行上方开新行：先写缩进 + 可选注释，后写行尾
+            text.push_str(&indent);
+            if let Some(token) = continue_comment_token {
+                text.push_str(token);
+                text.push(' ');
+            }
+            text.push_str(doc.line_ending.as_str());  // ← 使用元信息
+        } else {
+            // 常规情况：先写行尾，后写缩进 + 可选注释
+            text.push_str(doc.line_ending.as_str());  // ← 使用元信息
+            text.push_str(&indent);
+            if let Some(token) = continue_comment_token {
+                text.push_str(token);
+                text.push(' ');
+            }
+        }
+
+        let text = text.repeat(count);  // 重复 count 次（支持 3o 开 3 行）
+        // ...
+        (above_next_line_end_index, above_next_line_end_index, Some(text.into()))
+    });
+    // ...
+    doc.apply(&transaction, view.id);
+}
+```
+
+**关键结论：**
+
+- 通过 `doc.line_ending.as_str()` 直接读取元信息（不缓存为局部变量）
+- 第一行上方开新行的顺序特殊：内容在行尾**之前**（因为是在第 0 行位置插入）
+- 其他情况：行尾 + 缩进 + 可选注释，行尾在最前
+- 支持数字计数：`3o` 会重复插入 3 次
+- 进入插入模式，光标定位在新行的缩进之后
+- **不会**修改已有内容的行尾
+
+### 13.5 粘贴操作（paste）
+
+粘贴操作有两种主要入口：`p`（`paste_after`）和 `P`（`paste_before`）。核心逻辑在 [paste_impl()](helix-term/src/commands.rs) 和 [replace_selections_with_register()](helix-term/src/commands.rs)。
+
+**行尾转换的核心机制：**
+
+```rust
+static LINE_ENDING_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\r\n|\r|\n").unwrap());
+```
+
+这个正则匹配**所有常见行尾格式**：`\r\n`（CRLF）、`\r`（单独的 CR）、`\n`（LF）。
+
+**paste_impl() 中的转换：**
+
+```rust
+fn paste_impl(values: &[String], doc: &mut Document, view: &mut View,
+               pos: Paste, count: usize, mode: Mode) {
+    // ...
+    let map_value = |value| {
+        // 关键：正则替换所有行尾为当前文档行尾
+        let value = LINE_ENDING_REGEX.replace_all(value, doc.line_ending.as_str());
+        let mut out = Tendril::from(value.as_ref());
+        for _ in 1..count {
+            out.push_str(&value);
+        }
+        out
+    };
+    // ...
+}
+```
+
+**replace_selections_with_register() 中的转换（粘贴到选区）：**
+
+```rust
+fn replace_selections_with_register(editor: &mut Editor, register: char, count: usize) {
+    // ...
+    let map_value = |value: &Cow<str>| {
+        // 同样的正则替换
+        let value = LINE_ENDING_REGEX.replace_all(value, doc.line_ending.as_str());
+        let mut out = Tendril::from(value.as_ref());
+        for _ in 1..count {
+            out.push_str(&value);
+        }
+        out
+    };
+    // ...
+}
+```
+
+**关键结论：**
+
+| 问题 | 答案 |
+|------|------|
+| 来源内容是 Windows CRLF 呢？ | 用 `LINE_ENDING_REGEX` 把所有 `\r\n` 替换为目标行尾 |
+| 来源内容是老 Mac CR 呢？ | `\r` 也会被正则匹配并替换 |
+| 来源是混合行尾？ | 每种行尾分别被正则捕获，统一替换 |
+| 会修改已粘贴内容之外的行吗？ | **不会**，只处理被粘贴的 `value` 字符串 |
+| yank 时的行尾是怎么存的？ | 见 13.7 节（寄存器使用 `NATIVE_LINE_ENDING` 拼接） |
+
+**数据流：**
+
+```
+剪贴板内容 (可能含任意行尾)
+    ↓ LINE_ENDING_REGEX.replace_all(value, doc.line_ending.as_str())
+统一行尾后的字符串
+    ↓ Transaction::change 或 Transaction::insert
+插入到 Rope 中（行尾已与文档一致）
+```
+
+### 13.6 add_newline_above / add_newline_below 命令
+
+绑定键：`<a-j>`（在下方添加换行，不进入插入模式）和 `<a-k>`（在上方添加）。
+
+实现位于 [add_newline_impl()](helix-term/src/commands.rs)：
+
+```rust
+fn add_newline_impl(cx: &mut Context, open: Open) {
+    let count = cx.count();
+    let (view, doc) = current!(cx.editor);
+    let selection = doc.selection(view.id);
+    let text = doc.text();
+    let slice = text.slice(..);
+
+    let changes = selection.into_iter().map(|range| {
+        let (start, end) = range.line_range(slice);
+        let line = match open {
+            Open::Above => start,
+            Open::Below => end + 1,
+        };
+        let pos = text.line_to_char(line);
+        (
+            pos,
+            pos,
+            // 直接用元信息重复 count 次
+            Some(doc.line_ending.as_str().repeat(count).into()),
+        )
+    });
+
+    let transaction = Transaction::change(text, changes);
+    doc.apply(&transaction, view.id);
+}
+```
+
+**关键结论：**
+
+- 纯插入行尾字符，**不进入插入模式**
+- 与 `o`/`O` 不同：不添加任何缩进或注释续行
+- 光标位置不变（仍在原行）
+- 常用于在代码块之间快速插入空行
+
+### 13.7 Yank / 寄存器与剪贴板的行尾
+
+寄存器写入时使用**平台原生行尾 `NATIVE_LINE_ENDING`**，而非 `doc.line_ending`。这是一个特殊的边界行为。
+
+实现位于 [register.rs](helix-view/src/register.rs)：
+
+```rust
+pub fn write(&mut self, name: char, mut values: Vec<String>) -> Result<()> {
+    match name {
+        '*' | '+' => {  // 系统剪贴板寄存器
+            self.clipboard_provider.load().set_contents(
+                // 用 NATIVE_LINE_ENDING 拼接多个选区值
+                &values.join(NATIVE_LINE_ENDING.as_str()),
+                ClipboardType::Clipboard,  // 或 Selection
+            )?;
+            // ...
+        }
+        _ => { /* 普通寄存器直接存储，不做处理 */ }
+    }
+}
+
+pub fn push(&mut self, name: char, mut value: String) -> Result<()> {
+    match name {
+        '*' | '+' => {  // 追加到剪贴板
+            // ...
+            saved_values.push(value.clone());
+            if !contents.is_empty() {
+                // 追加时用 NATIVE_LINE_ENDING 分隔旧内容和新内容
+                value.push_str(NATIVE_LINE_ENDING.as_str());
+            }
+            value.push_str(&contents);
+            // ...
+        }
+        _ => { /* 普通寄存器直接存储 */ }
+    }
+}
+```
+
+**完整的 Yank → 粘贴数据流：**
+
+```
+yank（从 Rope 中选区内容原样复制）
+    ↓
+寄存器/剪贴板 write():
+  ├─ 多选区 → 用 NATIVE_LINE_ENDING 拼接后写入剪贴板
+  └─ 单选区 → 原样写入剪贴板（Rope 中是什么行尾就是什么）
+    ↓
+系统剪贴板（Windows 上拼接用 \r\n，Linux/macOS 用 \n）
+    ↓
+粘贴时 paste_impl():
+  LINE_ENDING_REGEX.replace_all(内容, doc.line_ending.as_str())
+    ↓ 统一为文档行尾
+插入到 Rope
+```
+
+**特殊情况说明：**
+
+- **单选区 yank → 同文档粘贴**：Rope 中是 `\r\n`，剪贴板中也是 `\r\n`，粘贴时如果文档是 CRLF 模式则不做实际替换
+- **单选区 yank → 跨文档粘贴**：文档 A 是 CRLF，yank 后在文档 B（LF 模式）中粘贴，粘贴时 CRLF 会被转为 LF
+- **多选区 yank**：无论源文档行尾是什么，写入剪贴板时多值之间用 `NATIVE_LINE_ENDING` 分隔；粘贴回时所有行尾（包括拼接用的分隔符）会被统一转换
+- **yank 内部寄存器**：`"ay` 到 a 寄存器时不做处理，原样存储；`"ap` 时仍然经过 `LINE_ENDING_REGEX` 转换
+
+### 13.8 LSP Snippet 渲染
+
+LSP 代码片段（Snippet）渲染时，行尾由当前文档的 `doc.line_ending` 决定。
+
+实现位于 [Document::snippet_ctx()](helix-view/src/document.rs)：
+
+```rust
+pub fn snippet_ctx(&self) -> SnippetRenderCtx {
+    SnippetRenderCtx {
+        resolve_var: Box::new(|_| None),
+        tab_width: self.tab_width(),
+        indent_style: self.indent_style,
+        line_ending: self.line_ending.as_str(),  // ← 使用元信息
+    }
+}
+```
+
+`SnippetRenderCtx` 会传递给 LSP 服务，用于渲染代码片段模板。片段模板中的换行符会被转换为 `line_ending` 指定的格式。
+
+### 13.9 变量扩展 $line_ending
+
+Helix 支持通过 `$line_ending` 变量在命令行或配置中引用当前文档的行尾。
+
+实现位于 [expansion.rs](helix-view/src/expansion.rs)：
+
+```rust
+pub fn expand(&self, doc: &Document, view: &View) -> Result<Cow<str>> {
+    match self {
+        // ...
+        Variable::LineEnding => Ok(Cow::Borrowed(doc.line_ending.as_str())),
+        // ...
+    }
+}
+```
+
+例如在状态栏配置中显示 `$line_ending` 会显示为 `\r\n` 或 `\n`（实际显示的是原始字符）。
+
+### 13.10 行尾检测函数详解
+
+Helix 提供了两个行尾检测函数，分别处理 `RopeSlice` 和 `&str`。
+
+**get_line_ending(&line) - 检测单行 Rope 切片的行尾**
+
+位于 [line_ending.rs](helix-core/src/line_ending.rs)：
+
+```rust
+pub fn get_line_ending(line: &RopeSlice) -> Option<LineEnding> {
+    // 最后 1 个字符作为 str
+    let g1 = line.slice(line.len_chars().saturating_sub(1)..)
+        .as_str().unwrap();
+    // 最后 2 个字符作为 str
+    let g2 = line.slice(line.len_chars().saturating_sub(2)..)
+        .as_str().unwrap_or("");
+    // 先检查 2 字符的 CRLF，再检查 1 字符的行尾
+    LineEnding::from_str(g2).or_else(|| LineEnding::from_str(g1))
+}
+```
+
+- 用于 `RopeSlice`（来自 `rope.lines()` 迭代）
+- 必须先检查 `g2`（2 字符）再检查 `g1`（1 字符），否则 `\r\n` 会被误判为 `\n`
+- Ropey 保证 CRLF 始终连续，不会跨 chunk
+
+**get_line_ending_of_str(line) - 检测字符串的行尾**
+
+位于 [line_ending.rs](helix-core/src/line_ending.rs)：
+
+```rust
+pub fn get_line_ending_of_str(line: &str) -> Option<LineEnding> {
+    if line.ends_with("\u{000D}\u{000A}") {
+        Some(LineEnding::Crlf)
+    } else if line.ends_with('\u{000A}') {
+        Some(LineEnding::LF)
+    }
+    // unicode-lines feature 额外检查 VT, FF, CR, Nel, LS, PS
+    else {
+        None
+    }
+}
+```
+
+- 用于普通 `&str`（如寄存器内容、剪贴板内容）
+- 使用 `\u{XXXX}` 转义序列而非直接写 `\r\n`，确保跨平台一致
+
+**auto_detect_line_ending(doc) - 自动检测文档行尾**
+
+位于 [line_ending.rs](helix-core/src/line_ending.rs)：
+
+```rust
+pub fn auto_detect_line_ending(doc: &Rope) -> Option<LineEnding> {
+    for line in doc.lines().take(100) {
+        match get_line_ending(&line) {
+            None => {}
+            #[cfg(feature = "unicode-lines")]
+            Some(LineEnding::VT) | Some(LineEnding::FF) | Some(LineEnding::PS) => {}
+            ending => return ending,
+        }
+    }
+    None
+}
+```
+
+- 只扫描前 100 行，保证性能
+- 跳过 VT、FF、PS 等特殊用途行尾（unicode-lines 模式）
+- 返回第一个匹配的行尾
+
+### 13.11 编辑路径总览表
+
+| 操作 | 触发方式 | 是否使用 `doc.line_ending.as_str()` | 是否修改已有内容行尾 |
+|------|---------|-----------------------------------|---------------------|
+| Enter 换行 | 插入模式 Enter | ✅ 是（开头提取到局部变量） | ❌ 否 |
+| 下方开新行 | 普通模式 `o` | ✅ 是（直接读取） | ❌ 否 |
+| 上方开新行 | 普通模式 `O` | ✅ 是（直接读取） | ❌ 否 |
+| 添加纯换行 | `<a-j>` / `<a-k>` | ✅ 是（repeat） | ❌ 否 |
+| 粘贴 | `p` / `P` | ✅ 是（LINE_ENDING_REGEX 替换目标） | ❌ 否（只改粘贴内容） |
+| 选区替换粘贴 | `R` / `gp` 等 | ✅ 是（LINE_ENDING_REGEX 替换目标） | ❌ 否（只改选区内容） |
+| 保存末尾补换行 | 写入命令 | ✅ 是（insert_final_newline） | ❌ 否（只在末尾无行尾时添加） |
+| 显式切换行尾 | `:line-ending crlf/lf` | ✅ 是（Transaction 替换源） | ✅ **是**，遍历所有行替换 |
+| 新建空白文档 | `:new` | ✅ 是（初始化 Rope 内容） | N/A（空文档） |
+| 打开不存在路径的文件 | `:open new.txt` | ✅ 是（初始化 Rope 内容） | N/A（新文档） |
+| LSP Snippet 插入 | 自动补全/代码段 | ✅ 是（SnippetRenderCtx） | ❌ 否 |
+| 变量扩展 | `$line_ending` | ✅ 是（原样返回） | ❌ 否 |
+| 保存到磁盘 | `:w` | ❌ 否（Rope 原样写出） | ❌ 否 |
+| 重新加载 | `:reload` | ❌ 否（按磁盘内容） | 🔄 可能（磁盘内容覆盖时） |
+
+### 13.12 行尾处理边界完整总结
+
+**Rope 内容与 doc.line_ending 的关系：**
+
+| 场景 | Rope 中的行尾 | doc.line_ending 元信息 | 一致性 |
+|------|-------------|-----------------------|--------|
+| 打开已有 LF 文件 | `\n` | `LF`（自动检测） | ✅ 一致 |
+| 打开已有 CRLF 文件 | `\r\n` | `Crlf`（自动检测） | ✅ 一致 |
+| 新建文档（Native=LF） | `\n` | `LF` | ✅ 一致 |
+| 打开 EditorConfig 设为 crlf 的新文件 | `\r\n` | `Crlf`（来自 EditorConfig） | ✅ 一致 |
+| `:line-ending lf` 后（原 CRLF 文件） | 所有 `\r\n` → `\n` | `LF` | ✅ 一致 |
+| 粘贴 LF 内容到 CRLF 文档 | 粘贴内容中 `\n` → `\r\n` | `Crlf` | ✅ 粘贴部分一致 |
+| 混合行尾文件（既有 LF 也有 CRLF） | 保留混合 | 首个检测到的行尾类型 | ❌ 部分不一致 |
+| 其他编辑器修改了文件行尾，尚未 reload | 还是旧行尾 | 还是旧元信息 | ✅ 一致（但与磁盘不一致） |
+
+**关键边界原则：**
+
+1. **元信息只驱动新插入**：`doc.line_ending` 只在插入新行尾时生效，从不自动修改已有内容
+2. **唯一例外是 :line-ending**：显式切换行尾命令会主动遍历替换所有行的行尾字符
+3. **粘贴做输入转换**：外部内容进入时（剪贴板、寄存器、Snippet）做行尾归一化到文档当前行尾
+4. **保存不做转换**：Rope 中的行尾原样写入磁盘，不做任何 CRLF ↔ LF 转换
+5. **yank 不做转换**：从 Rope 复制内容时，保持 Rope 中的原始行尾（多选区拼接除外）
+6. **自动检测只在打开时**：`detect_indent_and_line_ending()` 仅在打开和 reload 时调用
+
+---
+
 ## 总结
 
 Helix 的文件 IO 与编码系统设计要点：
 
 1. **三级编码识别**：手动指定 → BOM 检测 → chardetng 统计检测
 2. **流式处理**：8KB 双缓冲 + 双层循环，适配大文件，读取与写入结构对称
-3. **行尾原样保留**：Rope 中保持原始行尾，`doc.line_ending` 仅作为元信息，在 `insert_final_newline` 时决定插入哪种行尾
-4. **无行尾转换**：保存时不做 CRLF ↔ LF 转换，与部分编辑器行为不同
-5. **编码转换仅在 to_writer()**：Rope (UTF-8) → 目标编码，是唯一的编码转换点
-6. **异步保存**：保存操作返回 Future，不阻塞编辑；通过通道串行化多个保存请求
-7. **原子保存**：支持备份和恢复，区分硬链接/符号链接/普通文件
-8. **外部修改检测**：基于 mtime 的冲突检测，防止覆盖外部修改
-9. **完整的错误处理**：从底层 IO 到 UI 展示的完整错误链路
-10. **EditorConfig 集成**：编码、行尾、缩进、空白修剪等可通过 `.editorconfig` 统一管理
+3. **行尾原样保留**：Rope 中保持原始行尾，打开和保存时都不做归一化
+4. **元信息驱动新行尾插入**：`doc.line_ending` 在 Enter、`o`/`O`、粘贴、添加换行、补末尾换行、Snippet 渲染等所有插入新行尾的编辑路径中起作用
+5. **粘贴统一行尾**：通过正则 `\r\n|\r|\n` 匹配所有行尾并替换为当前文档行尾
+6. **显式切换行尾会改内容**：`:line-ending` 命令除了设置元信息，还会创建 Transaction 替换所有行的行尾字符，可 undo
+7. **寄存器跨平台处理**：yank 到剪贴板时多选区用 `NATIVE_LINE_ENDING` 拼接，粘贴回时通过正则统一为文档行尾
+8. **编码转换仅在 to_writer()**：Rope (UTF-8) → 目标编码，是唯一的编码转换点
+9. **行尾检测函数区分**：`get_line_ending()` 处理 RopeSlice，`get_line_ending_of_str()` 处理普通字符串，`auto_detect_line_ending()` 扫描前 100 行
+10. **异步保存**：保存操作返回 Future，不阻塞编辑；通过通道串行化多个保存请求
+11. **原子保存**：支持备份和恢复，区分硬链接/符号链接/普通文件
+12. **外部修改检测**：基于 mtime 的冲突检测，防止覆盖外部修改
+13. **完整的错误处理**：从底层 IO 到 UI 展示的完整错误链路
+14. **EditorConfig 集成**：编码、行尾、缩进、空白修剪等可通过 `.editorconfig` 统一管理
