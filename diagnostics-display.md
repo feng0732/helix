@@ -498,19 +498,132 @@ pub fn immediately_show_diagnostic(&self, doc: &Document, view: ViewId) {
    └─ draw_diagnostics：Warning/Error 显示在行下方，带 Box-drawing 连接线
 ```
 
-#### 4.5.3 四个跳转命令的差异
+#### 4.5.3 四个跳转命令的选区方向、光标落点与连续跳转机制
 
-| 命令 | 诊断查找方式 | Selection 方向 | 是否使用 apply_motion |
-|------|-------------|---------------|----------------------|
-| goto_first_diag | `doc.diagnostics().first()` | 正向（start→end） | ❌ 直接执行 |
-| goto_last_diag | `doc.diagnostics().last()` | 正向（start→end） | ❌ 直接执行 |
-| goto_next_diag | `.find(\|d\| d.range.start > cursor)` 正向查找 | 正向（start→end） | ✅ apply_motion |
-| goto_prev_diag | `.rev().find(\|d\| d.range.start < cursor)` 反向查找 | 反向（end→start，光标落在 range.end） | ✅ apply_motion |
+##### 前置知识：Range 语义与 cursor() 计算
+
+[Range](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-core/src/selection.rs#L55-L63) 结构包含两个位置字段：
+
+```rust
+pub struct Range {
+    pub anchor: usize,  // 锚点：扩展选区时不移动的一端
+    pub head: usize,    // 头：扩展选区时移动的一端，block 光标始终在 head 侧
+}
+```
+
+[Selection::single(anchor, head)](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-core/src/selection.rs#L541-L550) 的第一个参数是 anchor，第二个参数是 head。
+
+[Range::cursor()](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-core/src/selection.rs#L335-L341) 根据方向返回块光标（block cursor）的左边界位置：
+
+```rust
+pub fn cursor(self, text: RopeSlice) -> usize {
+    if self.head > self.anchor {
+        // 正向选区（anchor 在左，head 在右）：
+        // block 光标覆盖 [head-1, head)，所以光标左边界是 head 前一个 grapheme
+        prev_grapheme_boundary(text, self.head)
+    } else {
+        // 反向选区（anchor 在右，head 在左）：
+        // block 光标覆盖 [head, head+1)，所以光标左边界就是 head
+        self.head
+    }
+}
+```
+
+可视化说明（字符 `|` 表示 grapheme 边界，`█` 表示 block 光标）：
+
+```
+正向选区: Selection::single(2, 5)
+  anchor=2, head=5, head > anchor（正向）
+  字符位置:  0   1   2   3   4   5   6
+             a   b   c   d   e   f   g
+             |---|---|---|---|---|---|
+                 ^anchor     ^head
+                 |<--选区-->|
+  cursor = prev_grapheme_boundary(head=5) = 4
+  光标显示:                 █
+                           ^光标(4)
+
+反向选区: Selection::single(5, 2)
+  anchor=5, head=2, head < anchor（反向）
+  字符位置:  0   1   2   3   4   5   6
+             a   b   c   d   e   f   g
+             |---|---|---|---|---|---|
+                     ^head     ^anchor
+                     |<--选区-->|
+  cursor = head = 2
+  光标显示:         █
+                   ^光标(2)
+```
+
+##### 四个命令的选区构造与光标落点
+
+| 命令 | 选区构造 | anchor | head | 方向 | cursor = | 光标落点 |
+|------|---------|--------|------|------|----------|---------|
+| goto_first_diag | `single(start, end)` | start | end | 正向 | `prev_grapheme_boundary(end)` | 诊断范围最右端的字符 |
+| goto_last_diag | `single(start, end)` | start | end | 正向 | `prev_grapheme_boundary(end)` | 诊断范围最右端的字符 |
+| goto_next_diag | `single(start, end)` | start | end | 正向 | `prev_grapheme_boundary(end)` | 诊断范围最右端的字符 |
+| goto_prev_diag | `single(end, start)` | end | start | 反向 | `start` | 诊断范围最左端的字符 |
+
+##### 连续跳转不重复命中的机制
+
+**goto_next_diag (`]d`)**：
+
+```
+诊断 A: range [10, 20)    诊断 B: range [30, 40)
+字符:   |...|10|...|20|...|30|...|40|...
+             A 选区         B 选区
+
+步骤 1: 光标在 5（在 A 之前）
+  查找: diag.range.start(10) > cursor_pos(5) → 命中诊断 A
+  跳转: single(10, 20) → cursor = prev_grapheme_boundary(20) = 19
+  结果: 光标落在 A 的最右端字符
+
+步骤 2: 再次按 ]d，光标在 19
+  查找: diag.range.start > cursor_pos(19)
+    - A.start(10) > 19 → false  ← 不命中 A ✓
+    - B.start(30) > 19 → true   ← 命中诊断 B
+  跳转: single(30, 40) → cursor = prev_grapheme_boundary(40) = 39
+  结果: 光标落在 B 的最右端字符
+```
+
+**关键**：正向选区的 cursor 落在诊断范围的最右端（`end - 1 grapheme`），下次查找 `start > cursor` 时，当前诊断的 `start` 一定不满足（因为 `start <= end - 1 = cursor`），因此不会重复命中。
+
+**goto_prev_diag (`[d`)**：
+
+```
+诊断 A: range [10, 20)    诊断 B: range [30, 40)
+字符:   |...|10|...|20|...|30|...|40|...
+             A 选区         B 选区
+
+步骤 1: 光标在 45（在 B 之后）
+  反向遍历查找: diag.range.start < cursor_pos(45)
+    - B.start(30) < 45 → true  ← 命中诊断 B
+  跳转: single(40, 30) → cursor = head = 30 （反向选区，cursor=head）
+  结果: 光标落在 B 的最左端字符
+
+步骤 2: 再次按 [d，光标在 30
+  反向遍历查找: diag.range.start < cursor_pos(30)
+    - B.start(30) < 30 → false  ← 不命中 B ✓
+    - A.start(10) < 30 → true   ← 命中诊断 A
+  跳转: single(20, 10) → cursor = head = 10
+  结果: 光标落在 A 的最左端字符
+```
+
+**关键**：反向选区的 cursor 落在诊断范围的最左端（`= start`），下次查找 `start < cursor` 时，当前诊断的 `start` 不满足（`start == cursor` 而非小于），因此不会重复命中。
+
+##### 四个命令的综合对比
+
+| 命令 | 诊断查找方式 | Selection 构造 | 光标落点 | 是否使用 apply_motion |
+|------|-------------|---------------|---------|----------------------|
+| goto_first_diag | `doc.diagnostics().first()` | `single(start, end)` 正向 | 诊断最右端 | ❌ 直接执行 |
+| goto_last_diag | `doc.diagnostics().last()` | `single(start, end)` 正向 | 诊断最右端 | ❌ 直接执行 |
+| goto_next_diag | `.find(\|d\| d.range.start > cursor)` 正向查找 | `single(start, end)` 正向 | 诊断最右端 | ✅ apply_motion |
+| goto_prev_diag | `.rev().find(\|d\| d.range.start < cursor)` 反向遍历 | `single(end, start)` 反向 | 诊断最左端 | ✅ apply_motion |
 
 **设计意图**：
 - `first/last` 是绝对定位，不需要 motion 语义
 - `next/prev` 是相对移动，使用 `apply_motion` 以便与其他 motion 行为一致（如扩展选择等）
-- `prev` 的 selection 为反向 `(end, start)`，确保光标落在 range 的 end 位置（上一个诊断的末尾），再次按 `[d` 不会重复命中同一诊断
+- `next` 用正向选区让光标落在诊断最右端，`prev` 用反向选区（见代码注释 [commands.rs#L4182-L4183](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4182-L4183)）让光标落在诊断最左端，两者配合确保连续跳转时不会重复命中同一诊断
 
 #### 4.5.4 与普通光标移动的对比
 
