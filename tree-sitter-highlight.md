@@ -2,7 +2,8 @@
 
 本文档从代码实现角度，系统梳理 Helix 编辑器中 Tree-sitter 语法高亮的三大核心模块：**语言查询**、**增量解析**、**样式映射**，并阐明它们之间的数据流与调用关系。
 
-> 代码引用格式：`[相对路径](file://绝对路径#Lines)`，便于在 IDE 中点击跳转，也可直接按相对路径复核。
+> 代码引用格式：`[显示名](相对路径#Lines)`，采用仓库相对路径，跨环境可直接跳转。
+> 如需在 IDE 中快速定位，可在文件列表中按相对路径查找。
 
 ---
 
@@ -67,7 +68,7 @@ highlights.scm 编译        injections.scm 编译
 
 #### 配置数据结构
 
-文件：`helix-core/src/syntax/config.rs` — [点击跳转](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-core/src/syntax/config.rs#L25-L106)
+[LanguageConfiguration](helix-core/src/syntax/config.rs#L25-L106)
 
 ```rust
 pub struct LanguageConfiguration {
@@ -83,7 +84,7 @@ pub struct LanguageConfiguration {
 
 #### Loader 初始化
 
-文件：`helix-core/src/syntax.rs` — [Loader::new](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-core/src/syntax.rs#L287-L322)
+[Loader::new](helix-core/src/syntax.rs#L287-L322)
 
 `Loader` 构建语言注册表，建立 "文件扩展名 → Language" 的快速映射：
 
@@ -109,7 +110,7 @@ pub fn new(config: Configuration) -> Result<Self, LoaderError> {
 
 ### 2.3 LanguageData：查询的惰性编译
 
-文件：`helix-core/src/syntax.rs` — [LanguageData](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-core/src/syntax.rs#L39-L47)
+[LanguageData](helix-core/src/syntax.rs#L39-L47)
 
 ```rust
 pub struct LanguageData {
@@ -126,7 +127,7 @@ pub struct LanguageData {
 
 #### 语法配置编译入口
 
-文件：`helix-core/src/syntax.rs` — [compile_syntax_config](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-core/src/syntax.rs#L67-L91)
+[compile_syntax_config](helix-core/src/syntax.rs#L67-L91)
 
 ```rust
 pub fn compile_syntax_config(
@@ -155,7 +156,7 @@ pub fn compile_syntax_config(
 
 ### 2.4 查询文件的读取与继承
 
-文件：`helix-core/src/syntax.rs` — [read_query](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-core/src/syntax.rs#L268-L272)
+[read_query](helix-core/src/syntax.rs#L268-L272)
 
 ```rust
 pub fn read_query(lang: &str, query_filename: &str) -> String {
@@ -173,6 +174,7 @@ pub fn read_query(lang: &str, query_filename: &str) -> String {
 目录：`runtime/queries/`
 
 每个语言目录下可包含：
+
 | 文件名 | 用途 |
 |---|---|
 | `highlights.scm` | 语法高亮捕获规则 |
@@ -185,7 +187,7 @@ pub fn read_query(lang: &str, query_filename: &str) -> String {
 
 #### 示例：Rust highlights.scm 片段
 
-文件：`runtime/queries/rust/highlights.scm` — [前 80 行](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/runtime/queries/rust/highlights.scm#L1-L80)
+[runtime/queries/rust/highlights.scm#L1-L80](runtime/queries/rust/highlights.scm#L1-L80)
 
 ```scheme
 ; 基本捕获
@@ -210,7 +212,7 @@ Query 语法要点：
 
 ### 2.5 Capture → Scope 的索引化映射
 
-文件：`helix-core/src/syntax.rs` — [reconfigure_highlights](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-core/src/syntax.rs#L241-L266)
+[reconfigure_highlights](helix-core/src/syntax.rs#L241-L266)
 
 ```rust
 fn reconfigure_highlights(config: &SyntaxConfig, recognized_names: &[String]) {
@@ -258,7 +260,7 @@ fn reconfigure_highlights(config: &SyntaxConfig, recognized_names: &[String]) {
 
 ### 3.2 Syntax 结构
 
-文件：`helix-core/src/syntax.rs` — [Syntax](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-core/src/syntax.rs#L514-L702)
+[Syntax](helix-core/src/syntax.rs#L514-L702)
 
 ```rust
 pub struct Syntax {
@@ -303,7 +305,7 @@ pub fn update(
 
 ### 3.3 ChangeSet → InputEdit 的转换
 
-文件：`helix-core/src/syntax.rs` — [generate_edits](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-core/src/syntax.rs#L706-L779)
+[generate_edits](helix-core/src/syntax.rs#L706-L779)
 
 这是增量解析的**桥接函数**，将 Helix 内部的 ChangeSet（字符级别）转换为 tree-sitter 的 InputEdit（字节级别）。
 
@@ -368,7 +370,7 @@ fn generate_edits(old_text: RopeSlice, changeset: &ChangeSet) -> Vec<InputEdit> 
 
 ### 3.4 增量解析的触发链路
 
-文件：`helix-view/src/document.rs` — [apply_impl](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-view/src/document.rs#L1435-L1611)
+[Document::apply_impl](helix-view/src/document.rs#L1435-L1611)
 
 ```rust
 fn apply_impl(&mut self, transaction: &Transaction, view_id: ViewId, ...) -> bool {
@@ -434,7 +436,7 @@ pub fn tree_for_byte_range(&self, start: u32, end: u32) -> &Tree;
 
 ### 4.2 Theme 数据结构
 
-文件：`helix-view/src/theme.rs` — [Theme](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-view/src/theme.rs#L272-L284)
+[Theme](helix-view/src/theme.rs#L272-L284)
 
 ```rust
 pub struct Theme {
@@ -454,11 +456,11 @@ pub struct Theme {
 
 **双存储策略**：
 - UI 样式（如 `ui.text`, `ui.statusline`）数量少、按名查找 → HashMap
-- 语法高亮 scope 数量多、逐字符查找 → Vec\<Style\> + u32 索引（O(1)）
+- 语法高亮 scope 数量多、逐字符查找 → `Vec<Style>` + u32 索引（O(1)）
 
 #### 主题解析流程
 
-文件：`helix-view/src/theme.rs` — [build_theme_values](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-view/src/theme.rs#L311-L376)
+[build_theme_values](helix-view/src/theme.rs#L311-L376)
 
 ```rust
 fn build_theme_values(mut values: Map<String, Value>) -> (...) {
@@ -484,7 +486,7 @@ fn build_theme_values(mut values: Map<String, Value>) -> (...) {
 
 #### 示例：base16_theme.toml 片段
 
-文件：`base16_theme.toml` — [前 30 行](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/base16_theme.toml#L11-L30)
+[base16_theme.toml#L11-L30](base16_theme.toml#L11-L30)
 
 ```toml
 "comment" = { fg = "gray" }
@@ -507,7 +509,7 @@ fn build_theme_values(mut values: Map<String, Value>) -> (...) {
 | `0..RGB_START` | 普通 scope 索引 | `highlights[highlight.idx()]` |
 | `RGB_START..u32::MAX` | 内联 RGB 颜色 | 小端字节 `[B, G, R, 0xFF]` |
 
-文件：`helix-view/src/theme.rs` — [rgb_highlight](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-view/src/theme.rs#L402-L406)
+[rgb_highlight](helix-view/src/theme.rs#L402-L406)
 
 ```rust
 pub fn rgb_highlight(r: u8, g: u8, b: u8) -> Highlight {
@@ -519,7 +521,7 @@ pub fn rgb_highlight(r: u8, g: u8, b: u8) -> Highlight {
 
 ### 4.4 运行时样式查找
 
-文件：`helix-view/src/theme.rs` — [highlight](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-view/src/theme.rs#L409-L415)
+[Theme::highlight](helix-view/src/theme.rs#L409-L415)
 
 ```rust
 #[inline]
@@ -534,7 +536,7 @@ pub fn highlight(&self, highlight: Highlight) -> Style {
 
 #### 反向查找（名称 → 索引）
 
-文件：`helix-view/src/theme.rs` — [find_highlight](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-view/src/theme.rs#L454-L465)
+[Theme::find_highlight](helix-view/src/theme.rs#L454-L465)
 
 ```rust
 pub fn find_highlight(&self, mut scope: &str) -> Option<Highlight> {
@@ -554,7 +556,7 @@ pub fn find_highlight(&self, mut scope: &str) -> Option<Highlight> {
 
 ### 4.5 Style::patch：样式合并的语义
 
-文件：`helix-view/src/graphics.rs` — [patch](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-view/src/graphics.rs#L739-L751)
+[Style::patch](helix-view/src/graphics.rs#L739-L751)
 
 ```rust
 pub fn patch(mut self, other: Style) -> Style {
@@ -595,7 +597,7 @@ pub fn patch(mut self, other: Style) -> Style {
 
 #### OverlayHighlighter::advance 源码（可验证事件模型）
 
-文件：`helix-core/src/syntax.rs` — [OverlayHighlighter::advance](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-core/src/syntax.rs#L895-L978)
+[OverlayHighlighter::advance](helix-core/src/syntax.rs#L895-L978)
 
 ```rust
 pub fn advance(&mut self) -> (HighlightEvent, impl Iterator<Item = Highlight> + '_) {
@@ -643,7 +645,7 @@ pub fn advance(&mut self) -> (HighlightEvent, impl Iterator<Item = Highlight> + 
 
 ### 4.7 语法高亮游标：SyntaxHighlighter
 
-文件：`helix-term/src/ui/document.rs` — [SyntaxHighlighter](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-term/src/ui/document.rs#L514-L530)
+[SyntaxHighlighter::advance](helix-term/src/ui/document.rs#L514-L530)
 
 ```rust
 fn advance(&mut self) {
@@ -665,7 +667,7 @@ fn advance(&mut self) {
 
 ### 4.8 叠加高亮游标：OverlayHighlighter
 
-文件：`helix-term/src/ui/document.rs` — [OverlayHighlighter::advance](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-term/src/ui/document.rs#L556-L567)
+[OverlayHighlighter::advance（UI 层）](helix-term/src/ui/document.rs#L556-L567)
 
 ```rust
 fn advance(&mut self) {
@@ -686,7 +688,7 @@ fn advance(&mut self) {
 
 ### 4.9 完整渲染管线
 
-文件：`helix-term/src/ui/document.rs` — [render_text](file:///d:/fz/0601/solo-dogfeeding/code/265-helix/helix-term/src/ui/document.rs#L63-L173)
+[render_text](helix-term/src/ui/document.rs#L63-L173)
 
 ```rust
 pub fn render_text(...) {
@@ -787,14 +789,14 @@ Document::open(path)
 
 | 优化点 | 实现位置 | 技术手段 |
 |---|---|---|
-| 查询编译延迟 | `helix-core/src/syntax.rs` `LanguageData` | `OnceCell` 按需懒加载 |
-| 高亮索引化 | `helix-core/src/syntax.rs` `reconfigure_highlights` | capture 名 → u32 索引，消除字符串比较 |
-| 样式查找 O(1) | `helix-view/src/theme.rs` `Theme::highlight` | `Vec<Style>` 按索引直接访问 |
-| 增量解析 | `helix-core/src/syntax.rs` `Syntax::update` | tree-sitter 原生增量 + InputEdit 精确描述 |
-| 解析超时保护 | `helix-core/src/syntax.rs` `PARSE_TIMEOUT` | 500ms 上限，防止大文件卡死 UI |
-| 渲染按范围迭代 | `helix-core/src/syntax.rs` `Syntax::highlighter` | 只对可视字节范围做 query 匹配 |
-| Push 增量优化 | `tree_house` highlighter / `OverlayHighlighter` | 栈式增减时用 Push 避免重算，打乱时回退 Refresh |
-| 主题继承合并 | `helix-view/src/theme.rs` `Loader::load_theme` | 递归合并父主题 TOML，减少重复定义 |
+| 查询编译延迟 | [LanguageData](helix-core/src/syntax.rs#L39-L47) | `OnceCell` 按需懒加载 |
+| 高亮索引化 | [reconfigure_highlights](helix-core/src/syntax.rs#L241-L266) | capture 名 → u32 索引，消除字符串比较 |
+| 样式查找 O(1) | [Theme::highlight](helix-view/src/theme.rs#L409-L415) | `Vec<Style>` 按索引直接访问 |
+| 增量解析 | [Syntax::update](helix-core/src/syntax.rs#L514-L702) | tree-sitter 原生增量 + InputEdit 精确描述 |
+| 解析超时保护 | `PARSE_TIMEOUT` | 500ms 上限，防止大文件卡死 UI |
+| 渲染按范围迭代 | `Syntax::highlighter` | 只对可视字节范围做 query 匹配 |
+| Push 增量优化 | [OverlayHighlighter::advance](helix-core/src/syntax.rs#L895-L978) | 栈式增减时用 Push 避免重算，打乱时回退 Refresh |
+| 主题继承合并 | `Loader::load_theme` | 递归合并父主题 TOML，减少重复定义 |
 
 ---
 
