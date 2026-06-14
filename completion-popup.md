@@ -219,17 +219,24 @@ matches.sort_unstable_by_key(|&(i, score)| {
 });
 ```
 
-排序键优先级从高到低（按元组字段顺序）：
+排序键优先级从高到低（严格按元组字段**从左到右依次比较**，前字段不等就不再比较后续字段）：
 
 | 优先级 | 键 | 类型 | 排序方向 | 说明 |
 |---|---|---|---|---|
-| 1 | `score <= min_score` | bool | 升序（false 在前） | 低于最低阈值的项统一沉底。`false=0 < true=1`，所以匹配质量达标的项全部排在不达标之前 |
-| 2 | `Reverse(option.preselect())` | bool | 降序（true 在前） | LSP 标记 `preselect=true` 的项优先。`Reverse` 反转 bool 默认顺序，使 true 排在 false 前面 |
-| 3 | `option.provider_priority()` | i8 | **升序（越小越前）** | 来源优先级。数值越小排名越靠前 |
-| 4 | `Reverse(score)` | u32 | 降序（越高越前） | 模糊匹配得分。得分越高排名越靠前 |
-| 5 | `i` | u32 | 升序（越小越前） | 原始索引保序。当以上所有键都相等时，按在 options 中出现的先后顺序排列 |
+| 1 | `score <= min_score` | bool | 升序（false 在前） | 低于最低阈值的项统一沉底。`false=0 < true=1`，所以匹配质量达标的项全部分在不达标项之前 |
+| 2 | `Reverse(option.preselect())` | `Reverse<bool>` | 升序 = 逻辑上 true 在前 | LSP 标记 `preselect=true` 的项优先。`Reverse(true)` < `Reverse(false)`，使 true 排在 false 前面。**这是第二键，只要 preselect 不同，就直接决定顺序，不看 provider_priority** |
+| 3 | `option.provider_priority()` | i8 | 升序（越小越前） | 来源优先级。数值越小排名越靠前。**仅当前两键（达标状态 + preselect）都相同时才比较此键** |
+| 4 | `Reverse(score)` | `Reverse<u32>` | 升序 = 逻辑上 score 越高越前 | 模糊匹配得分。得分越高排名越靠前。**仅当前三键都相同时才比较此键** |
+| 5 | `i` | u32 | 升序（越小越前） | 原始索引保序。以上所有键都相等时，按在 options 中出现的先后顺序排列 |
 
-其中 `min_score = (7 + needle_len * 14) / 3`，是一个启发式阈值，用于过滤掉匹配质量过差的候选项（但不直接剔除，只是沉底）。
+其中 `min_score = (7 + needle_len * 14) / 3`，是一个启发式阈值，用于将匹配质量过差的候选项沉底（不直接剔除）。
+
+**关键规则总结**：
+1. **达标/不达标是最高分界线**：低于 min_score 的项一律排在达标项之后，不论 preselect 和 provider_priority 如何
+2. **preselect 高于来源优先级**：同一达标组内，`preselect=true` 的项**全部排在** `preselect=false` 的项之前，即使其 provider_priority 数值更大（来源优先级更低）
+3. **provider_priority 仅在前两键相同时生效**：同为 preselect=false（或同为 preselect=true）且同为达标状态时，才按来源优先级分块
+4. **分块内按模糊分排序**：同一 provider_priority 组内按 nucleo 匹配得分从高到低
+5. **原始索引兜底**：所有键都相同时保持加入顺序
 
 #### Step 3: `provider_priority` 的数值与来源
 
@@ -289,20 +296,78 @@ Path 和 Word 的 `provider_priority` 都是 1，处于同一层级。它们之�
 
 ##### 多 LSP 场景下的完整排序示例
 
-假设有 3 个 LSP（rust-analyzer, rls, clippy）按顺序配置，以及 Path、Word 补全：
+**场景**：`languages.toml` 中对同一语言配置了 3 个 LSP，顺序为：rust-analyzer（配置第 1 个）、rls（配置第 2 个）、clippy（配置第 3 个）。
 
-| 候选项 | 来源 | provider_priority | preselect | score (假设) | 最终排序位置 |
-|---|---|---|---|---|---|
-| func_a | clippy (第3个) | -2 | false | 150 | 1 |
-| func_b | rls (第2个) | -1 | true | 100 | 2 |
-| func_c | rust-analyzer (第1个) | 0 | false | 200 | 3 |
-| func_d | rust-analyzer (第1个) | 0 | false | 180 | 4 |
-| src/ | Path | 1 | false | 160 | 5 |
-| some_word | Word | 1 | false | 140 | 6 |
-| low_qual | rls (第2个) | -1 | false | 5 | 7（低于 min_score 沉底） |
+`enumerate` 索引依次为 0, 1, 2，取负后的 provider_priority：
+- rust-analyzer (第1配置) → priority = -(0) = **0**
+- rls (第2配置) → priority = -(1) = **-1**
+- clippy (第3配置) → priority = -(2) = **-2**
 
-> 注意：func_b 虽然 score 只有 100，但因为 preselect=true，所以排在 func_c 前面。
-> clippy 的 func_a 虽然 score 不是最高，但因为 provider_priority=-2 最小，所以排第 1。
+**provider_priority 升序关系**：`-2 (clippy) < -1 (rls) < 0 (rust-analyzer) < 1 (Path/Word)`
+
+假设当前已输入字符构成 needle 长度为 4，`min_score = (7 + 4×14)/3 = 21`，即 score < 21 的项判为不达标。
+
+候选项一览：
+
+| # | 候选项 | 来源 | provider_priority | preselect | score | 是否达标 |
+|---|---|---|---|---|---|---|
+| A | func_clippy_a | clippy (配置第3, 来源最高) | -2 | false | 80 | 是 |
+| B | func_rls_pre | rls (配置第2) | -1 | **true** | 50 | 是 |
+| C | func_ra_best | rust-analyzer (配置第1, 来源最低) | 0 | false | 180 | 是 |
+| D | func_clippy_b | clippy (配置第3) | -2 | false | 95 | 是 |
+| E | src_dir/ | Path | 1 | false | 70 | 是 |
+| F | my_word_var | Word | 1 | false | 60 | 是 |
+| G | func_rls_weak | rls (配置第2) | -1 | false | 5 | **否** |
+| H | func_ra_pre2 | rust-analyzer (配置第1) | 0 | **true** | 30 | 是 |
+
+**逐步推演排序**：
+
+**第一步：按达标状态分块（第 1 键）**
+```
+达标组（score<=min_score = false=0）：A, B, C, D, E, F, H    ← 在前
+不达标组（score<=min_score = true=1）：G                    ← 沉底
+```
+
+**第二步：达标组内按 preselect 分块（第 2 键）**
+```
+preselect=true 子组（Reverse(true)=0）：B, H   ← 全部在前（不看 provider_priority）
+preselect=false 子组（Reverse(false)=1）：A, C, D, E, F   ← 在后
+```
+
+**第三步：preselect=true 子组按 provider_priority 排序（第 3 键）**
+- B: rls → priority=-1
+- H: rust-analyzer → priority=0
+- 因为 -1 < 0，所以 **B → H**
+
+**第四步：preselect=false 子组按 provider_priority 分块（第 3 键）**
+```
+priority=-2（clippy 组）：A(score=80), D(score=95)
+priority=0（rust-analyzer 组）：C(score=180)
+priority=1（Path/Word 组）：E(score=70), F(score=60)
+```
+
+**第五步：每个 provider_priority 分块内按 Reverse(score) 降序（第 4 键）**
+- clippy 块：D(95) → A(80)
+- rust-analyzer 块：只有 C
+- Path/Word 块：E(70) → F(60)
+
+**最终完整排序**：
+
+| 名次 | 候选项 | 来源 | preselect | provider_priority | score | 排在前面的原因 |
+|---|---|---|---|---|---|---|
+| 1 | **func_rls_pre (B)** | rls (配置第2) | ✅ true | -1 | 50 | preselect=true → 越过所有 preselect=false 的项（包括来源更高的 clippy） |
+| 2 | **func_ra_pre2 (H)** | rust-analyzer (配置第1) | ✅ true | 0 | 30 | preselect=true；来源优先级低于 B，所以排 B 之后 |
+| 3 | **func_clippy_b (D)** | clippy (配置第3) | ❌ | -2 | 95 | preselect=false 组内来源最高（-2 最小）；95 > 80 → 排 A 之前 |
+| 4 | **func_clippy_a (A)** | clippy (配置第3) | ❌ | -2 | 80 | 与 D 同来源同 preselect；score 较低 |
+| 5 | **func_ra_best (C)** | rust-analyzer (配置第1) | ❌ | 0 | 180 | 来源低于 clippy（0 > -2），所以在 clippy 组之后；尽管 score 最高也无法越界 |
+| 6 | **src_dir/ (E)** | Path | ❌ | 1 | 70 | 非 LSP 来源优先级（1）最低；70 > 60 |
+| 7 | **my_word_var (F)** | Word | ❌ | 1 | 60 | 与 E 同来源层；score 较低 |
+| 8 | **func_rls_weak (G)** | rls (配置第2) | ❌ | -1 | 5 | score 不达标（5 < 21）→ 沉底，即使来源优先级高也无济于事 |
+
+**核心冲突点解释**：
+- **名次 1 vs 3**：`func_rls_pre`（B，来源次优，priority=-1）排在 `func_clippy_b`（D，来源最优，priority=-2）之前，原因是 preselect=true 是第二键、provider_priority 是第三键——**preselect 不同就不再比较来源优先级**。这体现了 LSP 服务器的 preselect 标志意图高于用户配置的来源顺序。
+- **名次 5 vs 3**：`func_ra_best`（C，score=180 最高）无法越过 `func_clippy_b`（D，score=95），原因是两者 preselect 相同（都是 false）时先比较 provider_priority，clippy 的 -2 < rust-analyzer 的 0 → clippy 组整体在前。
+- **名次 8 vs 1**：`func_rls_weak`（G）虽然 priority=-1 来源极高，但 score 不达标导致被**第一键**直接打入最后一组，彻底出局。
 
 ### 3.4 过滤更新：`update_filter`
 
