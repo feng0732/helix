@@ -1445,23 +1445,25 @@ pub fn auto_detect_line_ending(doc: &Rope) -> Option<LineEnding> {
 5. **yank 不做转换**：从 Rope 复制内容时，保持 Rope 中的原始行尾（多选区拼接除外）
 6. **自动检测触发时机**：`detect_indent_and_line_ending()` 有 5 个调用点（见 13.13 节）
 
-### 13.13 detect_indent_and_line_ending() 所有调用点
+### 13.13 detect_indent_and_line_ending() 直接调用点与触发链路
 
-`detect_indent_and_line_ending()` 的完整调用点共 5 处，覆盖 5 种场景：
+**直接调用点共 5 处**（在 4 个源文件中）：
 
-| 调用位置 | 文件 | 触发场景 | 是否刷新 EditorConfig |
-|---------|------|---------|---------------------|
-| `Document::open()` | document.rs | 打开文件（`:open`） | ✅ 先设置 `editor_config` |
-| `Document::reload()` | document.rs | 重新加载文件（`:reload`） | ❌ 不刷新（沿用原有） |
-| `Editor::refresh_doc_language()` | editor.rs | 设置文档路径后内部调用 | ✅ 先调用 `detect_editor_config()` |
-| `Editor::set_path()` → `refresh_doc_language()` | editor.rs | 设置文档路径后 | ✅ 先调用 `detect_editor_config()` |
-| `:language` 命令 | typed.rs | 手动切换文档语言后 | ❌ 不刷新（沿用原有） |
+| # | 调用位置 | 文件 | 触发场景 | 是否刷新 EditorConfig |
+|---|---------|------|---------|---------------------|
+| 1 | `Document::open()` | helix-view/src/document.rs | 打开文件（`:open`） | ✅ 先设置 `editor_config` |
+| 2 | `Document::reload()` | helix-view/src/document.rs | 重新加载文件（`:reload`） | ❌ 不刷新（沿用原有） |
+| 3 | `Editor::refresh_doc_language()` | helix-view/src/editor.rs | 刷新语言配置（由 set_path 间接调用） | ✅ 先调用 `detect_editor_config()` |
+| 4 | `:language` 命令 | helix-term/src/commands/typed.rs | 手动切换文档语言后 | ❌ 不刷新（沿用原有） |
+| 5 | `make_format_callback()` | helix-term/src/commands.rs | LSP 格式化完成回调 | ❌ 不刷新（沿用原有） |
+
+**间接调用链路**：`Editor::set_path()` 本身不直接调用 `detect_indent_and_line_ending()`，而是通过调用 `refresh_doc_language()` 间接触发第 3 个直接调用点。这是**同一条调用路径**，不应重复计数。
 
 **注意：`new_file_from_stdin()` (stdin 管道) 不调用 `detect_indent_and_line_ending()`，见 13.14 节。**
 
-下面逐一说明每个调用点。
+下面逐一说明每个直接调用点及其触发链路。
 
-**调用点 1：Document::open() — 打开文件**
+**直接调用点 1：Document::open() — 打开文件**
 
 [Document::open()](helix-view/src/document.rs) 末尾：
 
@@ -1474,7 +1476,12 @@ doc.detect_indent_and_line_ending();
 
 这是最常见的调用点，所有 `:open` 打开的文件都会经过这里。
 
-**调用点 2：Document::reload() — 重新加载文件**
+**触发链路**：
+```
+:open file.txt → typed::open_impl() → Editor::open() → Document::open() → detect_indent_and_line_ending()
+```
+
+**直接调用点 2：Document::reload() — 重新加载文件**
 
 [Document::reload()](helix-view/src/document.rs) 末尾：
 
@@ -1490,7 +1497,12 @@ self.detect_indent_and_line_ending();  // ← 重新检测
 
 重新加载磁盘内容后重新检测行尾。如果外部编辑器将 LF 改为 CRLF 后，Helix 执行 `:reload`，`doc.line_ending` 会同步更新。
 
-**调用点 3：Editor::refresh_doc_language() — 刷新语言配置**
+**触发链路**：
+```
+:reload → typed::reload_impl() → Document::reload() → detect_indent_and_line_ending()
+```
+
+**直接调用点 3：Editor::refresh_doc_language() — 刷新语言配置**
 
 [Editor::refresh_doc_language()](helix-view/src/editor.rs)：
 
@@ -1498,21 +1510,31 @@ self.detect_indent_and_line_ending();  // ← 重新检测
 pub fn refresh_doc_language(&mut self, doc_id: DocumentId) {
     let loader = self.syn_loader.load();
     let doc = doc_mut!(self, &doc_id);
-    doc.detect_language(&loader);      // ← 重新检测语言
-    doc.detect_editor_config();         // ← 重新读取 EditorConfig
-    doc.detect_indent_and_line_ending(); // ← 重新检测行尾
+    doc.detect_language(&loader);           // ← 重新检测语言
+    doc.detect_editor_config();              // ← 重新读取 EditorConfig
+    doc.detect_indent_and_line_ending();     // ← 重新检测行尾
     self.refresh_language_servers(doc_id);
     // 刷新诊断...
 }
 ```
 
-**触发时机：** 由 `Editor::set_path()` 内部调用。当文档路径被设置时（如 `:write new.txt` 将 scratch buffer 保存为新文件），会触发完整的语言、EditorConfig 和行尾重新检测。
-
 `detect_editor_config()` 会根据当前路径重新搜索 `.editorconfig`，如果找到新的 EditorConfig 中设置了 `end_of_line`，`detect_indent_and_line_ending()` 会优先使用它而非扫描 Rope 内容。
 
-**调用点 4：Editor::set_path() — 设置文档路径**
+**触发链路（通过 Editor::set_path() 间接触发）：**
 
-[Editor::set_path()](helix-view/src/editor.rs)：
+```
+:w new.txt (保存 scratch buffer 为新文件)
+  → typed::write_impl()
+    → Editor::save()
+      → Document::save_impl() 保存成功回调
+        → handle_document_write()
+          → Editor::set_path()
+            → doc.detect_editor_config()
+            → Editor::refresh_doc_language()
+              → detect_indent_and_line_ending()  ← 第 3 个直接调用点
+```
+
+`Editor::set_path()` 本身的代码：
 
 ```rust
 pub fn set_path(&mut self, doc_id: DocumentId, path: &Path) -> Result<(), Error> {
@@ -1520,14 +1542,14 @@ pub fn set_path(&mut self, doc_id: DocumentId, path: &Path) -> Result<(), Error>
     let doc = doc_mut!(self, &doc_id);
     doc.language_servers.clear();
     doc.set_path(Some(path));
-    doc.detect_editor_config();         // ← 重新读取 EditorConfig
-    self.refresh_doc_language(doc_id)   // ← 内部再次调用 detect_indent_and_line_ending()
+    doc.detect_editor_config();         // ← 先重新读取 EditorConfig
+    self.refresh_doc_language(doc_id)   // ← 然后间接触发第 3 个调用点
 }
 ```
 
-设置路径时先 `detect_editor_config()`，然后 `refresh_doc_language()` 再次调用 `detect_indent_and_line_ending()`。典型场景：`:write new.txt` 将 scratch buffer 保存为新文件时，路径从 `None` 变为 `Some(new.txt)`，此时会重新检测 EditorConfig、语言和行尾。
+注意：`set_path()` 中先调一次 `detect_editor_config()`，`refresh_doc_language()` 内部又调一次——两次 EditorConfig 检测结果应一致。
 
-**调用点 5：:language 命令 — 手动切换文档语言**
+**直接调用点 4：:language 命令 — 手动切换文档语言**
 
 [`language()` 命令](helix-term/src/commands/typed.rs)：
 
@@ -1548,6 +1570,54 @@ fn language(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> any
 ```
 
 注意：此调用点**不刷新 EditorConfig**（不调用 `detect_editor_config()`）。因为语言切换不涉及路径变更，EditorConfig 应无变化。手动调用 `refresh_language_servers()` 重启 LSP。
+
+**触发链路**：
+```
+:language rust → typed::language() → detect_indent_and_line_ending()
+```
+
+**直接调用点 5：make_format_callback() — LSP 格式化完成回调**
+
+[`make_format_callback()`](helix-term/src/commands.rs)：
+
+```rust
+async fn make_format_callback(
+    doc_id: DocumentId,
+    doc_version: i32,
+    view_id: ViewId,
+    format: impl Future<Output = Result<Transaction, FormatterError>> + Send + 'static,
+    write: Option<(Option<PathBuf>, bool)>,
+) -> anyhow::Result<job::Callback> {
+    let format = format.await;
+    let call: job::Callback = Callback::Editor(Box::new(move |editor| {
+        // ...
+        let doc = doc_mut!(editor, &doc_id);
+        match format {
+            Ok(format) => {
+                if doc.version() == doc_version {
+                    doc.apply(&format, view.id);
+                    doc.append_changes_to_history(view);
+                    doc.detect_indent_and_line_ending();  // ← 格式化后重新检测
+                    // ...
+                }
+            }
+            // ...
+        }
+    }));
+    // ...
+}
+```
+
+格式化完成后（尤其是 LSP 外部 formatter 可能改变了行尾风格），需要重新检测行尾。例如 rustfmt 会将所有行尾统一为 LF，此时重新检测可以让 `doc.line_ending` 与实际内容一致。
+
+**触发链路**：
+```
+:w（保存时 auto_format=true） 或  :format
+  → Document::auto_format()
+    → LSP textDocument/formatting 请求
+      → make_format_callback() 异步回调
+        → detect_indent_and_line_ending()  ← 第 5 个直接调用点
+```
 
 **detect_indent_and_line_ending() 内部优先级：**
 
@@ -1659,11 +1729,12 @@ Helix 的文件 IO 与编码系统设计要点：
 7. **寄存器跨平台处理**：yank 到剪贴板时多选区用 `NATIVE_LINE_ENDING` 拼接，粘贴回时通过正则统一为文档行尾
 8. **编码转换仅在 to_writer()**：Rope (UTF-8) → 目标编码，是唯一的编码转换点
 9. **行尾检测函数区分**：`get_line_ending()` 处理 RopeSlice，`get_line_ending_of_str()` 处理普通字符串，`auto_detect_line_ending()` 扫描前 100 行
-10. **自动检测触发时机明确**：`detect_indent_and_line_ending()` 有 5 个调用点：打开文件、重新加载、设置路径（内部调用 `refresh_doc_language()`）、设置路径（直接调用）、`:language` 命令
+10. **自动检测触发时机明确**：`detect_indent_and_line_ending()` 有 5 个直接调用点：打开文件（`Document::open()`）、重新加载（`Document::reload()`）、刷新语言配置（`refresh_doc_language()`，由 `set_path()` 间接触发）、手动切换语言（`:language` 命令）、LSP 格式化完成回调（`make_format_callback()`）
 11. **stdin 不自动检测**：stdin 管道内容插入后不触发 `detect_indent_and_line_ending()`，需保存为文件后触发或手动切换
-12. **刷新语言配置触发检测**：`refresh_doc_language()` 会先重新检测语言、EditorConfig、行尾（含行尾）
-13. **异步保存**：保存操作返回 Future，不阻塞编辑；通过通道串行化多个保存请求
-14. **原子保存**：支持备份和恢复，区分硬链接/符号链接/普通文件
-15. **外部修改检测**：基于 mtime 的冲突检测，防止覆盖外部修改
-16. **完整的错误处理**：从底层 IO 到 UI 展示的完整错误链路
-17. **EditorConfig 集成**：编码、行尾、缩进、空白修剪等可通过 `.editorconfig` 统一管理
+12. **刷新语言配置触发检测**：`refresh_doc_language()` 会先重新检测语言、EditorConfig，再检测行尾；`Editor::set_path()` 本身不直接调用检测，而是通过调用 `refresh_doc_language()` 间接触发（同一路径不重复计数）
+13. **格式化后也会检测**：LSP 格式化（如 rustfmt）改变内容后，`make_format_callback()` 会重新检测行尾，确保元信息与格式化后的实际内容一致
+14. **异步保存**：保存操作返回 Future，不阻塞编辑；通过通道串行化多个保存请求
+15. **原子保存**：支持备份和恢复，区分硬链接/符号链接/普通文件
+16. **外部修改检测**：基于 mtime 的冲突检测，防止覆盖外部修改
+17. **完整的错误处理**：从底层 IO 到 UI 展示的完整错误链路
+18. **EditorConfig 集成**：编码、行尾、缩进、空白修剪等可通过 `.editorconfig` 统一管理
