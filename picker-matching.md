@@ -158,7 +158,7 @@ Picker 使用 **nucleo** 库（fzf 匹配算法的 Rust 实现）进行核心匹
    - `Normalization::Smart` - 智能 Unicode 标准化
    - `Config::DEFAULT.match_paths()` - 路径匹配优化（`/` 作为分隔符）
 
-2. **匹配过程**（在 nucleo 内部线程执行）：
+2. **匹配过程**（由 `tick` 派发到 rayon 线程池异步执行，详见第 3.2 节）：
    - 对每个候选项的每个可过滤列执行模糊匹配
    - 计算匹配得分：底层 `nucleo_matcher::Matcher` 的单列匹配返回 `Option<u16>`（0-65535）；高层 `nucleo::MultiPattern::score()` 将各列 `u16` 累加为 `u32`，存入 `Match { score: u32, idx: u32 }`
    - 按得分降序排列结果（同分 tie breaker 见第 3.3 节）
@@ -186,51 +186,176 @@ snapshot.pattern().column_pattern(matcher_index).indices(
 
 ### 3.1 候选注入与 Nucleo 内部管线
 
-Nucleo 匹配器内部维护一条**生产者-消费者管线**：
+Nucleo 匹配器内部不是"无锁队列消费"模型，而是**共享 append-only vector + 游标增量读取**模型：
 
 ```
 调用方（主线程/异步任务）
     │  Injector::push(item, fill_fn)
+    │  → 追加到 boxcar::Vec<T>（共享）
+    │  → 调用 notify() 请求重绘（每次 push 都触发）
     ▼
-nucleo 内部无锁队列
-    │  matcher.tick(timeout) 时消费
+Arc<boxcar::Vec<T>>      ← Injector / Worker / Snapshot 三方共享
+    │  Worker.last_snapshot 游标追踪已处理位置
+    │  process_new_items() 增量读取自 last_snapshot 以来的新项
     ▼
-匹配线程池
-    │  对每个新/变更项执行模糊匹配
+rayon 线程池（异步）
+    │  Worker::run(status, cleared)
+    │  → 增量扫描 boxcar::Vec，对新项执行模糊匹配
+    │  → 对已有项若 pattern 变更则重新打分
+    │  → par_quicksort 并行排序
+    │  → 完成后若 should_notify=true 再调一次 notify()
     ▼
-排序结果（按得分降序）
-    │  snapshot 暴露给调用方
+Worker.matches 结果向量
+    │  下一帧 tick 获取锁时 → snapshot.update()
     ▼
-UI 渲染时读取
+Snapshot（只读，暴露给 UI）
 ```
 
-1. **Injector::push()** 将原始数据 `T` 和列文本一起放入无锁队列。列文本由 `fill_fn` 闭包填充到 `dst` 缓冲区——这就是 [inject_nucleo_item()](helix-term/src/ui/picker.rs#L132-L143) 所做的事。
-2. 调用方无需等待匹配完成，push 立即返回，匹配在后台线程异步进行。
-3. 匹配完成后 nucleo 通过 `Arc::new(helix_event::request_redraw)` 通知 UI 请求重绘（见 [Nucleo::new()](helix-term/src/ui/picker.rs#L282-L287) 的第二个参数）。
+核心数据结构 `boxcar::Vec<T>` 是一个**append-only、并发安全、分块存储**的 vector：
+- **不会被消费**：注入的 item 永久保存在 vector 中，只是 Worker 用 `last_snapshot: u32` 游标记录上次读到了哪里
+- **支持无锁等待写入**：如果某个索引暂时未初始化（写入还在进行），Worker 会把它放进 `in_flight: Vec<u32>`，下次 `run()` 时再检查
+- **三方共享**：`Injector`、`Worker`、`Snapshot` 都持有同一个 `Arc<boxcar::Vec<T>>`，通过索引 `idx` 引用原始数据
 
-### 3.2 tick — 刷新匹配结果
+#### Injector::push() 的实际行为（`nucleo/src/lib.rs`）
+
+```rust
+pub fn push(&self, value: T, fill_columns: impl FnOnce(&T, &mut [Utf32String])) -> u32 {
+    let idx = self.items.push(value, fill_columns);  // 追加到 boxcar::Vec
+    (self.notify)();                                  // 立即触发一次重绘通知
+    idx
+}
+```
+
+1. `self.items.push()` 把 `T` 和列文本（`fill_fn` 闭包写入 `dst` 缓冲区）追加到共享 vector，返回分配的索引 `idx`——这就是 [inject_nucleo_item()](helix-term/src/ui/picker.rs#L132-L143) 所做的事。
+2. **push 之后立刻调用 `notify()`**，不是等匹配完成后才通知。这意味着用户每输入一个字符就会触发一次重绘请求，即使匹配还没开始。
+
+#### 重绘通知 `notify` 的触发时机
+
+Picker 创建时传给 `Nucleo::new()` 的 notify 回调是 `Arc::new(helix_event::request_redraw)`（见 [picker.rs#L282-L287](helix-term/src/ui/picker.rs#L282-L287) 和 [picker.rs#L317-L322](helix-term/src/ui/picker.rs#L317-L322)）。它在**两个时机**被调用：
+
+1. **`Injector::push()` / `extend()`**：每次追加候选后立即触发
+2. **`Worker::run()` 末尾**：匹配和排序完成后，若 `should_notify` 原子标志为 `true`，再触发一次
+
+`request_redraw()` 的实现（[helix-event/src/redraw.rs#L28-L30](helix-event/src/redraw.rs#L28-L30)）非常轻量：
+```rust
+pub fn request_redraw() {
+    REDRAW_NOTIFY.notify_one();  // 唤醒 tokio 等待的渲染循环
+}
+```
+它不会立即重绘，只是向 tokio 的 `Notify` 发送一次通知。Helix 主循环会以**30 FPS 去抖**速率合并这些通知，保证实际重绘不会过于频繁。
+
+### 3.2 tick — 协调 snapshot 与异步 worker
 
 每次 [render_picker()](helix-term/src/ui/picker.rs#L683-L880) 被调用时，首先执行 tick：
 
 ```rust
 fn render_picker(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
-    let status = self.matcher.tick(10);   // 最多阻塞 10ms 等待新结果
-    let snapshot = self.matcher.snapshot(); // 获取当前最新快照
+    let status = self.matcher.tick(10);   // 协调 worker，最多等 10ms 拿锁
+    let snapshot = self.matcher.snapshot(); // 只读快照
     // ...
 }
 ```
 
-**[matcher.tick(10)](helix-term/src/ui/picker.rs#L684)** 做了什么：
-- 消费自上次 tick 以来所有新注入的候选项
-- 对所有需要匹配的项执行模糊匹配（包括因 pattern 变更而需要重新匹配的项）
-- 重新按得分降序排序
-- 最多阻塞 10ms（避免长时间阻塞 UI 线程），未完成的部分留到下次 tick 继续
-- 返回 `status`，包含 `changed: bool`（结果是否有变化）和 `running: bool`（是否还有未完成的匹配）
+> **重要澄清**：**tick 本身不执行匹配**。匹配完全在 rayon 线程池异步进行。tick 的职责只是**协调**——检查 worker 是否跑完、把结果同步到 snapshot、必要时把 worker 再次派出去。
 
-**[matcher.snapshot()](helix-term/src/ui/picker.rs#L685)** 返回一个**不可变快照**：
-- 快照是 tick 之后的一致性视图
+#### tick 内部流程（`nucleo/src/lib.rs` → `tick_inner`）
+
+```rust
+fn tick_inner(&mut self, timeout: u64, canceled: bool, status: pattern::Status) -> Status {
+    // 1. 尝试获取 Worker 锁：canceled=true 时立即阻塞获取；
+    //    否则最多等 timeout 毫秒（Picker 传 10ms）
+    let mut inner = if canceled {
+        self.canceled.store(true, Ordering::Relaxed);
+        self.worker.lock_arc()
+    } else {
+        let Some(worker) = self.worker.try_lock_arc_for(Duration::from_millis(timeout)) else {
+            // 拿不到锁 → worker 还在跑，本帧没有新结果
+            self.should_notify.store(true, Ordering::Release);
+            return Status { changed: false, running: true };
+        };
+        worker
+    };
+
+    // 2. 若上一轮 worker 已经跑完（inner.running=true），把结果同步到 snapshot
+    let changed = inner.running;  // changed=true 意味着 snapshot 会更新
+    let running = canceled || self.items.count() > inner.item_count();
+    if inner.running {
+        inner.running = false;
+        if !inner.was_canceled && !self.state.canceled() {
+            self.snapshot.update(&inner);  // ← snapshot 在这里才会更新
+        }
+    }
+
+    // 3. 若还有未处理的新项或 pattern 变更，把 worker 派到线程池
+    if running {
+        inner.pattern.clone_from(&self.pattern);
+        self.canceled.store(false, Ordering::Relaxed);
+        if !canceled {
+            self.should_notify.store(true, Ordering::Release);
+        }
+        let cleared = self.state.cleared();
+        if cleared {
+            inner.items = self.items.clone();   // restart() 后切换到新 boxcar::Vec
+        }
+        // 异步执行 Worker::run()，立即返回不阻塞
+        self.pool.spawn(move || unsafe { inner.run(status, cleared) });
+    }
+    Status { changed, running }
+}
+```
+
+#### Status 字段含义
+
+| 字段 | 含义 |
+|------|------|
+| `status.changed` | 本帧 snapshot 是否被更新（只有在 `inner.running=true` 且没被取消时才为 `true`） |
+| `status.running` | 是否还有未完成的工作——如果为 `true`，下一帧还需要 tick（若 worker 还在跑，或有新候选项待处理） |
+
+Picker 侧对 `status.changed` 的处理（[picker.rs#L686-L690](helix-term/src/ui/picker.rs#L686-L690)）：
+```rust
+if status.changed {
+    self.cursor = self.cursor
+        .min(snapshot.matched_item_count().saturating_sub(1))
+}
+```
+只有在 snapshot 真的更新后才修正 cursor 越界，避免不必要的抖动。
+
+#### Snapshot 更新机制（`Snapshot::update`）
+
+```rust
+fn update(&mut self, worker: &Worker<T>) {
+    self.item_count = worker.item_count();
+    self.pattern.clone_from(&worker.pattern);
+    self.matches.clone_from(&worker.matches);   // 复制排序后的匹配结果
+    if !Arc::ptr_eq(&worker.items, &self.items) {
+        self.items = worker.items.clone()        // restart() 后切换共享 vector
+    }
+}
+```
+
+**[matcher.snapshot()](helix-term/src/ui/picker.rs#L685)** 返回一个**不可变引用**：
+- 只包含 `item_count`、`matches: Vec<Match>`、`pattern`、`items: Arc<boxcar::Vec<T>>` 四个字段
 - 包含 `matched_item_count()`、`item_count()`、`matched_items(range)`、`get_matched_item(idx)`、`pattern()` 等查询接口
-- 所有后续读取都基于这个快照，保证渲染期间数据一致
+- 所有后续渲染读取都基于这个快照，保证同一次渲染期间数据一致
+
+#### Worker 扫描新项的游标机制（`Worker::process_new_items`）
+
+Worker 用 `last_snapshot: u32` 记录上次处理到的索引。每次 `run()` 时：
+
+```rust
+let new_snapshot = self.items.par_snapshot(self.last_snapshot);
+if new_snapshot.end() != self.last_snapshot {
+    let end = new_snapshot.end();
+    // 对 [last_snapshot, end) 范围内的项并行匹配
+    self.matches.par_extend(new_snapshot.map(|(idx, item)| {
+        // 若 item 未初始化（写入还在进行）→ 放入 in_flight
+        // 否则 pattern.score() 计算得分
+    }));
+    self.last_snapshot = end;  // 游标前进
+}
+```
+
+如果某索引暂未初始化（push 正在并发写入），Worker 把 `idx` 放入 `in_flight: Vec<u32>`，下次 `run()` 时在 `process_new_items` 开头优先重试这些索引。
 
 ### 3.3 排序机制
 
@@ -427,9 +552,9 @@ fn finish_debounce(&mut self) {
 
 **关键步骤**：
 1. `version.fetch_add(1)` — 旧 Injector 检测到版本不匹配后 `push()` 返回 `Err(InjectorShutdown)`，安全退出
-2. `matcher.restart(false)` — 清空内部所有候选，`false` 表示不清除查询 pattern
-3. 新 Injector 绑定新版本号，后台任务通过它注入新的候选
-4. 后续 tick 将消费新候选，触发匹配和重排
+2. `matcher.restart(false)` — 切换到一个全新的 `boxcar::Vec`，旧 vector 随旧 Injector 引用计数归零后释放；`false` 表示不立刻清除 snapshot
+3. 新 Injector 绑定新版本号和新 vector，后台任务通过它 `push()` 追加新候选（每次 push 立即调 `notify()` 请求重绘）
+4. 后续每一帧 `tick(10ms)` 会：检测到 boxcar::Vec 有未处理的新项 → 把 Worker 派发到 rayon 线程池 → Worker 用 `last_snapshot` 游标增量扫描新项 → 匹配、排序、更新 snapshot
 
 ### 3.7 完整时序图
 
@@ -446,25 +571,30 @@ handle_prompt_change(is_paste)
     │  ③ 对变化的列调用 matcher.pattern.reparse()
     │  ④ 如果是动态 picker，发送 DynamicQueryChange
     ▼
-异步：nucleo 后台线程
-    │  ① 重新匹配受影响的候选
-    │  ② 计算得分，排序
-    │  ③ 请求 UI 重绘 (request_redraw)
+异步：nucleo rayon 线程池
+    │  （下一帧 render_picker → tick 时 pool.spawn 派发到这里）
+    │  ① pattern.status=Rescore 时 reset + 重算所有项得分
+    │  ② pattern.status=Unchanged 时 last_snapshot 游标增量扫描新项
+    │  ③ par_quicksort 并行排序（得分降序 → 长度升序 → 注入索引升序）
+    │  ④ 完成后若 should_notify → request_redraw()
     ▼
 render_picker()
-    │  ① matcher.tick(10ms) — 消费匹配结果
-    │  ② 获取 snapshot
-    │  ③ 如果 status.changed → 修正 cursor 不越界
+    │  ① matcher.tick(10ms) — 拿 worker 锁
+    │     · 超时拿不到 → running=true，本帧无新结果
+    │     · 拿到且上一轮跑完 → snapshot.update() 复制结果 + matches
+    │     · 拿到且有未处理项 → pool.spawn() 再次派发
+    │  ② 获取 snapshot（只读一致性视图）
+    │  ③ status.changed → 修正 cursor 不越界
     │  ④ 遍历可见行的 matched_items
-    │     └─ 对每个 filter 列：获取 indices → 构造高亮 Span
+    │     └─ 对每个 filter 列：pattern.indices() → 字素遍历 → 构造高亮 Span
     │  ⑤ 渲染 Table（带 highlight_style 高亮）
     ▼
 render_preview()
     │  ① selection() → snapshot.get_matched_item(cursor) → 原始数据
     │  ② file_fn → 路径 + 行范围
     │  ③ get_preview() → 缓存/磁盘/编辑器文档
-    │  ④ 异步触发语法高亮
-    │  ⑤ 渲染预览文档
+    │  ④ 异步触发语法高亮（150ms 防抖）
+    │  ⑤ 渲染预览文档（语法高亮 + 范围标记）
     ▼
 用户看到更新后的界面
 ```
@@ -632,27 +762,41 @@ pub fn selection(&self) -> Option<&T> {
 用户输入
     │
     ▼
-┌─────────────────┐     ┌─────────────────┐
-│  Prompt 输入框  │────▶│ PickerQuery 解析 │
-└─────────────────┘     └─────────────────┘
+┌─────────────────┐     ┌──────────────────────┐
+│  Prompt 输入框  │────▶│ PickerQuery 解析      │
+└─────────────────┘     └──────────────────────┘
     │                          │
-    │                          ▼
-    │              ┌──────────────────────────┐
-    │              │  Nucleo 匹配引擎（多线程）│
-    │              │  Injector → 无锁队列 →    │
-    │              │  匹配 → 排序 → snapshot   │
-    │              └──────────────────────────┘
-    │                          │
-    │                          ▼
-    │              ┌──────────────────────────┐
-    │              │   tick(10ms) + snapshot   │
-    │              │   · 消费新匹配结果        │
-    │              │   · status.changed 修正   │
-    │              │     cursor 越界           │
-    │              │   · indices() → 高亮      │
-    │              └──────────────────────────┘
-    │                          │
-    ▼                          ▼
+    │                          ▼ matcher.pattern.reparse()
+    │              ┌─────────────────────────────────────┐
+    │              │  Nucleo 匹配引擎                      │
+    │              │  ┌───────────────────────────────┐  │
+    │              │  │ Arc<boxcar::Vec<T>>           │  │
+    │              │  │ (三方共享 append-only vector) │  │
+    │              │  └───────────────┬───────────────┘  │
+    │              │          Injector│push/extend         │
+    │              │                  ▼                    │
+    │              │          追加 + notify()             │
+    │              │                  │                    │
+    │              │  ┌───────────────▼───────────────┐  │
+    │              │  │ rayon 线程池（异步匹配）       │  │
+    │              │  │  Worker::run()                 │  │
+    │              │  │  · last_snapshot 游标增量扫描   │  │
+    │              │  │  · par_extend 并行匹配         │  │
+    │              │  │  · par_quicksort 并行排序      │  │
+    │              │  │  · 完成后若 should_notify 则   │  │
+    │              │  │    再调一次 notify()           │  │
+    │              │  └───────────────┬───────────────┘  │
+    │              └──────────────────┼──────────────────┘
+    │                                 │
+    │              ┌──────────────────▼──────────────────┐
+    │              │        tick(10ms) + snapshot         │
+    │              │  · 拿 worker 锁（最多等 10ms）        │
+    │              │  · 若上一轮跑完 → snapshot.update()  │
+    │              │  · 若还有未处理项 → pool.spawn()     │
+    │              │  · status.changed → 修正 cursor     │
+    │              │  · indices() → 高亮渲染              │
+    │              └──────────────────┬──────────────────┘
+    ▼                                 ▼
 ┌─────────────────┐     ┌─────────────────┐
 │ render_picker   │     │ get_preview     │
 │  - 列表渲染     │────▶│  - 缓存检查     │
@@ -679,12 +823,15 @@ callback_fn 回调执行
 
 1. **增量匹配**：只重新解析变化的查询列
 2. **追加优化**：`is_append` 提示 nucleo 优化匹配过程
-3. **后台匹配**：nucleo 使用多线程进行匹配，不阻塞 UI
-4. **tick 限时**：`tick(10ms)` 最多阻塞 10ms，未完成部分留到下一帧
-5. **预览缓存**：避免重复读取文件和解析语法
-6. **防抖处理**：动态查询（100ms）和语法高亮（150ms）都有防抖
-7. **快速路径**：查询无实际变化时直接返回
-8. **版本号取消**：`AtomicUsize` 版本机制安全地使旧 Injector 失效
+3. **异步匹配**：nucleo 将 Worker 派发到独立 rayon 线程池，匹配完全不阻塞 UI 线程
+4. **tick 限时取锁**：`tick(10ms)` 最多等待 10ms 获取 Worker 锁，拿不到就直接返回本帧旧结果，保证帧率
+5. **游标增量扫描**：Worker 用 `last_snapshot` 游标追踪 boxcar::Vec 新增项，避免全量重复扫描
+6. **并行匹配与排序**：`par_extend` 并行匹配新项，`par_quicksort` 并行排序
+7. **重绘去抖**：`request_redraw()` 通过 tokio `Notify` 发送通知，Helix 主循环以 30 FPS 合并
+8. **预览缓存**：避免重复读取文件和解析语法
+9. **防抖处理**：动态查询（100ms）和语法高亮（150ms）都有防抖
+10. **快速路径**：查询无实际变化时直接返回
+11. **版本号取消**：`AtomicUsize` 版本机制安全地使旧 Injector 失效
 
 ---
 
@@ -695,4 +842,5 @@ callback_fn 回调执行
 | [picker.rs](helix-term/src/ui/picker.rs) | Picker 主组件，包含渲染、事件处理、预览逻辑 |
 | [picker/query.rs](helix-term/src/ui/picker/query.rs) | 查询语法解析，支持 `%field` 多列查询 |
 | [picker/handlers.rs](helix-term/src/ui/picker/handlers.rs) | 异步处理器：预览高亮、动态查询 |
-| [helix-core/src/fuzzy.rs](helix-core/src/fuzzy.rs) | 模糊匹配工具函数，MATCHER 全局实例 |
+| [helix-core/src/fuzzy.rs](helix-core/src/fuzzy.rs) | 模糊匹配工具函数，MATCHER 全局实例（小规模同步匹配） |
+| [helix-event/src/redraw.rs](helix-event/src/redraw.rs) | `request_redraw()` 重绘通知机制，30 FPS 去抖 |
