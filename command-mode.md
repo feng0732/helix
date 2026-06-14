@@ -16,30 +16,38 @@
       │  ═════════════ handle_event 阶段（按键后立即执行）════════════ │
       │  按键事件 → Prompt::handle_event [ui/prompt.rs#L606-L766]     │
       │         │                                                     │
-      │         ├─ 字符输入 → 修改 self.line                          │
+      │         ├─ 字符/删除键 → 修改 self.line                       │
       │         │       ↓                                             │
       │         │  1. recalculate_completion [ui/prompt.rs#L157-L160] │
       │         │     调用 completion_fn → 计算补全候选，保存到 self.completion │
       │         │  2. callback_fn(Update) → execute_command_line(Update) │
       │         │     无验证、无展开，仅让命令感知输入变化             │
       │         │                                                     │
-      │         ├─ Enter 键 → 关闭 Prompt → 触发 Validate 事件        │
+      │         ├─ Tab/S-Tab → 切换 self.selection + 替换 self.line  │
       │         │       ↓                                             │
-      │         │  1. 保存输入到历史寄存器                            │
-      │         │  2. callback_fn(Validate) → execute_command_line(Validate) │
-      │         │     完整解析 + 验证 + 展开 + 执行                   │
-      │         │     失败 → set_error → 状态栏渲染                   │
+      │         │  ❌ 不重算补全候选（仅切换索引+填充）              │
+      │         │  ✅ callback_fn(Update)（Tab 时，S-Tab 同理）       │
+      │         │  例外：唯一候选是目录 → recalculate_completion      │
       │         │                                                     │
-      │         └─ Esc/C-c → 关闭 Prompt → 触发 Abort 事件            │
+      │         ├─ Enter 键 → callback_fn(Validate) → close_fn       │
+      │         │       ↓                                             │
+      │         │  1. callback_fn(Validate) → execute_command_line(Validate) │
+      │         │     完整解析 + 验证 + 展开 + 执行                   │
+      │         │  2. 返回 close_fn → compositor.pop() 移除 Prompt   │
+      │         │  3. should_redraw=true                              │
+      │         │                                                     │
+      │         └─ Esc/C-c → callback_fn(Abort) → close_fn           │
       │                 ↓                                             │
-      │                 callback_fn(Abort) → 命令函数可恢复状态（如 theme 预览）│
+      │                 callback_fn(Abort) → 命令函数可恢复状态       │
+      │                 返回 close_fn → compositor.pop() 移除 Prompt  │
       │                                                               │
       │  ═════════════════ render 阶段（红屏时执行）═════════════════ │
-      │  Prompt::render → render_prompt [ui/prompt.rs#L469-L511]      │
-      │         │                                                     │
+      │  输入变化时：Prompt 仍在 layers 中 → Prompt::render_prompt   │
       │         ├─ 渲染补全列表（使用 handle_event 阶段计算好的 completion）│
-      │         └─ doc_fn(&self.line) [commands/typed.rs#L4076-L4146] │
-      │            计算文档提示 → 渲染帮助浮窗（在命令行上方）         │
+      │         └─ doc_fn(&self.line) → 计算文档提示 → 渲染帮助浮窗  │
+      │                                                               │
+      │  Enter/Esc 时：Prompt 已被 pop 移除 → 只渲染底层 EditorView │
+      │         └─ EditorView::render → 编辑区 + 状态栏（含错误信息） │
       └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -115,16 +123,18 @@ pub struct Prompt {
 
 `Prompt::handle_event` 在 [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L606-L766) 处理所有按键：
 
-| 按键 | 行为 | 触发回调事件 |
-|------|------|-------------|
-| 普通字符 | 插入到 `self.line`，更新补全 | `PromptEvent::Update` |
-| `Enter` | 执行命令，关闭 Prompt | `PromptEvent::Validate` |
-| `Esc` / `C-c` | 关闭 Prompt，丢弃输入 | `PromptEvent::Abort` |
-| `Tab` / `S-Tab` | 切换补全选项，自动填充 | `PromptEvent::Update` |
-| `Backspace` / `C-h` | 删除前一个字符 | `PromptEvent::Update` |
-| `C-w` / `A-Backspace` | 删除前一个词 | `PromptEvent::Update` |
-| `Up` / `C-p` | 浏览历史记录 | `PromptEvent::Update` |
-| `Down` / `C-n` | 浏览历史记录 | `PromptEvent::Update` |
+| 按键 | 行为 | 是否重算补全 | 触发回调事件 |
+|------|------|-------------|-------------|
+| 普通字符 | 插入到 `self.line` | ✅ `insert_char` 内部调用 `recalculate_completion` | `PromptEvent::Update` |
+| `Enter` | 执行命令，关闭 Prompt | ❌ 特殊：目录补全时调用 `recalculate_completion`，否则不调用 | `PromptEvent::Validate` |
+| `Esc` / `C-c` | 关闭 Prompt，丢弃输入 | ❌ | `PromptEvent::Abort` |
+| `Tab` | 切换补全选项，自动填充 `self.line` | ❌ 不重算候选，仅切换 `self.selection` 索引；**例外**：唯一候选是目录时调用 `recalculate_completion` | `PromptEvent::Update` |
+| `S-Tab` | 反向切换补全选项，自动填充 `self.line` | ❌ 不重算候选，仅切换 `self.selection` 索引 | `PromptEvent::Update` |
+| `Backspace` / `C-h` | 删除前一个字符 | ✅ `delete_char_backwards` 内部调用 `recalculate_completion` | `PromptEvent::Update` |
+| `C-w` / `A-Backspace` | 删除前一个词 | ✅ `delete_word_backwards` 内部调用 `recalculate_completion` | `PromptEvent::Update` |
+| `Up` / `C-p` | 浏览历史记录 | ✅ `change_history` 内部调用 `recalculate_completion` | `PromptEvent::Update` |
+| `Down` / `C-n` | 浏览历史记录 | ✅ `change_history` 内部调用 `recalculate_completion` | `PromptEvent::Update` |
+| `C-q` | 退出补全选择状态 | ❌ 仅 `exit_selection()` | 无 |
 
 ### 3. Enter 键的特殊处理
 
@@ -163,38 +173,72 @@ key!(Enter) => {
 > 1. **handle_event 阶段**（按键后立即执行）：补全计算 + Update 回调
 > 2. **render 阶段**（随后红屏时执行）：文档提示计算 + 所有渲染
 
-### 完整调用时序（以用户输入单个字符为例）
+### 完整调用时序
+
+#### 时序 A：输入字符（重算补全候选）
 
 ```
 application::handle_terminal_events() [application.rs#L685-L760]
   ↓
 compositor::handle_event() [compositor.rs#L144-L175]
-  ↓ (从顶层 UI 层向下传递，Prompt 是顶层)
-Prompt::handle_event() [ui/prompt.rs#L606-L766]
-  ├─ 步骤 1：修改 self.line（如 self.insert_char(c, cx)）
-  │   └─ 内部调用 self.recalculate_completion(cx.editor) [ui/prompt.rs#L268-L268]
-  │       └─ 调用 completion_fn → 计算补全，保存到 self.completion
-  ├─ 步骤 2：调用 (self.callback_fn)(cx, &self.line, PromptEvent::Update)
-  │   └─ execute_command_line(Update) → 无验证无展开的命令解析
-  └─ 返回 EventResult::Consumed(None) → should_redraw = true
   ↓
-application::handle_terminal_events() 检测到 should_redraw = true
+Prompt::handle_event() [ui/prompt.rs#L754-L761]
+  ├─ 步骤 1：self.insert_char(c, cx) → 修改 self.line
+  │   └─ 内部调用 self.recalculate_completion(cx.editor) [ui/prompt.rs#L268]
+  │       └─ 调用 completion_fn → 计算补全，保存到 self.completion
+  ├─ 步骤 2：(self.callback_fn)(cx, &self.line, PromptEvent::Update)
+  │   └─ execute_command_line(Update) → 无验证无展开的命令解析
+  └─ 返回 EventResult::Consumed(None) → consumed=true → should_redraw=true
   ↓
 application::render() [application.rs#L255-L286]
   ↓
-compositor::render() [compositor.rs]
+compositor::render() → Prompt 仍在 layers 中
   ↓
-Prompt::render() → self.render_prompt() [ui/prompt.rs#L400-L511]
-  ├─ 渲染补全列表（使用 self.completion，已在 handle_event 阶段计算好）
-  └─ 步骤 3：调用 (self.doc_fn)(&self.line) [ui/prompt.rs#L479-L479]
-      └─ command_line_doc() → 计算文档提示 → 渲染帮助浮窗
+Prompt::render() → render_prompt() [ui/prompt.rs#L404-L511]
+  ├─ 渲染补全列表（使用 self.completion）
+  └─ doc_fn(&self.line) [ui/prompt.rs#L479] → 文档提示 → 渲染帮助浮窗
+```
+
+#### 时序 B：Tab 切换补全选项（不重算候选）
+
+```
+Prompt::handle_event() [ui/prompt.rs#L721-L728]
+  ├─ 步骤 1：self.change_completion_selection(Forward) [ui/prompt.rs#L375-L394]
+  │   ├─ 切换 self.selection 索引（不调用 recalculate_completion）
+  │   └─ self.line.replace_range(range, &item.content) → 替换输入文本
+  ├─ 步骤 2：唯一候选是目录？
+  │   └─ 是 → self.recalculate_completion()（列出目录内容）
+  ├─ 步骤 3：(self.callback_fn)(cx, &self.line, PromptEvent::Update)
+  └─ 返回 EventResult::Consumed(None) → should_redraw=true
+  ↓
+render 阶段：同上，渲染更新后的补全列表和文档提示
+```
+
+#### 时序 C：Enter 执行命令（Prompt 被移除，底层重绘）
+
+```
+Prompt::handle_event() [ui/prompt.rs#L679-L709]
+  ├─ 步骤 1：(self.callback_fn)(cx, input, PromptEvent::Validate)
+  │   └─ execute_command_line(Validate) → 完整解析+验证+展开+执行
+  └─ 返回 close_fn = EventResult::Consumed(Some(callback))
+      ↓
+compositor::handle_event() [compositor.rs#L161-L164]
+  ├─ 收集 callback 到 callbacks 列表
+  └─ 循环结束后执行 callback → compositor.pop() → Prompt 从 layers 移除
+  返回 consumed=true → should_redraw=true
+  ↓
+application::render() [application.rs#L255-L286]
+  ↓
+compositor::render() → 遍历剩余 layers（只有 EditorView）
+  ↓
+EditorView::render() → 渲染编辑区 + 状态栏（含错误信息）
 ```
 
 | 阶段 | 执行时机 | 调用的函数 | 作用 |
 |------|---------|-----------|------|
-| **handle_event 阶段** | 按键后立即同步执行 | `recalculate_completion` → `completion_fn` | 计算补全候选，保存到 `self.completion` |
-| **handle_event 阶段** | 按键后立即同步执行 | `callback_fn(Update)` → `execute_command_line(Update)` | 命令感知输入变化（无验证无展开） |
-| **render 阶段** | handle_event 之后，should_redraw=true 时异步执行 | `doc_fn(&self.line)` → `command_line_doc` | 计算并渲染文档提示浮窗 |
+| **handle_event 阶段** | 按键后立即同步执行 | `recalculate_completion` → `completion_fn` | 计算补全候选，保存到 `self.completion`（仅字符/删除/历史键触发，Tab 不触发） |
+| **handle_event 阶段** | 按键后立即同步执行 | `callback_fn(Update/Validate/Abort)` | Update：命令感知输入变化；Validate：完整执行命令；Abort：恢复状态 |
+| **render 阶段** | should_redraw=true 时执行 | Prompt 仍在：`doc_fn` → 文档提示 + 补全渲染 | Prompt 已移除：EditorView 渲染编辑区+状态栏 |
 
 ---
 
@@ -625,8 +669,10 @@ pub(super) fn execute_command(
 
 | 事件类型 | 触发时机 | 触发的动作 |
 |---------|---------|-----------|
-| **输入变化**（普通字符、删除、Tab、方向键等） | `handle_event` 阶段 + `render` 阶段 | `handle_event` 阶段：<br>1. `recalculate_completion()` → 补全计算<br>2. `callback_fn(Update)` → `execute_command_line(Update)`<br><br>`render` 阶段：<br>3. 渲染补全列表<br>4. `doc_fn()` → 文档提示计算与渲染 |
-| **回车执行**（Enter 键） | 仅 `handle_event` 阶段 | `handle_event` 阶段：<br>1. 保存输入到历史寄存器<br>2. `callback_fn(Validate)` → `execute_command_line(Validate)`<br>3. 关闭 Prompt，从 compositor 栈移除<br><br>**没有 render 阶段**（因为 Prompt 已关闭） |
+| **输入变化**（普通字符、删除、Tab、方向键等） | `handle_event` 阶段 + `render` 阶段 | `handle_event` 阶段：<br>1. 修改 `self.line`（可能重算补全候选，见上表）<br>2. `callback_fn(Update)` → `execute_command_line(Update)`<br><br>`render` 阶段：<br>3. `Prompt::render_prompt()` → 渲染补全列表 + 文档提示 |
+| **回车执行**（Enter 键） | `handle_event` 阶段 + `render` 阶段 | `handle_event` 阶段：<br>1. 保存输入到历史寄存器<br>2. `callback_fn(Validate)` → `execute_command_line(Validate)`<br>3. 返回 `close_fn` → compositor 执行回调 `compositor.pop()` 移除 Prompt 层<br>4. `compositor.handle_event` 返回 `consumed=true` → `should_redraw=true`<br><br>`render` 阶段：<br>5. **仍然执行** `application::render()`<br>6. `compositor.render()` 遍历剩余层 → 渲染底层 `EditorView`（显示命令执行结果或错误信息）<br>7. **不再渲染 Prompt**（已从 layers 移除） |
+
+> **纠正**：之前文档描述"回车后没有 render 阶段"是错误的。回车后 `should_redraw=true` 仍然触发 `application::render()`，但此时 Prompt 已从 compositor 的 layers 中移除，所以 render 只渲染底层 EditorView，不会渲染 Prompt 自身。
 
 ### Update vs Validate 解析动作完整对比
 
@@ -1076,23 +1122,33 @@ fn theme(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
 
 #### 阶段 2：按下 Enter（触发 Validate）
 
-只触发 **handle_event 阶段**，没有后续 render 阶段（因为 Prompt 已关闭）：
+触发 **handle_event 阶段 + render 阶段**，但 render 阶段不渲染 Prompt（已移除）：
+
+**handle_event 阶段：**
 
 | 步骤 | 执行动作 |
 |------|---------|
-| 1 | 保存 `"write --no-format test.txt"` 到 `:` 历史寄存器 |
-| 2 | `callback_fn(Validate)` → `execute_command_line(..., Validate)` |
-| 2a | `split()` → `("write", "--no-format test.txt", false)` |
-| 2b | 查找到 `write` 命令 |
-| 2c | `execute_command(..., validate=true)` |
-| 2d | `Tokenizer::new("--no-format test.txt", true)` → 分词 → 两个 Unquoted token |
-| 2e | 每个 token 调用 `expansion::expand()` → 都是 Unquoted，原样返回 |
-| 2f | `Args::push("--no-format")` → 匹配 flag `no-format` |
-| 2g | `Args::push("test.txt")` → positionals = `["test.txt"]` |
-| 2h | `Args::finish()` → 验证通过 ✓ |
-| 2i | `write(cx, args, Validate)` → 检测到 Validate → 实际保存文件 |
-| 3 | 成功 → Prompt 关闭，回到 Normal 模式 |
-| 4 | 失败（如权限不足）→ `cx.editor.set_error("'write': Permission denied")` → 下一次 render 时红色显示在状态栏左下角 |
+| 1 | `callback_fn(Validate)` → `execute_command_line(..., Validate)` |
+| 1a | `split()` → `("write", "--no-format test.txt", false)` |
+| 1b | 查找到 `write` 命令 |
+| 1c | `execute_command(..., validate=true)` |
+| 1d | `Tokenizer::new("--no-format test.txt", true)` → 分词 → 两个 Unquoted token |
+| 1e | 每个 token 调用 `expansion::expand()` → 都是 Unquoted，原样返回 |
+| 1f | `Args::push("--no-format")` → 匹配 flag `no-format` |
+| 1g | `Args::push("test.txt")` → positionals = `["test.txt"]` |
+| 1h | `Args::finish()` → 验证通过 ✓ |
+| 1i | `write(cx, args, Validate)` → 检测到 Validate → 实际保存文件 |
+| 2 | 返回 `close_fn`（`EventResult::Consumed(Some(callback))`） |
+| 3 | `compositor.handle_event` 收集 callback，循环结束后执行 `compositor.pop()` → Prompt 从 layers 移除 |
+| 4 | `compositor.handle_event` 返回 `consumed=true` → `should_redraw=true` |
+
+**render 阶段（should_redraw=true 触发）：**
+
+| 步骤 | 执行动作 |
+|------|---------|
+| 5 | `application::render()` → `compositor.render()` |
+| 6 | 遍历剩余 layers（此时只有 EditorView，Prompt 已被 pop 移除） |
+| 7 | `EditorView::render()` → 渲染编辑区 + 状态栏<br>• 命令成功 → 状态栏可能显示成功信息<br>• 命令失败 → `editor.status_msg` 包含 `Severity::Error` → 红色错误文本显示在状态栏左下角 |
 
 ---
 
