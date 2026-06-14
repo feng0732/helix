@@ -283,17 +283,29 @@ Adapter 在 launch/attach 请求处理完成、**准备好接收配置**（如�
 [handle_debugger_message](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-view/src/handlers/dap.rs#L375-L396) 处理 `Initialized` 事件时，完成最后的配置阶段：
 
 ```
-Initialized 事件处理
+Initialized 事件处理（id = 发出此事件的 Client 的 DebugAdapterId）
   ├─ 1. set_status("Debugger initialized...")
   ├─ 2. 同步已有断点：
-  │     └─ 遍历 editor.breakpoints 中所有文件的断点
+  │     └─ 遍历 editor.breakpoints 中所有文件的断点（全局唯一断点列表）
   │        └─ 对每个 path 调用 breakpoints_changed(debugger, path, breakpoints)
-  │              └─ 发送 setBreakpoints 请求给 Adapter
-  ├─ 3. 发送 configurationDone 请求（仅当 Adapter 支持时）
+  │              └─ 向当前 Client 发送 setBreakpoints 请求
+  │              └─ 将 Adapter 返回的 id/verified/line/column 回写到全局断点列表
+  ├─ 3. 发送 configurationDone 请求
   │     └─ 通知 Adapter：所有初始配置已发送完毕，可以开始执行被调试程序
   ├─ 4. 成功则 set_status("Debugged application started")
-  └─ 5. debug_adapters.set_active_client(id)  ← 标记当前 Client 为活跃调试器
+  └─ 5. debug_adapters.set_active_client(id)  ← 将此 Client 设为活跃调试器
 ```
+
+**关于 `set_active_client(id)` 的关键行为**：
+
+- `id` 参数来自事件参数 `handle_debugger_message(id, payload)` 中的 `id`，即**发出此 Initialized 事件的那个 Client** 的 `DebugAdapterId`
+- `set_active_client` 直接将 `Registry.current_client_id` 设为 `Some(id)`，**覆盖**之前的活跃调试器
+- 因此，**最后收到 Initialized 事件的 Client 成为活跃调试器**
+- 在父子调试会话的场景中：
+  - 父调试器先收到 Initialized → 父成为活跃调试器
+  - 子调试器后收到 Initialized → **子覆盖父成为活跃调试器**
+  - 此后用户通过 `debugger!` 宏发起的命令（步进、继续等）都作用于子调试器
+  - 父调试器仍在运行，仍接收事件，只是不再是用户命令的默认目标
 
 这一步完成后，调试会话才算真正建立，用户可以进行步进、查看变量等操作。
 
@@ -535,33 +547,76 @@ StartDebugging 请求处理
 | 消息汇聚 | receiver 推入 SelectAll | 同一 SelectAll，每条消息自带 id 区分来源 |
 | launch/attach | 由 dap_start_impl 异步触发 | 由 StartDebugging 处理逻辑直接 await |
 | 调试目标 | 原始被调试进程（父进程） | fork 出的子进程或附加的目标 |
-| 断点管理 | 独立的断点集合？* | 独立的断点集合？* |
-| 活跃状态 | 初始被设为 active_client | 不会自动设为 active，需用户切换 |
+| 断点同步 | Initialized 时同步全局断点到父 Adapter | Initialized 时再次同步同一全局断点到子 Adapter |
+| 活跃状态 | Initialized 后设为 active；子 Initialized 后被覆盖 | 子 Initialized 后成为 active（覆盖父） |
 
-*注：断点存储在 Editor.breakpoints 中是全局的（按文件路径索引），所有调试 Client 共享同一断点列表，但每个 Client 会各自发送 setBreakpoints 请求，Adapter 端区分哪些断点属于哪个会话。
+**活跃状态的实际行为**：
 
-**initialize 的独立性**：
-- 父调试器：在 `Registry::start_client` 中 `block_on(client.initialize(config.name.clone()))` 同步执行
-- 子调试器：同样在 `Registry::start_client` 中独立执行 `block_on(client.initialize(config.name.clone()))`，不依赖父调试器的状态
-- 两次 initialize 之间没有任何共享数据，完全独立
+`set_active_client` 的逻辑是**直接覆盖**（见 [Registry::set_active_client](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/registry.rs#L82-L88)）：
 
-**消息接收与区分**：
-- 每个 Client 创建时都会将独立的 receiver 通过 `self.incoming.push(...)` 推入 Registry 的 `SelectAll<UnboundedReceiverStream<...>>`
-- `SelectAll` 将多条流合并为一条，任何一条 receiver 上有消息都会被取出
-- 每条消息都附带 `DebugAdapterId`（由 `Client::recv` 协程在转发时加上 `(id, Payload)`），因此上层可以准确区分消息来源
-- 反向请求的回复通过 `debugger.reply(request.seq, ...)` 发送到**收到该请求的特定 Client**，不会干扰其他会话
+```rust
+pub fn set_active_client(&mut self, id: DebugAdapterId) {
+    if self.get_client(id).is_some() {
+        self.current_client_id = Some(id);  // 直接覆盖
+    }
+}
+```
 
-**限制与注意事项**：
-| 限制项 | 说明 |
-|--------|------|
-| 传输方式限制 | 父调试器必须使用 TCP 传输（client.socket 不为 None） |
-| stdio 模式 | 不支持子调试（stdio 是一对一的，无法 accept 多条连接） |
-| `:debug-remote` | 不支持子调试（`Client::tcp` 创建的 Client 的 `socket` 字段为 None，即使底层是 TCP） |
-| 配置来源 | 子调试器复用父调试器的 `DebugAdapterConfig` |
-| 会话数量 | 理论上可以有多个子调试器，由 SlotMap 统一管理，每条独立 TCP 连接 |
-| Adapter 支持 | 需要 Adapter 自身实现支持多连接（服务器端 Socket accept 循环） |
+- `handle_debugger_message` 在收到每个 Client 的 `Initialized` 事件时都会调用 `set_active_client(id)`
+- 由于子调试会话的 Initialized 事件通常晚于父（子需要先创建连接、握手、launch/attach，然后 Adapter 才发 Initialized），**子调试器会覆盖父成为活跃调试器**
+- StartDebugging 处理逻辑中**没有**显式调用 `set_active_client`，活跃状态的变更完全由 Initialized 事件驱动
+- 父调试器仍在 SlotMap 中运行，仍通过 SelectAll 接收事件（如 Stopped、Continued），只是用户通过 `debugger!` 宏发起的命令默认作用于子调试器
+- 当任一 Client 收到 `Terminated` 事件时，调用 `unset_active_client()` **直接清空**活跃调试器，不会回退到父调试器
 
-> ⚠️ **代码细节**：`Client::tcp` 方法（远程连接路径）不会设置 `client.socket` 字段，因此通过 `:debug-remote` 连接的调试器即使底层是 TCP，也无法启动子调试会话。只有通过 `Client::tcp_process` 路径（本地 tcp+port_arg）创建的 Client 才会设置 `socket` 字段。这是当前实现的一个特性，可能是为了避免远程场景下假设端口可达性问题。
+**断点同步的实际行为**：
+
+`Editor.breakpoints` 是全局唯一的（`HashMap<PathBuf, Vec<Breakpoint>>`），所有 Client 共享。每个 Client 收到 `Initialized` 事件时，都会触发相同的断点同步流程：
+
+```
+Initialized 事件（id = 父/子 Client）
+  └─ 遍历 self.breakpoints 的每个 (path, breakpoints)
+       └─ breakpoints_changed(debugger, path, breakpoints)
+            ├─ 向该 Client 的 Adapter 发送 setBreakpoints 请求
+            └─ 将 Adapter 返回的 id/verified/line/column **就地回写**到全局 breakpoints
+```
+
+关键细节：
+1. **全局断点列表只有一个**，不是每个 Client 各自一份
+2. 父 Client Initialized 时，向父 Adapter 发送 setBreakpoints，父 Adapter 返回的断点 id/verified 回写到全局列表
+3. 子 Client Initialized 时，向子 Adapter 发送 setBreakpoints，子 Adapter 返回的断点 id/verified **覆盖**全局列表中之前的值
+4. 由于 `breakpoints_changed` 修改的是 `&mut [Breakpoint]`（可变引用），后同步的 Client 的 Adapter 响应会覆盖先同步的 Adapter 响应
+5. 这意味着全局断点列表中最终保存的是**最后一个同步的 Adapter** 的断点状态（verified、id 等）
+6. 用户手动切换断点时（`Space G b`），调用的是 `debugger!(editor)` 即活跃 Client 的 `breakpoints_changed`，只会同步到当前活跃 Client 的 Adapter
+
+**子调试会话的完整生命周期时序**：
+
+```
+1. Adapter 通过父 Client 的连接发送 StartDebugging 反向请求
+   ↓
+2. handle_debugger_message(id=父, Payload::Request(StartDebugging))
+   ├─ 检查父 Client 的 socket（必须存在）
+   ├─ start_client(Some(socket), &config) 创建子 Client
+   │   ├─ Client::tcp(socket) → 新建第二条 TCP 连接
+   │   ├─ block_on(client.initialize()) → 子 Client 独立握手
+   │   └─ 子 receiver 推入 SelectAll
+   ├─ 子 Client.launch/attach → 直接 await（不是 dap_callback）
+   └─ debugger.reply() → 通过父 Client 回复 Adapter
+   ↓
+3. Adapter 处理子的 launch/attach，准备就绪后
+   ↓
+4. Adapter 通过子 Client 的 TCP 连接发送 Initialized 事件
+   ↓
+5. handle_debugger_message(id=子, Payload::Event(Initialized))
+   ├─ 遍历全局断点，向子 Adapter 同步（覆盖全局断点的 id/verified）
+   ├─ 子 Client.configuration_done()
+   └─ set_active_client(子) → 子成为活跃调试器，覆盖父
+   ↓
+6. 子调试会话就绪，用户命令默认作用于子 Client
+   ↓
+7. 子 Client 收到 Terminated 事件
+   ├─ remove_client(子) → 从 SlotMap 中移除子 Client
+   └─ unset_active_client() → 直接清空活跃调试器（不会回退到父）
+```
 
 ---
 
@@ -612,6 +667,16 @@ pub struct Breakpoint {
 2. **0→1 索引转换**：Helix 内部使用 0-indexed 行号，DAP 协议使用 1-indexed，在构造 `SourceBreakpoint` 时 `line + 1`
 3. **发送 setBreakpoints 请求**：对整个文件的所有断点一次性发送（DAP 协议要求按文件设置断点，每次发送该文件的全部断点列表）
 4. **回写 Adapter 返回的断点信息**：将 Adapter 返回的 `verified`、`message`、修正后的 `line` 等信息更新到 Editor 的 breakpoints 中
+
+**多 Client 场景下的断点同步行为**：
+
+`breakpoints_changed` 的签名是 `fn breakpoints_changed(debugger: &mut dap::Client, path: PathBuf, breakpoints: &mut [Breakpoint])`，它接收的是**特定 Client 的可变引用**和**全局断点列表的可变切片**。这意味着：
+
+- 每次调用只向**一个** Client 的 Adapter 发送 setBreakpoints
+- Adapter 返回的断点状态（id、verified、line 等）**就地回写**到全局断点列表
+- 当存在多个 Client 时，每个 Client 的 Adapter 会独立分配断点 ID、独立验证断点
+- 由于全局断点列表只有一份，后同步的 Client 的 Adapter 响应会**覆盖**先同步的 Adapter 响应中的 id/verified 等字段
+- 用户手动切换断点时，`debugger!(editor)` 获取的是当前活跃 Client，断点变更只会同步到活跃 Client 的 Adapter
 
 ### 3.5 Adapter 主动推送的断点事件
 
