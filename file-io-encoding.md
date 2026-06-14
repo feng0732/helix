@@ -224,16 +224,57 @@ Rope 内容 = 一个行尾字符，行尾来源：EditorConfig `end_of_line` > �
 [Editor::new_file_from_stdin()](helix-view/src/editor.rs) 读取 stdin 内容：
 
 ```rust
-let (stdin, encoding, has_bom) = crate::document::read_to_string(&mut stdin(), None)?;
-let doc = Document::from(
-    helix_core::Rope::default(),  // 先创建空 Rope
-    Some((encoding, has_bom)),
-    // ...
-);
-// 然后通过 Transaction::insert 将 stdin 内容插入
+pub fn new_file_from_stdin(&mut self, action: Action) -> Result<DocumentId, Error> {
+    // 步骤 1：从 stdin 读取并解码为 UTF-8 字符串
+    let (stdin, encoding, has_bom) = crate::document::read_to_string(&mut stdin(), None)?;
+
+    // 步骤 2：用空 Rope 创建 Document（此时 line_ending = default_line_ending）
+    let doc = Document::from(
+        helix_core::Rope::default(),  // 空 Rope（不含任何行尾）
+        Some((encoding, has_bom)),
+        self.config.clone(),
+        self.syn_loader.clone(),
+    );
+    let doc_id = self.new_file_from_document(action, doc);
+    let doc = doc_mut!(self, &doc_id);
+    let view = view_mut!(self);
+    doc.ensure_view_init(view.id);
+
+    // 步骤 3：将 stdin 内容插入到 Rope
+    let transaction =
+        helix_core::Transaction::insert(doc.text(), doc.selection(view.id), stdin.into())
+            .with_selection(Selection::point(0));
+    doc.apply(&transaction, view.id);
+    doc.append_changes_to_history(view);
+
+    // 注意：**没有**调用 doc.detect_indent_and_line_ending()
+    Ok(doc_id)
+}
 ```
 
-stdin 内容通过 `read_to_string()` 解码后原样插入 Rope，行尾不做归一化。随后 `doc.detect_indent_and_line_ending()` 会根据实际内容检测并设置元信息。
+**关键事实：stdin 内容插入后**，`doc.line_ending` 仍然是 `Document::from()` 中设置的初始值 `config.default_line_ending.into()`——**不会立即根据 stdin 内容重新检测行尾**。
+
+| 项目 | 行为 |
+|------|------|
+| stdin 内容解码 | ✅ 通过 `read_to_string()` 解码，编码自动检测 |
+| Rope 中是否保留 stdin 的原始行尾 | ✅ 原样保留，不做归一化 |
+| 插入后是否调用 `detect_indent_and_line_ending()` | ❌ **否** |
+| 插入后 `doc.line_ending` 的值 | `default_line_ending`（默认 Native → 平台原生） |
+| 文档语言检测 | ❌ 无路径 → 无法从文件名检测语言 |
+
+**stdin 文档与正常打开文件的对比：**
+
+```
+正常 Document::open() :          stdin new_file_from_stdin() :
+─────────────────────────        ──────────────────────────
+路径存在 → from_reader()          read_to_string() 解码
+路径不存在 → 默认行尾初始化        空 Rope → Document::from()
+设置路径 + 检测语言                无路径 + 不检测语言
+设置 EditorConfig                  不设置 EditorConfig（无路径）
+→ detect_indent_and_line_ending()  ❌ 不调用 detect_indent_and_line_ending()
+```
+
+**影响：** 如果用管道把一个 CRLF 文件内容传给 `helix -`（stdin），在非 Windows 平台上，`doc.line_ending` 元信息是 `LF`（Native），但 Rope 里实际存的是 `\r\n`。此时按 Enter 换行插入的是 `\n`，造成混合行尾——除非手动执行 `:line-ending crlf`。
 
 ---
 
@@ -1393,6 +1434,7 @@ pub fn auto_detect_line_ending(doc: &Rope) -> Option<LineEnding> {
 | 粘贴 LF 内容到 CRLF 文档 | 粘贴内容中 `\n` → `\r\n` | `Crlf` | ✅ 粘贴部分一致 |
 | 混合行尾文件（既有 LF 也有 CRLF） | 保留混合 | 首个检测到的行尾类型 | ❌ 部分不一致 |
 | 其他编辑器修改了文件行尾，尚未 reload | 还是旧行尾 | 还是旧元信息 | ✅ 一致（但与磁盘不一致） |
+| stdin 管道内容（`cat file.txt | hx`） | 原样保留 stdin 中的行尾 | 保持 `default_line_ending`（初始值） | ❌ 可能不一致（除非手动触发检测） |
 
 **关键边界原则：**
 
@@ -1401,7 +1443,206 @@ pub fn auto_detect_line_ending(doc: &Rope) -> Option<LineEnding> {
 3. **粘贴做输入转换**：外部内容进入时（剪贴板、寄存器、Snippet）做行尾归一化到文档当前行尾
 4. **保存不做转换**：Rope 中的行尾原样写入磁盘，不做任何 CRLF ↔ LF 转换
 5. **yank 不做转换**：从 Rope 复制内容时，保持 Rope 中的原始行尾（多选区拼接除外）
-6. **自动检测只在打开时**：`detect_indent_and_line_ending()` 仅在打开和 reload 时调用
+6. **自动检测触发时机**：`detect_indent_and_line_ending()` 有 5 个调用点（见 13.13 节）
+
+### 13.13 detect_indent_and_line_ending() 所有调用点
+
+`detect_indent_and_line_ending()` 的完整调用点共 5 处，覆盖 5 种场景：
+
+| 调用位置 | 文件 | 触发场景 | 是否刷新 EditorConfig |
+|---------|------|---------|---------------------|
+| `Document::open()` | document.rs | 打开文件（`:open`） | ✅ 先设置 `editor_config` |
+| `Document::reload()` | document.rs | 重新加载文件（`:reload`） | ❌ 不刷新（沿用原有） |
+| `Editor::refresh_doc_language()` | editor.rs | 设置文档路径后内部调用 | ✅ 先调用 `detect_editor_config()` |
+| `Editor::set_path()` → `refresh_doc_language()` | editor.rs | 设置文档路径后 | ✅ 先调用 `detect_editor_config()` |
+| `:language` 命令 | typed.rs | 手动切换文档语言后 | ❌ 不刷新（沿用原有） |
+
+**注意：`new_file_from_stdin()` (stdin 管道) 不调用 `detect_indent_and_line_ending()`，见 13.14 节。**
+
+下面逐一说明每个调用点。
+
+**调用点 1：Document::open() — 打开文件**
+
+[Document::open()](helix-view/src/document.rs) 末尾：
+
+```rust
+// 先设置 EditorConfig
+doc.editor_config = editor_config;
+// 再检测缩进和行尾
+doc.detect_indent_and_line_ending();
+```
+
+这是最常见的调用点，所有 `:open` 打开的文件都会经过这里。
+
+**调用点 2：Document::reload() — 重新加载文件**
+
+[Document::reload()](helix-view/src/document.rs) 末尾：
+
+```rust
+// 从磁盘重新读取并 apply diff
+let transaction = helix_core::diff::compare_ropes(self.text(), &rope);
+self.apply(&transaction, view.id);
+self.append_changes_to_history(view);
+self.reset_modified();
+self.pickup_last_saved_time();
+self.detect_indent_and_line_ending();  // ← 重新检测
+```
+
+重新加载磁盘内容后重新检测行尾。如果外部编辑器将 LF 改为 CRLF 后，Helix 执行 `:reload`，`doc.line_ending` 会同步更新。
+
+**调用点 3：Editor::refresh_doc_language() — 刷新语言配置**
+
+[Editor::refresh_doc_language()](helix-view/src/editor.rs)：
+
+```rust
+pub fn refresh_doc_language(&mut self, doc_id: DocumentId) {
+    let loader = self.syn_loader.load();
+    let doc = doc_mut!(self, &doc_id);
+    doc.detect_language(&loader);      // ← 重新检测语言
+    doc.detect_editor_config();         // ← 重新读取 EditorConfig
+    doc.detect_indent_and_line_ending(); // ← 重新检测行尾
+    self.refresh_language_servers(doc_id);
+    // 刷新诊断...
+}
+```
+
+**触发时机：** 由 `Editor::set_path()` 内部调用。当文档路径被设置时（如 `:write new.txt` 将 scratch buffer 保存为新文件），会触发完整的语言、EditorConfig 和行尾重新检测。
+
+`detect_editor_config()` 会根据当前路径重新搜索 `.editorconfig`，如果找到新的 EditorConfig 中设置了 `end_of_line`，`detect_indent_and_line_ending()` 会优先使用它而非扫描 Rope 内容。
+
+**调用点 4：Editor::set_path() — 设置文档路径**
+
+[Editor::set_path()](helix-view/src/editor.rs)：
+
+```rust
+pub fn set_path(&mut self, doc_id: DocumentId, path: &Path) -> Result<(), Error> {
+    // ...
+    let doc = doc_mut!(self, &doc_id);
+    doc.language_servers.clear();
+    doc.set_path(Some(path));
+    doc.detect_editor_config();         // ← 重新读取 EditorConfig
+    self.refresh_doc_language(doc_id)   // ← 内部再次调用 detect_indent_and_line_ending()
+}
+```
+
+设置路径时先 `detect_editor_config()`，然后 `refresh_doc_language()` 再次调用 `detect_indent_and_line_ending()`。典型场景：`:write new.txt` 将 scratch buffer 保存为新文件时，路径从 `None` 变为 `Some(new.txt)`，此时会重新检测 EditorConfig、语言和行尾。
+
+**调用点 5：:language 命令 — 手动切换文档语言**
+
+[`language()` 命令](helix-term/src/commands/typed.rs)：
+
+```rust
+fn language(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    // ...
+    let doc = doc_mut!(cx.editor);
+    let loader = cx.editor.syn_loader.load();
+    if &args[0] == DEFAULT_LANGUAGE_NAME {
+        doc.set_language(None, &loader)
+    } else {
+        doc.set_language_by_language_id(&args[0], &loader)?;
+    }
+    doc.detect_indent_and_line_ending();  // ← 重新检测
+    cx.editor.refresh_language_servers(id);
+    // ...
+}
+```
+
+注意：此调用点**不刷新 EditorConfig**（不调用 `detect_editor_config()`）。因为语言切换不涉及路径变更，EditorConfig 应无变化。手动调用 `refresh_language_servers()` 重启 LSP。
+
+**detect_indent_and_line_ending() 内部优先级：**
+
+```rust
+pub fn detect_indent_and_line_ending(&mut self) {
+    // 缩进：EditorConfig > 自动检测 > 语言配置
+    self.indent_style = if let Some(indent_style) = self.editor_config.indent_style {
+        indent_style
+    } else {
+        auto_detect_indent_style(&self.text).unwrap_or_else(|| {
+            self.language_config().map(|cfg| cfg.indent).unwrap_or_default()
+        })
+    };
+    // 行尾：EditorConfig > 自动检测 > 保持原值
+    if let Some(line_ending) = self
+        .editor_config
+        .line_ending
+        .or_else(|| auto_detect_line_ending(&self.text))
+    {
+        self.line_ending = line_ending;
+    }
+}
+```
+
+行尾的覆盖逻辑：
+1. `editor_config.line_ending`（`.editorconfig` 中的 `end_of_line`）→ 强制使用
+2. `auto_detect_line_ending(&self.text)`（扫描前 100 行）→ 有则覆盖
+3. 都没有 → 保持 `Document::from()` 中的初始值不覆盖
+
+### 13.14 stdin 管道内容的行尾检测边界
+
+**核心结论：stdin 内容插入后不会立即重新检测行尾。**
+
+[Editor::new_file_from_stdin()](helix-view/src/editor.rs) 完整实现：
+
+```rust
+pub fn new_file_from_stdin(&mut self, action: Action) -> Result<DocumentId, Error> {
+    // 步骤 1：读取并解码 stdin 内容（自动识别编码）
+    let (stdin, encoding, has_bom) = crate::document::read_to_string(&mut stdin(), None)?;
+    
+    // 步骤 2：创建 Document，用空 Rope 初始化
+    let doc = Document::from(
+        helix_core::Rope::default(),   // 空 Rope！
+        Some((encoding, has_bom)),
+        self.config.clone(),
+        self.syn_loader.clone(),
+    );
+    
+    // 步骤 3：添加到编辑器
+    let doc_id = self.new_file_from_document(action, doc);
+    
+    // 步骤 4：通过 Transaction::insert 将 stdin 内容插入 Rope
+    let doc = doc_mut!(self, &doc_id);
+    let view = view_mut!(self);
+    doc.ensure_view_init(view.id);
+    let transaction =
+        helix_core::Transaction::insert(doc.text(), doc.selection(view.id), stdin.into())
+            .with_selection(Selection::point(0));
+    doc.apply(&transaction, view.id);
+    doc.append_changes_to_history(view);
+    
+    Ok(doc_id)
+    // ⚠️ 没有调用 detect_indent_and_line_ending()！
+}
+```
+
+**为什么不触发检测？**
+
+1. stdin 内容是通过 `Transaction::insert` 插入的，属于普通编辑操作
+2. Helix 的设计原则是：普通编辑操作不会自动触发行尾/缩进检测
+3. 只有明确的"文档初始化"或"刷新"操作才会触发检测（见 13.13 节的 5 个调用点）
+
+**影响与行为：**
+
+| 场景 | Rope 中的行尾 | doc.line_ending | 一致性 |
+|------|-------------|----------------|--------|
+| stdin 是 LF 文件（`cat unix.txt | hx`） | `\n` | `default_line_ending`（如 `Crlf` 在 Windows） | ❌ 不一致 |
+| stdin 是 CRLF 文件（`type win.txt | hx`） | `\r\n` | `default_line_ending`（如 `LF` 在 Linux） | ❌ 不一致 |
+| stdin 是新内容（`echo "hello" | hx`） | 无行尾（只有内容） | `default_line_ending` | ✅ 一致 |
+
+**如何手动触发检测？**
+
+用户有三种方式让 stdin 文档的行尾元信息与内容一致：
+
+1. **`:write new.txt` 保存为文件**：`set_path()` → `refresh_doc_language()` → `detect_indent_and_line_ending()`（触发完整检测）
+2. **`:reload` 重新加载**（但需要先保存为文件）
+3. **`:line-ending lf/crlf` 显式切换**：不仅设置元信息，还会替换已有行尾（见 13.2 节）
+
+**刷新语言配置时的触发：**
+
+当 stdin 文档被保存为文件后（`:w new.txt`），`Editor::set_path()` 会被调用：
+- 路径从 `None` → `Some(new.txt)`
+- 调用 `detect_editor_config()` 搜索 `.editorconfig`
+- 调用 `refresh_doc_language()` → `detect_indent_and_line_ending()`
+- 此时 `auto_detect_line_ending()` 会扫描 Rope 内容，更新 `doc.line_ending` 与实际内容一致
 
 ---
 
@@ -1418,8 +1659,11 @@ Helix 的文件 IO 与编码系统设计要点：
 7. **寄存器跨平台处理**：yank 到剪贴板时多选区用 `NATIVE_LINE_ENDING` 拼接，粘贴回时通过正则统一为文档行尾
 8. **编码转换仅在 to_writer()**：Rope (UTF-8) → 目标编码，是唯一的编码转换点
 9. **行尾检测函数区分**：`get_line_ending()` 处理 RopeSlice，`get_line_ending_of_str()` 处理普通字符串，`auto_detect_line_ending()` 扫描前 100 行
-10. **异步保存**：保存操作返回 Future，不阻塞编辑；通过通道串行化多个保存请求
-11. **原子保存**：支持备份和恢复，区分硬链接/符号链接/普通文件
-12. **外部修改检测**：基于 mtime 的冲突检测，防止覆盖外部修改
-13. **完整的错误处理**：从底层 IO 到 UI 展示的完整错误链路
-14. **EditorConfig 集成**：编码、行尾、缩进、空白修剪等可通过 `.editorconfig` 统一管理
+10. **自动检测触发时机明确**：`detect_indent_and_line_ending()` 有 5 个调用点：打开文件、重新加载、设置路径（内部调用 `refresh_doc_language()`）、设置路径（直接调用）、`:language` 命令
+11. **stdin 不自动检测**：stdin 管道内容插入后不触发 `detect_indent_and_line_ending()`，需保存为文件后触发或手动切换
+12. **刷新语言配置触发检测**：`refresh_doc_language()` 会先重新检测语言、EditorConfig、行尾（含行尾）
+13. **异步保存**：保存操作返回 Future，不阻塞编辑；通过通道串行化多个保存请求
+14. **原子保存**：支持备份和恢复，区分硬链接/符号链接/普通文件
+15. **外部修改检测**：基于 mtime 的冲突检测，防止覆盖外部修改
+16. **完整的错误处理**：从底层 IO 到 UI 展示的完整错误链路
+17. **EditorConfig 集成**：编码、行尾、缩进、空白修剪等可通过 `.editorconfig` 统一管理
