@@ -2,7 +2,7 @@
 
 ## 概述
 
-本文档梳理 Helix 编辑器中寄存器（Registers）与宏（Macros）的代码处理路径，包括**录制**、**存储**、**回放**三种状态，以及它们与**普通编辑状态**的关系。
+本文档梳理 Helix 编辑器中寄存器（Registers）与宏（Macros）的代码处理路径，聚焦**录制**、**存储**、**回放**三种核心操作，以及它们之间的**组合边界**（录制中触发回放、回放按键不写回录制、嵌套与递归保护）。
 
 ---
 
@@ -21,17 +21,16 @@ pub struct Registers {
 ```
 
 **特殊寄存器**:
-- `_` 黑洞：读写都丢弃
-- `#` 选区索引：返回每个选区的编号
-- `.` 选区内容：返回当前选区内容
-- `%` 文档路径：返回当前文件名
-- `*` 系统剪贴板
-- `+` 主剪贴板
+| 寄存器 | 读行为 | 写行为 |
+|--------|--------|--------|
+| `_` 黑洞 | 返回空迭代器 | 丢弃 |
+| `#` 选区索引 | 动态生成选区编号 | 拒绝写入 |
+| `.` 选区内容 | 动态返回当前选区文本 | 拒绝写入 |
+| `%` 文档路径 | 动态返回当前文件名 | 拒绝写入 |
+| `*` 系统剪贴板 | 优先读剪贴板，回退到缓存 | 同时写剪贴板和缓存 |
+| `+` 主剪贴板 | 同上 | 同上 |
 
-**存储策略**（第26-28行）：
-- 值以反向顺序存储（`write` 时 reverse）
-- 读取时再次 reverse 还原顺序
-- 目的：支持 `push` 操作高效前置新值
+**存储策略**: `write` 时 `values.reverse()` 反向存储，`read` 时 `.rev()` 再反转回来。目的是让 `push` 操作（向末尾追加）在反向后的向量头部插入，保持 O(1)。
 
 ### 1.2 宏状态字段
 
@@ -39,11 +38,12 @@ pub struct Registers {
 
 ```rust
 pub struct Editor {
-    pub macro_recording: Option<(char, Vec<KeyEvent>)>,  // (寄存器名, 按键序列)
-    pub macro_replaying: Vec<char>,                      // 正在回放的寄存器栈
-    // ...
+    pub macro_recording: Option<(char, Vec<KeyEvent>)>,  // (寄存器名, 已捕获的按键序列)
+    pub macro_replaying: Vec<char>,                      // 正在回放的寄存器名栈
 }
 ```
+
+**关键理解**: 这两个字段是**独立**的，不是互斥的。`macro_recording` 和 `macro_replaying` 可以同时处于活跃状态。
 
 ### 1.3 编辑模式 Mode
 
@@ -51,399 +51,429 @@ pub struct Editor {
 
 ```rust
 pub enum Mode {
-    Normal = 0,  // 普通模式
-    Select = 1,  // 选择模式
-    Insert = 2,  // 插入模式
+    Normal = 0,
+    Select = 1,
+    Insert = 2,
 }
 ```
 
 ---
 
-## 二、按键处理总流程
+## 二、按键事件的统一入口与录制捕获
 
-### 2.1 主事件循环
-
-**定义位置**: [application.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/application.rs#L754)
-
-```
-终端事件 → Application::run() → compositor.handle_event()
-```
-
-### 2.2 Compositor 事件分发
+### 2.1 Compositor.handle_event — 所有按键必经之路
 
 **定义位置**: [compositor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/compositor.rs#L144-L182)
 
 ```rust
 pub fn handle_event(&mut self, event: &Event, cx: &mut Context) -> bool {
-    // ⭐ 关键点1: 宏录制捕获（所有按键事件入口）
+    // ① 录制捕获：在事件分发之前
     if let (Event::Key(key), Some((_, keys))) = (event, &mut cx.editor.macro_recording) {
-        if cx.editor.macro_replaying.is_empty() {  // 回放时不录制
+        if cx.editor.macro_replaying.is_empty() {
             keys.push(*key);
         }
     }
 
-    // 事件冒泡到各组件层（EditorView 是最底层）
+    // ② 事件分发到各组件层（冒泡）
     for layer in self.layers.iter_mut().rev() {
         match layer.handle_event(event, cx) {
-            // ... 处理回调
+            EventResult::Consumed(Some(callback)) => {
+                callbacks.push(callback);
+                consumed = true;
+                break;
+            }
+            // ...
         }
     }
-}
-```
 
-### 2.3 EditorView 按键处理
-
-**定义位置**: [editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/ui/editor.rs#L1475-L1538)
-
-```rust
-Event::Key(mut key) => {
-    let mode = cx.editor.mode();
-
-    if !self.on_next_key(...) {
-        match mode {
-            Mode::Insert => self.insert_mode(&mut cx, key),  // 插入模式
-            mode => self.command_mode(mode, &mut cx, key),   // 普通/选择模式
-        }
+    // ③ 执行回调
+    for callback in callbacks {
+        callback(self, cx)
     }
+
+    consumed
 }
 ```
 
----
+**三个阶段**:
+1. **阶段①** — 录制捕获：按键**先于**命令执行被记录
+2. **阶段②** — 事件分发：按键被传递给 EditorView 执行命令
+3. **阶段③** — 回调执行：命令产生的回调在此执行（包括宏回放）
 
-## 三、状态流转详解
+### 2.2 录制捕获的守卫条件
 
-### 3.1 状态机
+阶段①的核心判断逻辑：
 
 ```
-                          ┌─────────────────┐
-                          │   普通编辑状态   │
-                          │  (Normal/Select)│
-                          └────────┬────────┘
-                                   │
-                          按 Q 开始录制
-                                   │
-                                   ▼
-                          ┌─────────────────┐
-                          │   录制状态      │
-                          │ macro_recording │
-                          └────────┬────────┘
-                                   │
-                          按 Q 停止录制
-                                   │
-                                   ▼
-                          ┌─────────────────┐
-                          │   存储状态      │
-                          │  寄存器保存      │
-                          └────────┬────────┘
-                                   │
-                          按 q 开始回放
-                                   │
-                                   ▼
-                          ┌─────────────────┐
-                          │   回放状态      │
-                          │ macro_replaying │
-                          └────────┬────────┘
-                                   │
-                          回放完成
-                                   │
-                                   ▼
-                          ┌─────────────────┐
-                          │   普通编辑状态   │
-                          └─────────────────┘
+if macro_recording.is_some()         // 正在录制？
+    && macro_replaying.is_empty()    // 且没有在回放？
+    → keys.push(key)                 // 才记录按键
 ```
 
-### 3.2 各状态详细说明
-
-#### 状态 A: 普通编辑状态
-
-**特征**:
-- `macro_recording = None`
-- `macro_replaying = []`
-- 编辑器处于 Normal/Select/Insert 模式之一
-
-**按键处理路径**:
-1. [application.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/application.rs#L754) → 接收终端按键事件
-2. [compositor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/compositor.rs#L147-L151) → 检查录制状态（当前为 None，跳过）
-3. [editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/ui/editor.rs#L1475-L1538) → 根据 Mode 分发：
-   - **Insert 模式** → `insert_mode()` → 直接插入字符或处理插入命令
-   - **Normal/Select 模式** → `command_mode()` → 查键映射执行命令
+这意味着：
+- **不在录制** → 不捕获（显然）
+- **在录制 + 不在回放** → 捕获按键到 `macro_recording`
+- **在录制 + 在回放** → **不捕获**，回放产生的按键不会污染录制内容
 
 ---
 
-#### 状态 B: 录制状态 (Recording)
+## 三、三种核心操作
 
-**触发**: 按 `Q` 键（默认绑定）
+### 3.1 录制 (record_macro)
 
-**命令处理**: [commands.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/commands.rs#L6893-L6919)
-
-```rust
-fn record_macro(cx: &mut Context) {
-    if cx.editor.macro_recording.take().is_none() {
-        // 开始录制
-        let reg = cx.register.take().unwrap_or('@');
-        cx.editor.macro_recording = Some((reg, Vec::new()));  // ⭐ 设置状态
-        cx.editor.set_status(format!("Recording to register [{}]", reg));
-    }
-}
-```
-
-**特征**:
-- `macro_recording = Some((reg, keys))`
-- `macro_replaying = []`（录制时不能回放）
-
-**按键处理路径**（与普通状态的差异）:
-1. [application.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/application.rs#L754) → 接收按键
-2. [compositor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/compositor.rs#L147-L151) → **捕获按键**：
-   ```rust
-   if let (Event::Key(key), Some((_, keys))) = (event, &mut cx.editor.macro_recording) {
-       if cx.editor.macro_replaying.is_empty() {
-           keys.push(*key);  // ⭐ 记录到 keys 向量
-       }
-   }
-   ```
-3. 继续正常处理按键 → 命令依然会执行（录制是"透明"的）
-
-**UI 反馈**: [editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/ui/editor.rs#L1674-L1697)
-- 状态栏右下角显示黄色 `[寄存器名]` 指示器
-
----
-
-#### 状态 C: 存储状态 (Stored)
-
-**触发**: 录制时再次按 `Q` 键
-
-**命令处理**: [commands.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/commands.rs#L6894-L6913)
+**定义位置**: [commands.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/commands.rs#L6893-L6920)
 
 ```rust
 fn record_macro(cx: &mut Context) {
     if let Some((reg, mut keys)) = cx.editor.macro_recording.take() {
-        keys.pop();  // ⭐ 移除停止录制的 Q 键本身
-        
-        // 按键序列序列化为字符串
-        let s = keys.into_iter().map(|key| {
-            let s = key.to_string();
-            if s.chars().count() == 1 { s } else { format!("<{}>", s) }
-        }).collect::<String>();
-        
-        // 写入寄存器
-        cx.editor.registers.write(reg, vec![s]);  // ⭐ 存储
+        // ── 停止录制 ──
+        keys.pop();                    // 移除本次 Q 键本身
+        let s = keys.into_iter()
+            .map(|key| { /* 序列化为字符串 */ })
+            .collect::<String>();
+        cx.editor.registers.write(reg, vec![s]);
+    } else {
+        // ── 开始录制 ──
+        let reg = cx.register.take().unwrap_or('@');
+        cx.editor.macro_recording = Some((reg, Vec::new()));
     }
 }
 ```
 
-**存储格式**:
-- 单字符按键：直接存储（如 `ihello<esc>` 中的 `i`, `h`, `e`, `l`, `l`, `o`）
-- 特殊按键：用 `<>` 包裹（如 `<esc>`, `<enter>`, `<space>`）
-- 完整示例：`"ihello<esc>"` 表示 `i` 进入插入模式，输入 `hello`，按 `esc` 返回普通模式
+**toggle 语义**: 同一个命令，第一次调用开始录制，第二次调用停止录制。
 
-**寄存器写入逻辑**: [register.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-view/src/register.rs#L80-L103)
+**停止时的 `keys.pop()`**: compositor 阶段①已经把停止键 `Q` push 进了 keys，这里 pop 掉它，确保宏内容不包含终止键。
 
-```rust
-pub fn write(&mut self, name: char, mut values: Vec<String>) -> Result<()> {
-    match name {
-        '_' => Ok(()),  // 黑洞丢弃
-        '#' | '.' | '%' => Err(...),  // 只读寄存器
-        '*' | '+' => { /* 同时写入剪贴板 */ }
-        _ => {
-            values.reverse();  // ⭐ 反向存储
-            self.inner.insert(name, values);
-            Ok(())
-        }
-    }
-}
-```
+### 3.2 存储 (registers.write)
 
----
+**定义位置**: [register.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-view/src/register.rs#L80-L103)
 
-#### 状态 D: 回放状态 (Replaying)
+宏内容以**单个字符串**存入寄存器：
+- 普通字符直接拼接（如 `ihello`）
+- 特殊按键用 `<>` 包裹（如 `<esc>`, `<C-a>`）
+- 完整示例：`"ihello<esc>"` = 进入插入模式 → 输入 hello → 回到普通模式
 
-**触发**: 按 `q` 键（默认绑定）
+寄存器值的反向存储是内部实现细节，宏写入时 `values.reverse()` 把只有一个元素的 vec 反转（无实际影响），读取时 `.rev()` 再反转回来。
 
-**命令处理**: [commands.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/commands.rs#L6922-L6968)
+### 3.3 回放 (replay_macro)
+
+**定义位置**: [commands.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/commands.rs#L6922-L6968)
 
 ```rust
 fn replay_macro(cx: &mut Context) {
     let reg = cx.register.unwrap_or('@');
-    
-    // 防递归：不能回放正在回放的寄存器
+
+    // 防递归检查
     if cx.editor.macro_replaying.contains(&reg) {
         cx.editor.set_error(...);
         return;
     }
-    
-    // 从寄存器读取并解析
-    let keys: Vec<KeyEvent> = if let Some(keys_str) = 
-        cx.editor.registers.read(reg, cx.editor)
-            .filter(|values| values.len() == 1)
-            .map(|mut values| values.next().unwrap())
-    {
-        helix_view::input::parse_macro(&keys_str)?  // ⭐ 反序列化为 KeyEvent
-    } else {
-        cx.editor.set_error(format!("Register [{}] empty", reg));
-        return;
-    };
-    
-    // 标记为正在回放（防递归）
-    cx.editor.macro_replaying.push(reg);  // ⭐ 入栈
-    
+
+    // 从寄存器读取并解析按键序列
+    let keys: Vec<KeyEvent> = /* registers.read → parse_macro */;
+
+    // ① 立即标记为正在回放
+    cx.editor.macro_replaying.push(reg);
+
+    // ② 注册延迟回调
     let count = cx.count();
     cx.callback.push(Box::new(move |compositor, cx| {
-        // 重复 count 次
         for _ in 0..count {
             for &key in keys.iter() {
-                // ⭐ 手动调用事件处理，模拟按键
-                compositor.handle_event(&compositor::Event::Key(key), cx);
+                compositor.handle_event(&Event::Key(key), cx);  // 递归调用！
             }
         }
-        cx.editor.macro_replaying.pop();  // ⭐ 出栈
+        cx.editor.macro_replaying.pop();  // ③ 回放结束后移除标记
     }));
 }
 ```
 
-**宏解析逻辑**: [input.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-view/src/input.rs#L679-L714)
+**时序关键点**:
+- `macro_replaying.push(reg)` 在步骤①**立即执行**
+- 回调在步骤②被注册到 `cx.callback`，**不是立即执行**
+- 回调实际执行时机：compositor 阶段③（见 2.1 节）
+- `macro_replaying.pop()` 在步骤③，位于回调内部，回放完成后执行
+
+**回调中递归调用 `compositor.handle_event`**: 每个模拟按键都会完整走一遍 compositor 的 ①②③ 三个阶段。
+
+---
+
+## 四、边界场景分析
+
+### 4.1 录制中触发回放（Q 录制 → q 回放）
+
+**场景**: 用户按 `Q` 开始录制，录制过程中按 `q` 触发回放。
+
+**完整执行流程**:
+
+```
+用户按 q（此时 macro_recording=Some(('@',keys)), macro_replaying=[]）
+│
+├─ compositor 阶段①: 录制捕获
+│   macro_recording=Some, macro_replaying=[]  →  keys.push('q')  ✅ 捕获
+│
+├─ compositor 阶段②: 事件分发
+│   EditorView.handle_event → command_mode → replay_macro()
+│   ├─ macro_replaying.contains('@')? → 否，通过
+│   ├─ 从寄存器读取并解析按键
+│   ├─ macro_replaying.push('@')          ← 立即标记
+│   └─ cx.callback.push(回放回调)         ← 延迟注册
+│
+├─ compositor 阶段③: 回调执行
+│   回放回调:
+│   │
+│   for key in keys:
+│   │
+│   ├─ compositor.handle_event(Event::Key(key))   ← 递归调用
+│   │   │
+│   │   ├─ 阶段①: 录制捕获
+│   │   │   macro_recording=Some, macro_replaying=['@']  → 非空！
+│   │   │   → 不捕获  ⭐ 回放按键不写回录制内容
+│   │   │
+│   │   ├─ 阶段②: 事件分发 → 正常执行命令
+│   │   └─ 阶段③: 回调（如有）
+│   │
+│   macro_replaying.pop()                 ← 回放结束，移除标记
+│
+│ 此时状态: macro_recording=Some(('@',keys)), macro_replaying=[]
+│ 继续录制...
+```
+
+**结论**: 录制中触发回放是允许的。回放期间 `macro_replaying` 非空，compositor 阶段①的守卫条件使得回放按键不会被写入录制内容。回放结束后 `macro_replaying.pop()` 清空，后续用户按键恢复被录制。
+
+### 4.2 回放按键不写回录制内容的机制
+
+**守卫代码**: [compositor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/compositor.rs#L147-L151)
 
 ```rust
-pub fn parse_macro(keys_str: &str) -> anyhow::Result<Vec<KeyEvent>> {
-    // 解析规则:
-    // - 普通字符直接作为按键
-    // - <xxx> 格式解析为特殊按键（如 <esc>, <C-a>）
-    // - 支持修饰键: C- (Ctrl), A- (Alt), S- (Shift)
+if let (Event::Key(key), Some((_, keys))) = (event, &mut cx.editor.macro_recording) {
+    if cx.editor.macro_replaying.is_empty() {   // ⭐ 守卫条件
+        keys.push(*key);
+    }
 }
 ```
 
-**特征**:
-- `macro_recording = None`（回放时不能录制）
-- `macro_replaying = [reg, ...]`（栈结构，支持嵌套但防递归）
+**双重条件**:
+1. `macro_recording.is_some()` — 必须正在录制
+2. `macro_replaying.is_empty()` — 必须不在回放
 
-**按键处理路径**（与普通状态的差异）:
-1. 按键不是来自终端，而是来自宏的 `keys` 向量
-2. [compositor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/compositor.rs#L147-L151) → 检查录制状态：
-   - 因为 `macro_replaying` 非空，**跳过录制捕获**（第148行判断）
-3. 后续处理与普通编辑完全相同
+只有同时满足两个条件，按键才被捕获。回放中条件2不满足，因此所有回放产生的按键都被跳过。
+
+**注意**: 这不是"录制和回放互斥"的设计，而是"回放期间暂停录制捕获"。`macro_recording` 本身仍然是 `Some`，回放结束后自动恢复捕获。
+
+### 4.3 嵌套回放：宏 A 回放中触发宏 B
+
+**场景**: 寄存器 `@` 存有宏 A，寄存器 `a` 存有宏 B。宏 A 的内容包含 `q`（触发回放宏 B）。
+
+**执行流程**:
+
+```
+用户按 q（回放宏 @）
+│
+├─ replay_macro('@')
+│   ├─ macro_replaying.push('@')          → macro_replaying = ['@']
+│   └─ cx.callback.push(回放回调)
+│
+├─ 回调执行:
+│   for key in macro_A_keys:
+│   │
+│   ├─ ... 正常按键 ...
+│   │
+│   ├─ 遇到 'q' 键（触发 replay_macro('a')）
+│   │   ├─ macro_replaying.contains('a')? → 否，通过
+│   │   ├─ macro_replaying.push('a')      → macro_replaying = ['@', 'a']  ⭐ 嵌套入栈
+│   │   └─ cx.callback.push(宏B回放回调)
+│   │
+│   ├─ 宏B回调执行（在当前 compositor.handle_event 的阶段③内）
+│   │   for key in macro_B_keys:
+│   │       compositor.handle_event(...)
+│   │           → macro_replaying = ['@', 'a'] → 不捕获
+│   │   macro_replaying.pop()              → macro_replaying = ['@']  ⭐ 嵌套出栈
+│   │
+│   ├─ ... 继续宏A的剩余按键 ...
+│   │   → macro_replaying = ['@'] → 仍然不捕获
+│   │
+│   macro_replaying.pop()                  → macro_replaying = []  ⭐ 完全结束
+```
+
+**结论**: 嵌套回放通过栈结构自然支持。内层回放 push，结束后 pop，不影响外层。整个过程中 `macro_replaying` 始终非空，录制捕获始终被守卫条件阻止。
+
+### 4.4 递归回放保护：宏 A 回放中再次触发宏 A
+
+**场景**: 寄存器 `@` 存有宏 A，宏 A 的内容包含 `q`（触发回放同一寄存器 `@`）。
+
+**执行流程**:
+
+```
+用户按 q（回放宏 @）
+│
+├─ replay_macro('@')
+│   ├─ macro_replaying.contains('@')? → 否，通过
+│   ├─ macro_replaying.push('@')      → macro_replaying = ['@']
+│   └─ cx.callback.push(回放回调)
+│
+├─ 回调执行:
+│   for key in macro_A_keys:
+│   │
+│   ├─ 遇到 'q' 键（触发 replay_macro('@')）
+│   │   ├─ macro_replaying.contains('@')? → 是！  ⭐ 递归保护触发
+│   │   ├─ set_error("Cannot replay from register [@]...")
+│   │   └─ return  ← 直接返回，不执行回放
+│   │
+│   macro_replaying.pop()
+```
+
+**结论**: `macro_replaying.contains(&reg)` 检查阻止了同寄存器的递归回放。注意这是 **按寄存器名** 检查的——如果宏 A 调用宏 B，宏 B 调用宏 A，则宏 B 回放中触发 `replay_macro('@')` 时 `macro_replaying = ['@', 'b']`，`.contains('@')` 为真，也会被阻止。**间接递归同样被保护**。
+
+### 4.5 callback 注册与执行的时序
+
+**关键理解**: `cx.callback` 不是立即执行的。
+
+```
+replay_macro() 函数体内:
+  ├── macro_replaying.push(reg)     ← 立即
+  └── cx.callback.push(closure)     ← 注册延迟回调
+
+← 返回到 EditorView.handle_event
+
+EditorView.handle_event:
+  └── let callbacks = take(&mut cx.callback)    ← 取出回调
+      └── EventResult::Consumed(Some(callback))  ← 返回给 compositor
+
+compositor 阶段③:
+  └── callback(self, cx)                        ← 在此执行
+      └── 回放回调:
+          for key in keys:
+              compositor.handle_event(...)       ← 递归！
+          macro_replaying.pop()                  ← 回放结束后
+```
+
+**为什么 push 必须在 callback 之前**: 如果 push 也在 callback 内部，那么在回调执行之前，`macro_replaying` 仍为空。此时如果有其他机制（如事件循环的下一轮）触发 `replay_macro`，就无法检测到递归。代码注释（[commands.rs:6963-L6965](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/commands.rs#L6963-L6965)）也确认了这一点：
+
+> The macro under replay is cleared at the end of the callback, not in the macro replay context, or it will not correctly protect the user from replaying recursively.
+
+**为什么 pop 必须在 callback 内部**: pop 标志着回放的真正结束。如果 pop 在 callback 外部（即 `replay_macro` 函数末尾），则在回调执行期间 `macro_replaying` 已经被清除，递归保护就失效了。
 
 ---
 
-## 四、四种状态对比表
+## 五、完整状态矩阵
 
-| 状态 | `macro_recording` | `macro_replaying` | 按键来源 | 录制捕获 | 命令执行 |
-|------|------------------|-------------------|----------|----------|----------|
-| **普通编辑** | `None` | `[]` | 终端 | 否 | 是 |
-| **录制中** | `Some((reg, keys))` | `[]` | 终端 | **是（写入keys）** | 是 |
-| **已存储** | `None` | `[]` | - | - | - |
-| **回放中** | `None` | `[reg, ...]` | 宏keys | 否（跳过） | 是 |
+| 场景 | `macro_recording` | `macro_replaying` | 录制捕获 | 命令执行 |
+|------|-------------------|-------------------|----------|----------|
+| 普通编辑 | `None` | `[]` | 否 | 是 |
+| 仅录制 | `Some(('@',keys))` | `[]` | **是** | 是 |
+| 仅回放 | `None` | `['@']` | 否 | 是 |
+| 录制+回放 | `Some(('@',keys))` | `['@']` | **否**（守卫跳过） | 是 |
+| 录制+嵌套回放 | `Some(('@',keys))` | `['@','a']` | **否** | 是 |
 
 ---
 
-## 五、关键调用链
+## 六、关键调用链图
 
-### 5.1 录制流程调用链
-
-```
-用户按 Q
-  ↓
-[application.rs] 终端事件 → Event::Key(Key('Q'))
-  ↓
-[compositor.rs:147] 检查 macro_recording = None → 不捕获
-  ↓
-[editor.rs:1536] command_mode()
-  ↓
-[editor.rs:1087] handle_keymap_event() → 匹配 record_macro
-  ↓
-[commands.rs:6893] record_macro()
-  ↓
-  ├─ 开始: macro_recording = Some(('@', Vec::new()))
-  └─ 停止: keys.pop() → 序列化 → registers.write()
-
-用户后续按键（录制中）:
-  ↓
-[compositor.rs:147] macro_recording = Some → keys.push(*key)  ⭐ 捕获
-  ↓
-[editor.rs] 正常命令处理（命令依然执行）
-```
-
-### 5.2 回放流程调用链
+### 6.1 录制中触发回放的完整调用链
 
 ```
-用户按 q
-  ↓
-[application.rs] 终端事件
-  ↓
-[compositor.rs] 不捕获
-  ↓
-[editor.rs] command_mode()
-  ↓
-[editor.rs] handle_keymap_event() → 匹配 replay_macro
-  ↓
-[commands.rs:6922] replay_macro()
-  ↓
-  ├─ registers.read(reg) → 获取序列化字符串
-  ├─ parse_macro() → 解析为 Vec<KeyEvent>
-  ├─ macro_replaying.push(reg)  ⭐ 标记回放
-  └─ push callback:
-        for key in keys:
-            compositor.handle_event(Event::Key(key))  ⭐ 模拟按键
-                ↓
-                [compositor.rs] macro_replaying 非空 → 跳过录制捕获
-                ↓
-                [editor.rs] 正常命令处理
-        macro_replaying.pop()
+用户按 q（录制进行中）
+│
+│ [compositor.handle_event — 外层调用]
+│
+├─ 阶段① 录制捕获:
+│   macro_recording=Some, macro_replaying=[]  →  keys.push('q') ✅
+│
+├─ 阶段② 事件分发:
+│   EditorView.handle_event → command_mode → replay_macro()
+│   ├─ macro_replaying.push(reg)          → 状态变更
+│   └─ cx.callback.push(回放闭包)
+│
+├─ 阶段③ 回调执行:
+│   回放闭包(compositor, cx):
+│   │
+│   │ [compositor.handle_event — 递归调用，回放每个按键]
+│   │
+│   ├─ 阶段① 录制捕获:
+│   │   macro_recording=Some, macro_replaying=[reg]  → 非空 → 不捕获 ⭐
+│   │
+│   ├─ 阶段② 事件分发: 命令正常执行
+│   └─ 阶段③ 回调: （如有）
+│   │
+│   macro_replaying.pop()
+│
+│ [回到外层 compositor.handle_event]
+│ 后续用户按键恢复录制捕获: macro_recording=Some, macro_replaying=[]
 ```
 
-### 5.3 寄存器读写调用链
+### 6.2 递归保护的调用链
 
-**写入**:
 ```
-record_macro() 停止时
-  ↓
-registers.write(reg, vec![s])
-  ↓
-values.reverse()  ⭐ 反向存储
-  ↓
-self.inner.insert(reg, values)
-```
+replay_macro('@')
+│
+├─ macro_replaying.push('@')     → ['@']
+└─ cx.callback.push(回放闭包)
 
-**读取**:
-```
-replay_macro() 开始时
-  ↓
-registers.read(reg, editor)
-  ↓
-self.inner.get(&reg)
-  ↓
-RegisterValues::new(values.iter().map(Cow::from).rev())  ⭐ 反向还原
-  ↓
-values.next() → 获取序列化字符串
-  ↓
-parse_macro(&s) → Vec<KeyEvent>
+回放闭包:
+  for key in keys:
+    compositor.handle_event(key)
+    │
+    ├─ 阶段①: macro_replaying=['@'] → 不捕获
+    │
+    ├─ 阶段②: 如果 key 映射到 replay_macro
+    │   │
+    │   ├─ replay_macro('@'):
+    │   │   macro_replaying.contains('@')? → 真 ⛔
+    │   │   set_error + return
+    │   │
+    │   └─ replay_macro('a'):  （间接递归）
+    │       macro_replaying.contains('a')? → 否
+    │       macro_replaying.push('a')     → ['@', 'a']
+    │       cx.callback.push(宏B闭包)
+    │       │
+    │       宏B闭包:
+    │         for key in b_keys:
+    │           compositor.handle_event(key)
+    │           │
+    │           ├─ replay_macro('@'):  ← 间接递归
+    │           │   macro_replaying.contains('@')? → 真 ⛔
+    │           │   set_error + return
+    │           │
+    │         macro_replaying.pop()    → ['@']
+    │
+    macro_replaying.pop()          → []
 ```
 
 ---
 
-## 六、关键设计要点
+## 七、设计要点总结
 
-### 6.1 录制的透明性
-- 录制时命令**正常执行**，不是" dry run"
-- 按键先被捕获记录，再正常分发执行
-- 停止键（Q）会被 `keys.pop()` 移除，不会被记录
+### 7.1 录制与回放不互斥
 
-### 6.2 防递归机制
-- 使用 `macro_replaying: Vec<char>` 栈结构
-- 回放前检查：`if macro_replaying.contains(&reg)` → 拒绝
-- 回放期间 `macro_replaying` 非空 → 录制捕获被跳过（第148行）
+`macro_recording` 和 `macro_replaying` 是**独立字段**，可以同时活跃。录制中按 `q` 触发回放完全合法，回放结束后自动恢复录制。代码中没有任何地方在开始回放时清除录制状态，或在开始录制时检查回放状态。
 
-### 6.3 存储效率
-- 寄存器值反向存储 → `push` 操作是 O(1)
-- 宏只占一个寄存器位置（`len() == 1`）
-- 按键序列化为紧凑字符串格式
+### 7.2 回放按键不写回录制是守卫条件的效果
 
-### 6.4 状态独立性
-- `macro_recording` 和 `macro_replaying` 是独立字段
-- 二者互斥：录制时 `macro_replaying` 必为空，回放时 `macro_recording` 必为 None
-- 由 compositor 和 commands 共同维护状态不变量
+不是通过状态互斥实现的，而是通过 compositor 的双重守卫条件：
+
+```rust
+if macro_recording.is_some() && macro_replaying.is_empty()
+```
+
+回放期间第二个条件为假，所有按键（包括回放产生的）都不会进入 `macro_recording` 的 keys。
+
+### 7.3 嵌套通过栈结构自然支持
+
+`macro_replaying` 是 `Vec<char>`，每层回放 push 自己的寄存器名，结束后 pop。外层回放不受内层影响。
+
+### 7.4 递归保护是按寄存器名检查
+
+使用 `.contains(&reg)` 而非只检查栈顶，因此**间接递归**（A→B→A）也能被检测到。代价是无法在宏 B 中回放正在外层执行的宏 A，即使这不是真正的无限递归——这是保守但安全的选择。
+
+### 7.5 push/pop 的时序是递归保护生效的关键
+
+- `push` 在 callback 注册**之前**（立即执行），确保回调执行时标记已就位
+- `pop` 在 callback **内部末尾**（延迟执行），确保整个回放期间标记持续有效
 
 ---
 
-## 七、默认键绑定
+## 八、默认键绑定
 
 **定义位置**: [default.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/keymap/default.rs#L160-L161)
 
@@ -451,19 +481,19 @@ parse_macro(&s) → Vec<KeyEvent>
 |------|------|------|
 | `Q` | `record_macro` | 开始/停止录制宏 |
 | `q` | `replay_macro` | 回放宏 |
-| `"` + `{reg}` | - | 选择寄存器（如 `"aQ` 录制到寄存器 a） |
+| `"` + `{reg}` | 选择寄存器 | 如 `"aQ` 录制到寄存器 a，`"aq` 回放寄存器 a |
 
 ---
 
-## 八、相关文件索引
+## 九、相关文件索引
 
 | 文件 | 作用 |
 |------|------|
 | [helix-view/src/register.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-view/src/register.rs) | 寄存器核心实现（读写、特殊寄存器） |
-| [helix-view/src/editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-view/src/editor.rs) | Editor 结构体，含宏状态字段 |
-| [helix-view/src/input.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-view/src/input.rs) | KeyEvent、parse_macro 宏解析 |
-| [helix-term/src/compositor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/compositor.rs) | 事件分发、宏录制捕获点 |
-| [helix-term/src/commands.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/commands.rs) | record_macro、replay_macro 命令实现 |
-| [helix-term/src/ui/editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/ui/editor.rs) | EditorView 按键处理、录制指示器UI |
-| [helix-term/src/keymap/default.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/keymap/default.rs) | 默认键绑定 |
+| [helix-view/src/editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-view/src/editor.rs) | Editor 结构体，含 `macro_recording` 和 `macro_replaying` 字段 |
+| [helix-view/src/input.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-view/src/input.rs) | KeyEvent、`parse_macro` 宏解析 |
+| [helix-term/src/compositor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/compositor.rs) | 事件分发、**录制捕获的唯一点** |
+| [helix-term/src/commands.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/commands.rs) | `record_macro`、`replay_macro` 命令实现 |
+| [helix-term/src/ui/editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/ui/editor.rs) | EditorView 按键处理、回调注册、录制指示器UI |
+| [helix-term/src/keymap/default.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-term/src/keymap/default.rs) | 默认键绑定（Q=录制, q=回放） |
 | [helix-view/src/document.rs](file:///d:/fz/0601/solo-dogfeeding/code/270-helix/helix-view/src/document.rs) | Mode 枚举定义 |
