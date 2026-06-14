@@ -157,37 +157,41 @@ Registry::start_client(socket, config)
 
 **特点**：最常见的本地调试方式，通信延迟最低，进程生命周期与 Client 绑定。
 
-#### 1.4.2 路径二：tcp 本地进程（自启动 + port_arg）
+#### 1.4.2 路径二：tcp 本地进程（自启动 + port_arg + 监听端口）
 
 **触发条件**：`socket == None` 且 `config.transport == "tcp"` 且 `config.port_arg` 不为空
 
 **方法**：[Client::tcp_process](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L165-L203)
 
 **行为**：
-- 先调用 `Self::get_port()` 绑定一个随机可用的本地端口（127.0.0.1:0）
-- 启动 Adapter 子进程，将 port_arg 中的 `{}` 替换为实际端口号作为额外参数传入（如 `--port 12345`）
-- 子进程的 stdin/stdout/stderr 全部设为 null（不由 Helix 接管）
-- **不设置** `kill_on_drop`（注释说明"adapter should exit automatically"）
-- 等待 500ms 让 Adapter 准备就绪
-- 通过 `TcpStream::connect(socket)` 建立 TCP 连接
-- `client.socket = Some(socket)`（保存 TCP 端口地址，供子调试会话复用）
+- 先调用 `Self::get_port()` 分配一个随机可用的本地端口号（127.0.0.1 上，实际通过绑定 `:0` 后立即释放的方式获取空闲端口）
+- 启动 Adapter 子进程，将 port_arg 中的 `{}` 替换为实际端口号作为额外参数传入（如 `--port 12345`）。Adapter 收到该参数后**在该端口上建立 TCP 服务器监听**（accept 循环）
+- 子进程的 stdin/stdout/stderr 全部设为 null（不由 Helix 接管，DAP 消息全部走 TCP）
+- **不设置** `kill_on_drop`（注释说明"adapter should exit automatically"，即期望被调试进程退出后 Adapter 自行退出）
+- 等待 500ms 让 Adapter 启动并开始监听端口
+- 通过 `TcpStream::connect(socket)` 建立 Helix 到 Adapter 监听端口的**第一条 TCP 连接**
+- `client.socket = Some(socket)`（保存 TCP 监听端口地址，供后续子调试会话建立**新的**独立连接使用）
 
-**特点**：适用于某些只能通过 TCP 通信的 Adapter，或需要启动子调试会话的场景。进程生命周期不完全由 Client 控制。
+**特点**：适用于只能通过 TCP 通信的 Adapter，是唯一支持子调试会话的路径（因为需要监听端口 accept 多条连接）。
 
-#### 1.4.3 路径三：tcp 远程连接（不启动进程）
+#### 1.4.3 路径三：tcp 客户端连接（连接到已存在的监听端）
 
-**触发条件**：`socket == Some(address)`（即调用方显式传入了 TCP 地址）
+**触发条件**：`socket == Some(address)`（即调用方显式传入了 TCP 地址和端口）
 
 **方法**：[Client::tcp](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L105-L112)
 
 **行为**：
-- 直接通过 `TcpStream::connect(addr)` 连接已运行的 Adapter
-- 不启动任何子进程
-- 没有 stderr 捕获
+- 直接通过 `TcpStream::connect(addr)` 连接到**已在运行的** Adapter 的 TCP 监听端
+- 不启动任何子进程（Adapter 已由外部方式启动）
+- 没有 stderr 捕获（stderr 不在 Helix 的控制范围内）
 - `client.process = None`
 - ⚠️ **注意**：此方法不会设置 `client.socket` 字段，`client.socket` 保持为 `None`
 
-**特点**：用于 `:debug-remote` 连接远程或已在运行的 Adapter。由于 `client.socket` 为 None，**无法启动子调试会话**（见 2.6.2 节）。
+**适用场景**：
+- `:debug-remote`：连接到另一台机器或后台已启动的 Adapter
+- StartDebugging 子调试会话：父调试器通过 tcp_process 路径启动后，复用同一个端口地址建立**第二条独立 TCP 连接**
+
+**特点**：该路径建立的 Client 由于 `client.socket == None`，**无法进一步启动子调试会话**（见 2.6.2 节）。
 
 #### 1.4.4 命令入口与传输路径的对应关系
 
@@ -195,10 +199,12 @@ Registry::start_client(socket, config)
 |---------|------------|-------------|------|
 | `Space G l` | `None` | 取决于 `config.transport` | 本地启动，传输方式由配置决定 |
 | `:debug-start` | `None` | 取决于 `config.transport` | 同左 |
-| `:debug-remote host:port` | `Some(host:port)` | tcp 远程连接 | 连接已运行的 Adapter |
-| StartDebugging 反向请求 | `Some(父调试器.socket)` | tcp 远程连接（到同一 Adapter） | 子调试会话复用父调试器的 TCP 端口 |
+| `:debug-remote host:port` | `Some(host:port)` | tcp 客户端连接 | 连接已运行的 Adapter |
+| StartDebugging 反向请求 | `Some(父调试器.socket)` | tcp 客户端连接（同一监听端口，独立 TCP 连接） | 子调试会话建立到 Adapter 的第二条独立连接 |
 
 > **关键区分**：命令入口描述的是"用户如何触发"，传输路径描述的是"底层如何通信"。二者不是一一对应的。`:debug-start` 可能走 stdio 也可能走 tcp 本地进程，取决于 `languages.toml` 配置。
+>
+> **另一层关键区分**："复用同一 TCP 端口地址" ≠ "复用同一条 TCP 连接"。同一端口地址上可以建立多条独立的 TCP 连接（这是 TCP 协议的标准 accept 机制），父子调试会话之间互不干扰。
 
 #### 1.4.5 统一出口：Client::streams
 
@@ -493,30 +499,69 @@ StartDebugging 请求处理
   │     └─ 若为 None → set_error("Child debugger can only be started if the parent debugger is using TCP transport.")
   ├─ 3. 获取父调试器的 config（克隆）
   ├─ 4. 调用 debug_adapters.start_client(Some(socket), &config) 创建子调试器
-  │     └─ 复用父调试器的同一个 TCP socket 地址
-  │        走 Client::tcp 路径（纯 TCP 连接，不启动新进程）
-  ├─ 5. 根据 arguments.request 判断启动方式：
-  │     ├─ ConnectionType::Launch → client.launch(arguments.configuration)
-  │     └─ ConnectionType::Attach → client.attach(arguments.configuration)
-  ├─ 6. 返回 { success: true } 响应
-  └─ 7. 通过 debugger.reply() 将响应发回给 Adapter
+  │     └─ 传入父调试器的 TCP socket 地址（同一个端口号）
+  │        走 Client::tcp 路径：TcpStream::connect(socket)
+  │        → 与 Adapter 监听端口建立**第二条独立的 TCP 连接**
+  ├─ 5. start_client 内部：
+  │     ├─ 为子调试器分配新的独立 DebugAdapterId
+  │     ├─ 子调试器独立执行 block_on(client.initialize())  ← 独立的握手
+  │     └─ 子调试器的独立 receiver 推入 Registry.incoming (SelectAll)
+  ├─ 6. 根据 arguments.request 判断启动方式（在子调试器上）：
+  │     ├─ ConnectionType::Launch → child_client.launch(arguments.configuration)
+  │     └─ ConnectionType::Attach → child_client.attach(arguments.configuration)
+  ├─ 7. 返回 { success: true } 响应
+  └─ 8. 通过父调试器的 debugger.reply() 将响应发回给 Adapter
 ```
 
-**Socket 复用机制**：
-- 子调试器与父调试器连接到**同一个 TCP socket 地址**（同一个 Adapter 进程）
-- Adapter 通过同一个 TCP 连接的不同逻辑通道（由 DAP 协议层区分）与多个 Client 通信
-- 子调试器也会经历完整的 initialize 握手（由 `Registry::start_client` 中的 `block_on(client.initialize())` 保证）
+**连接模型：复用同一监听端口，建立独立 TCP 连接**
+
+子调试器的连接模型可以类比为 HTTP 服务器与多个浏览器：
+- **Adapter 端**：启动时监听一个 TCP 端口（如 `127.0.0.1:12345`），该端口可接受多条独立的 TCP 连接（使用标准的服务器 Socket accept 机制）
+- **父调试器**：通过 `TcpStream::connect` 建立**第一条** TCP 连接，用于父进程调试会话
+- **子调试器**：通过 `TcpStream::connect` 连接到**同一个端口**，建立**第二条独立的** TCP 连接，用于子进程调试会话
+- **每条连接完全独立**：各自拥有独立的 BufReader/BufWriter、独立的 Transport、独立的消息队列、独立的请求-响应匹配（pending_requests）
+
+**⚠️ 纠正**：不是"同一条连接里的多逻辑通道"，而是"同一监听端口上的多条独立 TCP 连接"。DAP 协议本身没有多路复用机制，每条连接对应一个独立的 DAP 会话。
+
+**父子调试会话的关系**：
+
+| 维度 | 父调试会话 | 子调试会话 |
+|------|-----------|-----------|
+| 触发方式 | 用户命令（Space G l / :debug-start） | Adapter 发送 StartDebugging 反向请求 |
+| DebugAdapterId | 独立分配 | 再次独立分配（SlotMap 新键） |
+| TCP 连接 | 第一条，通过 tcp_process 建立 | 第二条，通过 Client::tcp 建立到同一端口 |
+| initialize 握手 | 独立执行，存入父 client.caps | 再次独立执行，存入子 client.caps |
+| 消息通道 | 独立的 Transport、独立的 receiver | 独立的 Transport、独立的 receiver |
+| 消息汇聚 | receiver 推入 SelectAll | 同一 SelectAll，每条消息自带 id 区分来源 |
+| launch/attach | 由 dap_start_impl 异步触发 | 由 StartDebugging 处理逻辑直接 await |
+| 调试目标 | 原始被调试进程（父进程） | fork 出的子进程或附加的目标 |
+| 断点管理 | 独立的断点集合？* | 独立的断点集合？* |
+| 活跃状态 | 初始被设为 active_client | 不会自动设为 active，需用户切换 |
+
+*注：断点存储在 Editor.breakpoints 中是全局的（按文件路径索引），所有调试 Client 共享同一断点列表，但每个 Client 会各自发送 setBreakpoints 请求，Adapter 端区分哪些断点属于哪个会话。
+
+**initialize 的独立性**：
+- 父调试器：在 `Registry::start_client` 中 `block_on(client.initialize(config.name.clone()))` 同步执行
+- 子调试器：同样在 `Registry::start_client` 中独立执行 `block_on(client.initialize(config.name.clone()))`，不依赖父调试器的状态
+- 两次 initialize 之间没有任何共享数据，完全独立
+
+**消息接收与区分**：
+- 每个 Client 创建时都会将独立的 receiver 通过 `self.incoming.push(...)` 推入 Registry 的 `SelectAll<UnboundedReceiverStream<...>>`
+- `SelectAll` 将多条流合并为一条，任何一条 receiver 上有消息都会被取出
+- 每条消息都附带 `DebugAdapterId`（由 `Client::recv` 协程在转发时加上 `(id, Payload)`），因此上层可以准确区分消息来源
+- 反向请求的回复通过 `debugger.reply(request.seq, ...)` 发送到**收到该请求的特定 Client**，不会干扰其他会话
 
 **限制与注意事项**：
 | 限制项 | 说明 |
 |--------|------|
-| 传输方式限制 | 仅 TCP 传输的父调试器可以启动子调试器 |
-| stdio 模式 | 不支持子调试（因为无法在 stdio 上复用多个逻辑连接） |
-| `:debug-remote` | 不支持子调试（因为 `Client::tcp` 创建的 Client 的 `socket` 字段为 None） |
+| 传输方式限制 | 父调试器必须使用 TCP 传输（client.socket 不为 None） |
+| stdio 模式 | 不支持子调试（stdio 是一对一的，无法 accept 多条连接） |
+| `:debug-remote` | 不支持子调试（`Client::tcp` 创建的 Client 的 `socket` 字段为 None，即使底层是 TCP） |
 | 配置来源 | 子调试器复用父调试器的 `DebugAdapterConfig` |
-| 会话数量 | 理论上可以有多个子调试器，由 SlotMap 统一管理 |
+| 会话数量 | 理论上可以有多个子调试器，由 SlotMap 统一管理，每条独立 TCP 连接 |
+| Adapter 支持 | 需要 Adapter 自身实现支持多连接（服务器端 Socket accept 循环） |
 
-> ⚠️ **代码细节**：`Client::tcp` 方法（远程连接路径）不会设置 `client.socket` 字段，因此通过 `:debug-remote` 连接的调试器即使底层是 TCP，也无法启动子调试会话。只有通过 `Client::tcp_process` 路径（本地 tcp+port_arg）创建的 Client 才会设置 `socket` 字段。这是当前实现的一个特性，可能是为了避免远程场景下的端口可达性问题。
+> ⚠️ **代码细节**：`Client::tcp` 方法（远程连接路径）不会设置 `client.socket` 字段，因此通过 `:debug-remote` 连接的调试器即使底层是 TCP，也无法启动子调试会话。只有通过 `Client::tcp_process` 路径（本地 tcp+port_arg）创建的 Client 才会设置 `socket` 字段。这是当前实现的一个特性，可能是为了避免远程场景下假设端口可达性问题。
 
 ---
 
@@ -749,7 +794,7 @@ Stopped 事件
 Adapter 可以向 Client 发送反向请求，详细处理逻辑见 2.6 节。总结两种反向请求：
 
 - **RunInTerminal**：Adapter 请求在外部终端运行被调试程序。触发条件：调试模板设置了 `runInTerminal: true`，且 Helix 配置了外部终端。
-- **StartDebugging**：Adapter 请求启动子调试会话。触发条件：Adapter 检测到需要调试子进程（如 fork 场景）。限制：父调试器必须通过 tcp_process 路径创建（`client.socket` 不为 None），子调试器复用同一 TCP socket。
+- **StartDebugging**：Adapter 请求启动子调试会话。触发条件：Adapter 检测到需要调试子进程（如 fork 场景）。限制：父调试器必须通过 tcp_process 路径创建（`client.socket` 不为 None，说明 Adapter 在监听端口 accept 连接）。子调试器连接到同一监听端口，建立**独立的新 TCP 连接**，各自独立做 initialize 握手。
 
 ---
 
