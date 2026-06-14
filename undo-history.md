@@ -198,30 +198,59 @@ fn paste_impl(values, doc, view, action, count, mode) {
 用户按 C-r (Insert 模式)
     │
     ├── keymap 命中 insert_register (helix-term/src/commands.rs#L6019-L6040)
-    │     └── cx.on_next_key(...) 注册回调，等待下一个按键
+    │     │
+    │     ├── cx.on_next_key(callback) 注册回调
+    │     │     └── on_next_key_callback = Some((cb, PseudoPending))
+    │     │         (helix-term/src/commands.rs#L136-L138)
+    │     │
+    │     └── [本次事件结束时] self.on_next_key = cx.on_next_key_callback.take()
+    │           (helix-term/src/ui/editor.rs#L1540)
     │
     ├── mode 仍为 Insert
-    └── 键事件后检查：mode != Insert ? → false → 不提交  ← (此时还没粘贴，只有 C-r 按下)
+    └── 键事件后检查：mode != Insert ? → false → 不提交
+          (此时还没粘贴，只有 C-r 按下)
 
 用户按下寄存器名 (如 '+' 或 '*')
     │
-    ├── keymap 查找：单字符键在 Insert 模式下 → NotFound
-    │
-    ├── on_next_key 回调被触发 (OnKeyCallbackKind::Fallback)
+    ├── 主事件循环首先尝试消费 PseudoPending 回调 (helix-term/src/ui/editor.rs#L1484)
     │     │
-    │     └── paste(editor, register, Paste::Cursor, count)
+    │     └── self.on_next_key(kind=PseudoPending, cx, key)
     │           │
-    │           └── paste_impl(mode = Insert)
-    │                 ├── [边界A] append_changes_to_history  ← 粘贴前提交
-    │                 ├── 构造粘贴 Transaction
-    │                 ├── doc.apply(&transaction, view.id)
-    │                 │     → 走 apply_inner 路径
-    │                 │     → 变更 compose 到 changes
-    │                 │     → 首次变更时设置 old_state
-    │                 └── [边界B] append_changes_to_history  ← 粘贴后立即提交
+    │           ├── kind 匹配 → 调用回调函数 → 返回 true
+    │           │     │
+    │           │     ├── paste(editor, register, Paste::Cursor, count)
+    │           │     │     │
+    │           │     │     └── paste_impl(mode = Insert)
+    │           │     │           ├── [边界A] append_changes_to_history  ← 粘贴前提交
+    │           │     │           ├── 构造粘贴 Transaction
+    │           │     │           ├── doc.apply(&transaction, view.id)
+    │           │     │           │     → 走 apply_inner 路径
+    │           │     │           │     → 变更 compose 到 changes
+    │           │     │           │     → 首次变更时设置 old_state
+    │           │     │           └── [边界B] append_changes_to_history  ← 粘贴后立即提交
+    │           │     │
+    │           │     └── 回调完成，返回 true
+    │           │
+    │           └── on_next_key 方法返回 true → 整个 if 条件为 false
+    │
+    ├── 由于 if !true == false，跳过整个 mode dispatch 块
+    │     → 不进入 insert_mode()
+    │     → 不调用 handle_keymap_event()
+    │     → keymap 查找从未执行！
     │
     └── 键事件后检查：mode != Insert ? → false → 不提交
 ```
+
+**关键修正**：`insert_register` 注册的回调是 `OnKeyCallbackKind::PseudoPending`，主事件循环在进入 mode dispatch 之前**首先**尝试消费 PseudoPending 回调（`helix-term/src/ui/editor.rs#L1484`）。如果回调成功执行（返回 true），则整个 `if !... { match mode { ... } }` 块被跳过，**keymap 查找从未发生**，按键直接被回调消费。
+
+**两种 OnKeyCallbackKind 的区别**（`helix-term/src/commands.rs#L98-L102`）：
+
+| Kind | 消费时机 | 注册方式 | 效果 |
+|---|---|---|---|
+| **PseudoPending** | 主事件循环**最开头**，mode dispatch 之前（`helix-term/src/ui/editor.rs#L1484`） | `cx.on_next_key()` | 优先消费，跳过 keymap 和 mode dispatch，按键不会被当作普通输入 |
+| **Fallback** | keymap 查找返回 NotFound 之后（`helix-term/src/ui/editor.rs#L988`） | `cx.on_next_key_fallback()` | 备选消费，只有按键不匹配任何 keymap 绑定时才会被调用 |
+
+因此，寄存器名按键被 **PseudoPending 回调优先消费**，不会走 "keymap → NotFound → Fallback" 的路径。
 
 **撤销边界标注**（插入模式寄存器粘贴产生 3 个独立 undo 单元）：
 
