@@ -2,7 +2,7 @@
 
 本文从代码实现角度梳理 Helix 编辑器的配置体系，包括配置来源分层、合并优先级规则、变更监听触发流程、重载失败行为、以及各项配置的生效边界。
 
-> **代码引用说明**：本文中所有链接使用仓库相对路径作为显示名，实际指向绝对文件路径。
+> **代码引用说明**：本文中所有代码链接均为仓库相对路径，行号锚点格式与 GitHub 兼容。
 
 ---
 
@@ -24,24 +24,24 @@ Helix 的配置系统采用**多层来源 + 分层合并**的架构。按优先�
 
 ### 1.1 路径定位的关键实现
 
-- 全局配置目录：[lib.rs#L120-L126](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/lib.rs#L120-L126) 中 `config_dir()` 使用 `etcetera::base_strategy::choose_base_strategy()` 按操作系统约定定位，后追加 `/helix`
-- 工作区根目录定位：[lib.rs#L265-L283](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/lib.rs#L265-L283) 中 `find_workspace()` 从 CWD 向上查找 `.git` / `.svn` / `.jj` / `.helix` 标记目录
+- 全局配置目录：[helix-loader/src/lib.rs#L120-L126](helix-loader/src/lib.rs#L120-L126) 中 `config_dir()` 使用 `etcetera::base_strategy::choose_base_strategy()` 按操作系统约定定位，后追加 `/helix`
+- 工作区根目录定位：[helix-loader/src/lib.rs#L265-L283](helix-loader/src/lib.rs#L265-L283) 中 `find_workspace()` 从 CWD 向上查找 `.git` / `.svn` / `.jj` / `.helix` 标记目录
 - 配置文件路径函数定义：
-  - 全局 config: [lib.rs#L143-L145](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/lib.rs#L143-L145) → `config_dir() + "/config.toml"`
-  - 全局 languages: [lib.rs#L159-L161](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/lib.rs#L159-L161) → `config_dir() + "/languages.toml"`
-  - 工作区 config: [lib.rs#L151-L153](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/lib.rs#L151-L153) → `workspace + "/.helix/config.toml"`
-  - 工作区 languages: [lib.rs#L155-L157](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/lib.rs#L155-L157) → `workspace + "/.helix/languages.toml"`
-- 工作区信任文件：`~/.local/share/helix/trusted_workspaces`（每行一个路径），由 [workspace_trust.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/workspace_trust.rs) 管理
+  - 全局 config: [helix-loader/src/lib.rs#L143-L145](helix-loader/src/lib.rs#L143-L145) → `config_dir() + "/config.toml"`
+  - 全局 languages: [helix-loader/src/lib.rs#L159-L161](helix-loader/src/lib.rs#L159-L161) → `config_dir() + "/languages.toml"`
+  - 工作区 config: [helix-loader/src/lib.rs#L151-L153](helix-loader/src/lib.rs#L151-L153) → `workspace + "/.helix/config.toml"`
+  - 工作区 languages: [helix-loader/src/lib.rs#L155-L157](helix-loader/src/lib.rs#L155-L157) → `workspace + "/.helix/languages.toml"`
+- 工作区信任文件：`~/.local/share/helix/trusted_workspaces`（每行一个路径），由 [helix-loader/src/workspace_trust.rs](helix-loader/src/workspace_trust.rs) 管理
 
 ---
 
 ## 2. 合并优先级与策略（重新核准）
 
-不同类型配置使用不同的合并算法，关键代码位于 [helix-term/src/config.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/config.rs) 和 [helix-loader/src/lib.rs#L207-L256](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/lib.rs#L207-L256)。
+不同类型配置使用不同的合并算法，关键代码位于 [helix-term/src/config.rs](helix-term/src/config.rs) 和 [helix-loader/src/lib.rs#L207-L256](helix-loader/src/lib.rs#L207-L256)。
 
 ### 2.1 `config.toml` 合并（`Config::load()`）
 
-合并的核心函数是 [config.rs#L59-L118](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/config.rs#L59-L118)：
+合并的核心函数是 [helix-term/src/config.rs#L59-L118](helix-term/src/config.rs#L59-L118)：
 
 ```
 内置默认值
@@ -54,15 +54,15 @@ Helix 的配置系统采用**多层来源 + 分层合并**的架构。按优先�
 
 | 字段 | 合并策略 | 代码位置 |
 |------|---------|---------|
-| `keys`（键绑定） | **增量 merge**：先 L2 覆盖/追加到默认键映射，再 L4 覆盖/追加 | [config.rs#L69-L75](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/config.rs#L69-L75) `merge_keys()` |
-| `theme`（主题） | **优先取值**：`L4.or(L2)`，即工作区优先，缺失则回退全局 | [config.rs#L88](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/config.rs#L88) |
-| `editor`（编辑器配置） | **深度 merge (3 层)**：`merge_toml_values(L2, L4, 3)` | [config.rs#L77-L85](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/config.rs#L77-L85) |
+| `keys`（键绑定） | **增量 merge**：先 L2 覆盖/追加到默认键映射，再 L4 覆盖/追加 | [helix-term/src/config.rs#L69-L75](helix-term/src/config.rs#L69-L75) `merge_keys()` |
+| `theme`（主题） | **优先取值**：`L4.or(L2)`，即工作区优先，缺失则回退全局 | [helix-term/src/config.rs#L88](helix-term/src/config.rs#L88) |
+| `editor`（编辑器配置） | **深度 merge (3 层)**：`merge_toml_values(L2, L4, 3)` | [helix-term/src/config.rs#L77-L85](helix-term/src/config.rs#L77-L85) |
 
 > **错误处理策略**：若 L2 或 L4 中任一个 TOML 解析失败（`BadConfig`），整个加载过程**立即报错并返回**。IO 错误（文件不存在）可以被容忍，会退回到只有一侧的配置。
 
 ### 2.2 `load_default()` 的两阶段加载
 
-[config.rs#L120-L135](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/config.rs#L120-L135) 的 `Config::load_default()` 采用**两阶段加载**设计，这是理解配置加载的关键：
+[helix-term/src/config.rs#L120-L135](helix-term/src/config.rs#L120-L135) 的 `Config::load_default()` 采用**两阶段加载**设计，这是理解配置加载的关键：
 
 ```rust
 // 第一阶段：只加载 global 配置（忽略 local）
@@ -90,11 +90,11 @@ if let TrustStatus::Trusted = quick_query_workspace(global_parsed.editor.insecur
 最终语言配置
 ```
 
-实现位于 [helix-loader/src/config.rs#L13-L36](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/config.rs#L13-L36)，使用 `fold` 从内建配置开始依次叠加。
+实现位于 [helix-loader/src/config.rs#L13-L36](helix-loader/src/config.rs#L13-L36)，使用 `fold` 从内建配置开始依次叠加。
 
 ### 2.4 `merge_toml_values` 核心算法
 
-这是整个合并系统的基石（[helix-loader/src/lib.rs#L207-L256](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/lib.rs#L207-L256)）：
+这是整个合并系统的基石（[helix-loader/src/lib.rs#L207-L256](helix-loader/src/lib.rs#L207-L256)）：
 
 - **Table**：同 key 递归合并（深度减 1），否则右侧插入
 - **Array**：若元素含 `name` 字段，则按 `name` 配对合并；否则右侧整体覆盖左侧
@@ -108,7 +108,7 @@ if let TrustStatus::Trusted = quick_query_workspace(global_parsed.editor.insecur
 - 规则：从目标文件到根目录**自下而上**依次匹配 glob，**先匹配的优先级低**（后续覆盖前者）
 - 终止条件：遇到 `root = true` 或到达文件系统根
 - 支持字段：`indent_style`, `indent_size`, `tab_width`, `end_of_line`, `charset`, `trim_trailing_whitespace`, `insert_final_newline`, `max_line_length`
-- 实现：[helix-core/src/editor_config.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-core/src/editor_config.rs)
+- 实现：[helix-core/src/editor_config.rs](helix-core/src/editor_config.rs)
 
 > EditorConfig 不参与全局 Config 合并，而是直接以**文档属性**（`Document.editor_config`）存在，在需要时覆盖对应行为。
 
@@ -124,14 +124,14 @@ Helix **不会**使用 inotify / fsevents / ReadDirectoryChangesW 等机制主�
 
 | 触发方式 | 代码位置 |
 |---------|---------|
-| `:config-reload` 命令 | [helix-term/src/commands/typed.rs#L2495-L2506](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/commands/typed.rs#L2495-L2506) |
-| `:set` 命令修改单字段 | [helix-term/src/commands/typed.rs#L2206-L2208](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/commands/typed.rs#L2206-L2208) |
-| `:toggle` 命令切换布尔字段 | [helix-term/src/commands/typed.rs#L2300-L2303](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/commands/typed.rs#L2300-L2303) |
-| 工作区从「未信任」变为「已信任」 | [helix-term/src/handlers/workspace_trust.rs#L79-L81](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/handlers/workspace_trust.rs#L79-L81) |
+| `:config-reload` 命令 | [helix-term/src/commands/typed.rs#L2495-L2506](helix-term/src/commands/typed.rs#L2495-L2506) |
+| `:set` 命令修改单字段 | [helix-term/src/commands/typed.rs#L2206-L2208](helix-term/src/commands/typed.rs#L2206-L2208) |
+| `:toggle` 命令切换布尔字段 | [helix-term/src/commands/typed.rs#L2300-L2303](helix-term/src/commands/typed.rs#L2300-L2303) |
+| 工作区从「未信任」变为「已信任」 | [helix-term/src/handlers/workspace_trust.rs#L79-L81](helix-term/src/handlers/workspace_trust.rs#L79-L81) |
 
 ### 3.2 事件总线：ConfigEvent
 
-配置变更通过 `tokio::sync::mpsc` 通道异步传递，枚举定义见 [helix-view/src/editor.rs#L1277-L1281](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-view/src/editor.rs#L1277-L1281)：
+配置变更通过 `tokio::sync::mpsc` 通道异步传递，枚举定义见 [helix-view/src/editor.rs#L1277-L1281](helix-view/src/editor.rs#L1277-L1281)：
 
 ```rust
 pub enum ConfigEvent {
@@ -143,7 +143,7 @@ pub enum ConfigEvent {
 
 ### 3.3 热更新完整调用链
 
-核心调度在 [helix-term/src/application.rs#L367-L452](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/application.rs#L367-L452)：
+核心调度在 [helix-term/src/application.rs#L367-L452](helix-term/src/application.rs#L367-L452)：
 
 ```
 用户输入 :config-reload
@@ -198,7 +198,7 @@ application.rs::handle_config_events() 接收事件 [L367-L405]
 
 ### 3.5 配置共享机制：`Arc<ArcSwap<Config>>`
 
-全局 `Config` 实例被包装为 `Arc<ArcSwap<...>>`，见 [helix-term/src/application.rs#L75](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/application.rs#L75) 和 [L117](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/application.rs#L117)。
+全局 `Config` 实例被包装为 `Arc<ArcSwap<...>>`，见 [helix-term/src/application.rs#L75](helix-term/src/application.rs#L75) 和 [L117](helix-term/src/application.rs#L117)。
 
 - `store(Arc::new(new_config))`：原子性地替换整个 Config，**无锁、无阻塞**
 - 各子系统通过 `Map` 闭包持有 `Arc<ArcSwap<Config>>` 的投影引用，访问时调用 `.load()` 取得当前快照
@@ -249,11 +249,11 @@ Document 实例私有字段
 | `language_servers`（已连接的 LS 进程） | ❌ **不重启** | ❌ 不调用 `refresh_language_servers()` |
 
 > **代码证据**：`detect_indent_and_line_ending()` 仅在以下场景被调用：
-> - 文档打开时 [helix-view/src/document.rs#L823](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-view/src/document.rs#L823)
-> - `refresh_doc_language()` 时 [helix-view/src/editor.rs#L1721](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-view/src/editor.rs#L1721)
-> - `reload_from_disk()` 时 [helix-view/src/document.rs#L1298](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-view/src/document.rs#L1298)
-> - 手动 `:language` 命令时 [helix-term/src/commands/typed.rs#L2329](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/commands/typed.rs#L2329)
-> 
+> - 文档打开时 [helix-view/src/document.rs#L823](helix-view/src/document.rs#L823)
+> - `refresh_doc_language()` 时 [helix-view/src/editor.rs#L1721](helix-view/src/editor.rs#L1721)
+> - `reload_from_disk()` 时 [helix-view/src/document.rs#L1298](helix-view/src/document.rs#L1298)
+> - 手动 `:language` 命令时 [helix-term/src/commands/typed.rs#L2329](helix-term/src/commands/typed.rs#L2329)
+>
 > 但 `:config-reload` 路径中**不包含**上述调用。
 
 ### 4.4 生效边界总表
@@ -301,24 +301,24 @@ Document 实例私有字段
 
 ---
 
-## 5. 关键代码索引（仓库相对路径）
+## 5. 关键代码索引
 
 | 模块 | 文件（仓库相对路径） | 关键结构/函数 |
 |------|---------------------|--------------|
-| 主 Config 加载合并 | [helix-term/src/config.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/config.rs) | `Config::load()`, `Config::load_default()` |
-| 热更新总调度 | [helix-term/src/application.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/application.rs) | `handle_config_events()`, `refresh_config()`, `load_configured_theme()` |
-| TOML 合并算法 | [helix-loader/src/lib.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/lib.rs) | `merge_toml_values()` |
-| 路径/目录定位 | [helix-loader/src/lib.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/lib.rs) | `config_dir()`, `find_workspace()`, `config_file()`, `workspace_config_file()` |
-| 语言配置加载 | [helix-loader/src/config.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/config.rs) | `default_lang_config()`, `user_lang_config()` |
-| Editor 层配置处理 | [helix-view/src/editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-view/src/editor.rs) | `Config` 结构体, `ConfigEvent`, `refresh_config()` |
-| 工作区信任 | [helix-loader/src/workspace_trust.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-loader/src/workspace_trust.rs) | `quick_query_workspace()`, `TrustStatus` |
-| EditorConfig 支持 | [helix-core/src/editor_config.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-core/src/editor_config.rs) | `EditorConfig::find()` |
-| 配置变更事件定义 | [helix-view/src/events.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-view/src/events.rs) | `ConfigDidChange` |
-| 用户命令入口 | [helix-term/src/commands/typed.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/commands/typed.rs) | `refresh_config()`, `set_option()`, `toggle_option()` |
-| 信任变更触发 reload | [helix-term/src/handlers/workspace_trust.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/handlers/workspace_trust.rs) | `AllowAlways` 分支发送 `ConfigEvent::Refresh` |
-| 单词补全响应配置变更 | [helix-view/src/handlers/word_index.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-view/src/handlers/word_index.rs) | `register_hook!(ConfigDidChange)` |
-| 文档高亮响应配置变更 | [helix-term/src/handlers/document_highlight.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-term/src/handlers/document_highlight.rs) | `register_hook!(ConfigDidChange)` |
-| 文档级 EditorConfig 应用 | [helix-view/src/document.rs](file:///d:/fz/0601/solo-dogfeeding/code/279-helix/helix-view/src/document.rs) | `detect_editor_config()`, `detect_indent_and_line_ending()` |
+| 主 Config 加载合并 | [helix-term/src/config.rs](helix-term/src/config.rs) | `Config::load()`, `Config::load_default()` |
+| 热更新总调度 | [helix-term/src/application.rs](helix-term/src/application.rs) | `handle_config_events()`, `refresh_config()`, `load_configured_theme()` |
+| TOML 合并算法 | [helix-loader/src/lib.rs](helix-loader/src/lib.rs) | `merge_toml_values()` |
+| 路径/目录定位 | [helix-loader/src/lib.rs](helix-loader/src/lib.rs) | `config_dir()`, `find_workspace()`, `config_file()`, `workspace_config_file()` |
+| 语言配置加载 | [helix-loader/src/config.rs](helix-loader/src/config.rs) | `default_lang_config()`, `user_lang_config()` |
+| Editor 层配置处理 | [helix-view/src/editor.rs](helix-view/src/editor.rs) | `Config` 结构体, `ConfigEvent`, `refresh_config()` |
+| 工作区信任 | [helix-loader/src/workspace_trust.rs](helix-loader/src/workspace_trust.rs) | `quick_query_workspace()`, `TrustStatus` |
+| EditorConfig 支持 | [helix-core/src/editor_config.rs](helix-core/src/editor_config.rs) | `EditorConfig::find()` |
+| 配置变更事件定义 | [helix-view/src/events.rs](helix-view/src/events.rs) | `ConfigDidChange` |
+| 用户命令入口 | [helix-term/src/commands/typed.rs](helix-term/src/commands/typed.rs) | `refresh_config()`, `set_option()`, `toggle_option()` |
+| 信任变更触发 reload | [helix-term/src/handlers/workspace_trust.rs](helix-term/src/handlers/workspace_trust.rs) | `AllowAlways` 分支发送 `ConfigEvent::Refresh` |
+| 单词补全响应配置变更 | [helix-view/src/handlers/word_index.rs](helix-view/src/handlers/word_index.rs) | `register_hook!(ConfigDidChange)` |
+| 文档高亮响应配置变更 | [helix-term/src/handlers/document_highlight.rs](helix-term/src/handlers/document_highlight.rs) | `register_hook!(ConfigDidChange)` |
+| 文档级 EditorConfig 应用 | [helix-view/src/document.rs](helix-view/src/document.rs) | `detect_editor_config()`, `detect_indent_and_line_ending()` |
 
 ---
 
