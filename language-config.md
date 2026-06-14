@@ -138,18 +138,36 @@ helix-term/src/main.rs
 ```
 
 **合并算法细节**（`helix-loader/src/lib.rs:207` `merge_toml_values`）：
-- 深度参数为 3：`[[language]]` / `[language-server]` 顶层（depth=3）→ 字段层（depth=2）→ 子表层（depth=1）会递归合并
-- 例1（`[language-server]` 表合并）：`[language-server].taplo = { command = "taplo", args = ["lsp", "stdio"] }`
-  - 顶层 `[language-server]` 表在 depth=3
-  - 其下的 key `taplo` 在 depth=2
-  - key 的值 `{ command = "...", args = "..." }` 在 depth=1，**会分别合并**，更深层直接覆盖
-- 例2（`[[language]].language-servers` 数组合并）：`language-servers = [ "taplo", { name = "tombi", only-features = ["format"] } ]`
-  - 顶层 `[[language]]` 表在 depth=3
-  - `language-servers` 字段在 depth=2，值是数组
-  - 数组成员是字符串或表，在 depth=1，按 `name` 字段匹配合并
-- 数组合并通过 `name` 字段匹配（`get_name` 函数，`helix-loader/src/lib.rs:210`）：同名条目深度减 1 递归合并，不同名条目追加
-- 表合并：key 相同则深度减 1 递归合并，key 不同则直接插入
+- 深度参数为 3：从顶层 TOML 表开始，每深入一层 depth 减 1，减到 0 时不再递归合并
+- `get_name` 函数（`helix-loader/src/lib.rs:210-212`）：`v.get("name").and_then(Value::as_str)`
+  - 对**表类型**值（如 `{ name = "rust", ... }`）：返回 `name` 字段的字符串值
+  - 对**字符串类型**值（如 `"rust-analyzer"`）：没有 `name` 键，返回 `None`
+  - 对其他类型：返回 `None`
+- 数组合并通用规则（当 `merge_depth > 0` 时生效）：
+  - 遍历右侧数组元素，用 `get_name(rvalue)` 获取名称
+  - **有 name（表项）**：在左侧数组中查找同名项
+    - 找到 → `merge_toml_values(lvalue, rvalue, merge_depth - 1)` 递归合并
+    - 没找到 → 直接追加到结果数组
+  - **无 name（字符串项等）**：`get_name` 返回 `None`，无法匹配左侧项 → **直接追加**到结果数组（不会合并）
+  - 注意：左侧没有被右侧匹配到的项**保留**在原位置（不会被删除）
+- 表合并规则（当 `merge_depth > 0` 时生效）：
+  - key 相同 → 递归合并值（深度减 1）
+  - key 不同 → 直接插入新 key
 - 其他类型（字符串、数字、布尔）：右值直接覆盖左值
+- 例1（`[language-server]` 表合并）：`[language-server].taplo = { command = "taplo", args = ["lsp", "stdio"] }`
+  - 顶层 `[language-server]` 表在 depth=2（顶层 TOML 表 depth=3 → 进入 key 后 depth=2）
+  - 其下的 key `taplo` 在 depth=1（进入 `language-server` 表的 key 后 depth 再减 1）
+  - key 的值 `{ command = "...", args = "..." }` 是 Table，depth=1 时会递归合并其内部字段
+  - 再深一层（depth=0）如 `args` 数组的元素就直接覆盖了
+- 例2（`[[language]]` 数组合并）：通过 `name = "toml"` 匹配同名语言条目
+  - 顶层 `language` 数组在 depth=2（depth=3 减 1）
+  - 每个 `[[language]]` 表是数组成员，合并时 depth=1
+  - 表内字段（如 `scope`、`file-types`）合并时 depth=0 → 直接覆盖/合并
+- 例3（`language-servers` 数组的实际行为）：
+  - `[[language]]` 表内的 `language-servers` 字段在 depth=0 层级
+  - 因为 `merge_depth` 从 3 开始递减，到 `language-servers` 数组时正好耗尽（depth=0）
+  - 所以 **`language-servers` 数组在实际配置中是整体被右值覆盖，不会逐元素合并**
+  - 只有当 `merge_depth` 更大（如 4）时，才会触发逐元素合并逻辑
 
 > 注意：`merge_toml_values` 函数上方注释（第 184-206 行）中的示例使用了过时的 `language-server` 字段名，实际已改为 `language-servers` 数组 + `[language-server]` 顶层表的双层结构。
 
@@ -667,5 +685,7 @@ runtime/
 | 打开文档后检查信任并提示（DocumentDidOpen hook） | `helix-term/src/handlers/workspace_trust.rs:24-29` |
 | merge 右值覆盖左值，优先级：workspace > global > default | `helix-loader/src/config.rs:32` `fold(default, ...)` |
 | merge 深度 3 层递归合并 | `helix-loader/src/lib.rs:207` `merge_toml_values` |
-| 数组通过 `name` 字段匹配合并 | `helix-loader/src/lib.rs:210-223` `get_name()` |
+| `get_name()` 仅对表类型返回 name 字段，字符串返回 None | `helix-loader/src/lib.rs:210-212` |
+| 数组合并：表项按 name 匹配合并，字符串项直接追加 | `helix-loader/src/lib.rs:218-228` |
+| `language-servers` 数组因深度耗尽（depth=0）被整体覆盖 | `helix-loader/src/lib.rs:232` `merge_depth > 0` 判断 |
 | LSP 启动时用 name 查找配置 | `helix-lsp/src/lib.rs:630` `.get(&name)` |
