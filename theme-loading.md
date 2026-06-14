@@ -10,7 +10,7 @@
 |------|------|
 | `helix-view/src/theme.rs` | 主题加载核心逻辑：Loader、Theme、ThemePalette |
 | `helix-loader/src/lib.rs` | TOML 合并工具 `merge_toml_values` |
-| `helix-term/src/application.rs` | 应用启动时主题加载入口 `load_configured_theme` |
+| `helix-term/src/application.rs` | 应用启动时主题加载入口、主题事件处理、渲染循环 |
 | `helix-term/src/config.rs` | 配置文件解析，主题配置读取 |
 | `helix-term/src/ui/editor.rs` | 编辑器视图渲染，整体背景和文档渲染调度 |
 | `helix-term/src/ui/document.rs` | 文档文本渲染，语法高亮应用 |
@@ -18,6 +18,8 @@
 | `helix-term/src/ui/menu.rs` | 通用菜单组件渲染 |
 | `helix-term/src/ui/completion.rs` | 补全菜单渲染 |
 | `helix-term/src/compositor.rs` | 组件组合器，统一渲染调度 |
+| `helix-tui/src/backend/termina.rs` | 终端后端，OSC 背景色设置 |
+| `helix-tui/src/terminal.rs` | 终端抽象层，双缓冲机制 |
 | `theme.toml` | 内置默认主题（24位真彩色） |
 | `base16_theme.toml` | 内置 16 色默认主题 |
 | `runtime/themes/` | 内置主题文件目录 |
@@ -286,7 +288,7 @@ fn default_rainbow() -> Vec<Style> {
 }
 ```
 
-### 4.4 作用域逐级回退查找 [helix-view/src/theme.rs#L433-L436](helix-view/src/theme.rs#L433-L436)
+### 4.4 作用域逐级回退查找 [helix-view/src/theme.rs#L430-L443](helix-view/src/theme.rs#L430-L443)
 
 `try_get()` 方法实现点分隔作用域的逐级回退：
 
@@ -297,9 +299,17 @@ pub fn try_get(&self, scope: &str) -> Option<Style> {
 }
 ```
 
+`try_get_exact()` 方法只精确匹配，不回退：
+
+```rust
+pub fn try_get_exact(&self, scope: &str) -> Option<Style> {
+    self.styles.get(scope).copied()
+}
+```
+
 **查找示例**：
-- 查询 `ui.text.focus` → 依次尝试 `ui.text.focus` → `ui.text` → `ui`
-- 查询 `keyword.directive` → 依次尝试 `keyword.directive` → `keyword`
+- `try_get("ui.text.focus")` → 依次尝试 `ui.text.focus` → `ui.text` → `ui`
+- `try_get_exact("ui.text.focus")` → 只尝试 `ui.text.focus`，不存在则返回 None
 
 `get()` 方法在 `try_get()` 基础上增加最终兜底：
 ```rust
@@ -308,7 +318,7 @@ pub fn get(&self, scope: &str) -> Style {
 }
 ```
 
-### 4.5 加载失败兜底 [helix-term/src/application.rs#L455-L491](helix-term/src/application.rs#L455-L491)
+### 4.5 加载失败兜底 [helix-term/src/application.rs#L454-L491](helix-term/src/application.rs#L454-L491)
 
 `load_configured_theme()` 函数的完整兜底逻辑：
 
@@ -341,34 +351,281 @@ fn load_configured_theme(editor: &mut Editor, config: &Config,
 
 ## 五、界面应用过程
 
-主题进入编辑器后，通过多层组件渲染体系作用于界面。以下按组件从整体到局部的顺序详细说明。
+主题进入编辑器后，通过事件驱动 + 双缓冲渲染体系作用于界面。以下从主题设置、终端背景同步、渲染机制、各组件应用四个层面详细说明。
 
-### 5.1 应用启动加载与渲染循环
+### 5.1 主题设置入口：`set_theme`
 
-#### 启动时加载 [helix-term/src/application.rs#L128](helix-term/src/application.rs#L128)
+#### 设置入口 [helix-view/src/editor.rs#L1499-L1528](helix-view/src/editor.rs#L1499-L1528)
 
 ```rust
-Self::load_configured_theme(&mut editor, &config.load(), &mut terminal, theme_mode);
+pub fn set_theme(&mut self, theme: Theme) -> anyhow::Result<()> {
+    self.set_theme_impl(theme, ThemeAction::Set)
+}
+
+fn set_theme_impl(&mut self, theme: Theme, action: ThemeAction) -> anyhow::Result<()> {
+    // 最低要求：必须定义 ui.selection 样式
+    if theme.find_highlight_exact("ui.selection").is_none() {
+        bail!("Invalid theme: `ui.selection` required");
+    }
+    
+    // 更新语法高亮加载器的作用域列表
+    let scopes = theme.scopes();
+    (*self.syn_loader).load().set_scopes(scopes.to_vec());
+    
+    // 根据动作类型设置主题（预览或正式设置）
+    match action {
+        ThemeAction::Preview => {
+            let last_theme = std::mem::replace(&mut self.theme, theme);
+            self.last_theme.get_or_insert(last_theme);  // 保存原主题用于恢复
+        }
+        ThemeAction::Set => {
+            self.last_theme = None;
+            self.theme = theme;
+        }
+    }
+    
+    // 同步视图状态
+    self._refresh();
+    // 发送主题变更事件
+    self.config_events.0.send(ConfigEvent::ThemeChanged)?;
+    
+    Ok(())
+}
 ```
 
-#### 渲染循环 [helix-term/src/application.rs#L255-L286](helix-term/src/application.rs#L255-L286)
+**关键步骤**：
+1. 验证主题必须包含 `ui.selection`（编辑器正常工作的最低要求）
+2. 更新语法高亮加载器的作用域列表（影响语法高亮解析）
+3. 设置新主题到 `self.theme`
+4. 调用 `_refresh()` 同步视图状态（不是标记重绘，见下节说明）
+5. 发送 `ConfigEvent::ThemeChanged` 事件通知应用层
+
+#### `_refresh()` 的真实作用 [helix-view/src/editor.rs#L1817-L1838](helix-view/src/editor.rs#L1817-L1838)
+
+```rust
+fn _refresh(&mut self) {
+    let config = self.config();
+    
+    // 重置嵌入提示注解
+    if !config.lsp.display_inlay_hints {
+        for doc in self.documents_mut() {
+            doc.reset_all_inlay_hints();
+        }
+    }
+    
+    // 同步所有视图的文档变更
+    for (view, _) in self.tree.views_mut() {
+        let doc = doc_mut!(self, &view.doc);
+        view.sync_changes(doc);
+        view.gutters = config.gutters.clone();
+        view.ensure_cursor_in_view(doc, config.scrolloff)
+    }
+}
+```
+
+**注意**：`_refresh()` **不直接设置 `needs_redraw` 标志**，它的作用是：
+- 重置嵌入提示
+- 同步视图与文档的变更状态
+- 更新行号栏配置
+- 确保光标在视图范围内
+
+### 5.2 终端背景色同步：OSC 11 协议
+
+主题切换后，应用层通过 `ConfigEvent::ThemeChanged` 事件同步终端背景色。
+
+#### 事件处理入口 [helix-term/src/application.rs#L653-L656](helix-term/src/application.rs#L653-L656)
+
+```rust
+EditorEvent::ConfigEvent(event) => {
+    self.handle_config_events(event);
+    self.render().await;  // 事件处理后立即渲染
+}
+```
+
+#### 终端背景色设置 [helix-term/src/application.rs#L384-L391](helix-term/src/application.rs#L384-L391)
+
+```rust
+ConfigEvent::ThemeChanged => {
+    let _ = self.terminal.backend_mut().set_background_color(
+        self.editor
+            .theme
+            .try_get_exact("ui.background")  // 精确匹配，不逐级回退
+            .and_then(|style| style.bg),     // 提取背景色
+    );
+    return;  // 主题变更事件不触发完整配置刷新
+}
+```
+
+**关键细节**：
+- 使用 `try_get_exact("ui.background")` 精确匹配，不逐级回退
+- 只有当主题明确定义了 `ui.background` 的 `bg` 颜色时才设置
+- 设置失败会被忽略（`let _ = ...`）
+
+#### 后端实现 [helix-tui/src/backend/termina.rs#L620-L640](helix-tui/src/backend/termina.rs#L620-L640)
+
+```rust
+fn set_background_color(&mut self, color: Option<Color>) -> io::Result<()> {
+    // tmux 下 OSC 11 会破坏 SGR 导致闪烁，故禁用
+    if !self.capabilities.dynamic_background_color {
+        return Ok(());
+    }
+    
+    // 保存当前请求的背景色
+    self.background_color = match color {
+        Some(Color::Rgb(r, g, b)) => Some(RgbColor::new(r, g, b)),
+        _ => None,
+    };
+    
+    // 发送 OSC 11 控制序列设置终端背景色
+    if let Some(color) = self.background_color {
+        write!(
+            self.terminal,
+            "{}",
+            Osc::ChangeDynamicColors(
+                osc::DynamicColorNumber::TextBackgroundColor,
+                vec![color.into()]
+            )
+        )
+    } else {
+        self.reset_background_color()  // 恢复原始背景色
+    }
+}
+```
+
+**动态背景色能力检测** [helix-tui/src/backend/termina.rs#L104-L105](helix-tui/src/backend/termina.rs#L104-L105)：
+```rust
+// tmux 下 OSC11 / OSC111 会破坏 SGR 导致闪烁
+capabilities.dynamic_background_color = std::env::var_os("TMUX").is_none();
+```
+
+#### 退出时恢复 [helix-tui/src/backend/termina.rs#L465-L466](helix-tui/src/backend/termina.rs#L465-L466)
+
+```rust
+if self.background_color.is_some() {
+    self.reset_background_color()?;  // 退出时恢复终端原始背景色
+}
+```
+
+启动时还会查询终端原始背景色并保存（`original_background_color`），用于退出时恢复。
+
+### 5.3 两种重绘机制：`full_redraw` vs 普通重绘
+
+Helix 有两级重绘机制，作用和触发时机各不相同。
+
+#### 双缓冲渲染基础 [helix-tui/src/terminal.rs#L67-L69](helix-tui/src/terminal.rs#L67-L69)
+
+```rust
+buffers: [Buffer; 2],  // 前后双缓冲
+current: usize,        // 当前缓冲索引
+```
+
+渲染流程：
+1. 组件渲染写入当前缓冲（前缓冲）
+2. 与上一帧的后缓冲比较差异
+3. 只输出变化的部分到终端
+4. 交换前后缓冲
+
+#### 普通重绘：`needs_redraw` 标志
+
+`needs_redraw` 是 `Editor` 结构体上的标志 [helix-view/src/editor.rs#L1245](helix-view/src/editor.rs#L1245)，表示编辑器内部状态发生变化，需要重新渲染界面。
+
+**触发方式**：通过 `request_redraw()` 事件 [helix-view/src/editor.rs#L2396-L2404](helix-view/src/editor.rs#L2396-L2404)：
+
+```rust
+_ = helix_event::redraw_requested() => {
+    if !self.needs_redraw {
+        self.needs_redraw = true;
+        // 33ms 防抖，合并短时间内的多次重绘请求
+        let timeout = Instant::now() + Duration::from_millis(33);
+        if timeout < self.idle_timer.deadline() && timeout < self.redraw_timer.deadline() {
+            self.redraw_timer.as_mut().reset(timeout)
+        }
+    }
+}
+```
+
+**渲染时机** [helix-term/src/application.rs#L570-L573](helix-term/src/application.rs#L570-L573)：
+```rust
+let should_render = self.compositor.handle_event(&Event::IdleTimeout, &mut cx);
+if should_render || self.editor.needs_redraw {
+    self.render().await;
+}
+```
+
+**普通重绘的特点**：
+- 基于双缓冲差异渲染，只输出变化的字符
+- 性能开销小，适合频繁触发（光标移动、文本编辑等）
+- 主题切换通过 `ConfigEvent` 事件触发，属于普通重绘
+
+#### 全屏清屏重绘：`full_redraw` 标志
+
+`full_redraw` 是 `Compositor` 结构体上的标志 [helix-term/src/compositor.rs#L83](helix-term/src/compositor.rs#L83)，表示需要完全清除终端后重新绘制。
+
+**设置方法** [helix-term/src/compositor.rs#L220-L222](helix-term/src/compositor.rs#L220-L222)：
+```rust
+pub fn need_full_redraw(&mut self) {
+    self.full_redraw = true;
+}
+```
+
+**渲染时处理** [helix-term/src/application.rs#L256-L259](helix-term/src/application.rs#L256-L259)：
+```rust
+if self.compositor.full_redraw {
+    self.terminal.clear().expect("Cannot clear the terminal");
+    self.compositor.full_redraw = false;
+}
+```
+
+`terminal.clear()` 做了两件事 [helix-tui/src/terminal.rs#L238-L243](helix-tui/src/terminal.rs#L238-L243)：
+```rust
+pub fn clear(&mut self) -> io::Result<()> {
+    self.backend.clear()?;               // 发送清屏控制序列
+    self.buffers[1 - self.current].reset();  // 重置后缓冲，强制全量重绘
+    Ok(())
+}
+```
+
+**全屏重绘的特点**：
+- 清除整个终端屏幕，重置后缓冲
+- 下一帧所有内容都需要重新绘制和输出
+- 性能开销大，只在必要时使用
+
+#### 触发场景对比
+
+| 重绘类型 | 标志位置 | 触发场景 | 性能开销 |
+|---------|---------|---------|---------|
+| 普通重绘 | `Editor.needs_redraw` | 光标移动、文本编辑、诊断更新、主题切换 | 小（差异渲染） |
+| 全屏重绘 | `Compositor.full_redraw` | `:redraw` 命令、SIGCONT 恢复终端 | 大（全量重绘） |
+
+**重要纠正**：主题切换 **不会** 触发 `full_redraw`，它通过 `ConfigEvent::ThemeChanged` 事件触发一次普通重绘。由于双缓冲机制，所有字符的样式都会因为主题变化而被检测为差异，实际效果接近全量重绘，但技术上仍属于普通重绘范畴。
+
+### 5.4 渲染循环与组件渲染
+
+#### 渲染函数 [helix-term/src/application.rs#L255-L282](helix-term/src/application.rs#L255-L282)
 
 ```rust
 async fn render(&mut self) {
+    // 全屏重绘：先清屏
     if self.compositor.full_redraw {
         self.terminal.clear().expect("Cannot clear the terminal");
         self.compositor.full_redraw = false;
     }
 
     let mut cx = crate::compositor::Context { ... };
-    cx.editor.needs_redraw = false;
+    
+    helix_event::start_frame();
+    cx.editor.needs_redraw = false;  // 清除重绘标志
 
     let area = self.terminal.autoresize().expect("...");
     let surface = self.terminal.current_buffer_mut();
 
-    self.compositor.render(area, surface, &mut cx);  // 渲染所有组件
+    // 逐层渲染所有组件
+    self.compositor.render(area, surface, &mut cx);
+    
+    // 计算光标位置
     let (pos, kind) = self.compositor.cursor(area, &self.editor);
     
+    // 输出到终端
     self.terminal.draw(pos, kind).unwrap();
 }
 ```
@@ -383,7 +640,7 @@ pub fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
 }
 ```
 
-### 5.2 背景刷新：EditorView 根组件
+### 5.5 编辑器背景：`EditorView` 根组件
 
 `EditorView` 是最底层组件，负责绘制编辑器背景和调度所有子视图渲染。
 
@@ -393,64 +650,18 @@ pub fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
 fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
     // clear with background color
     surface.set_style(area, cx.editor.theme.get("ui.background"));
-    // ... 后续渲染
+    // ... 后续渲染 bufferline、各视图、状态栏等
 }
 ```
 
 **关键作用**：
 - 在每帧渲染开始时，用 `ui.background` 样式填充整个编辑器区域
 - 这是所有 UI 元素的底色基础
+- 使用 `theme.get()` 支持逐级回退
 
-#### 全屏重绘触发 [helix-term/src/compositor.rs#L220-L222](helix-term/src/compositor.rs#L220-L222)
+### 5.6 状态栏：多作用域分层应用
 
-```rust
-pub fn need_full_redraw(&mut self) {
-    self.full_redraw = true;
-}
-```
-
-`full_redraw` 标志会导致下一帧先调用 `terminal.clear()` 清除整个终端，再重新绘制所有内容。通常在主题切换、窗口大小变化等场景触发。
-
-### 5.3 主题设置到编辑器：`set_theme`
-
-#### 设置入口 [helix-view/src/editor.rs#L1499-L1525](helix-view/src/editor.rs#L1499-L1525)
-
-```rust
-pub fn set_theme(&mut self, theme: Theme) -> anyhow::Result<()> {
-    self.set_theme_impl(theme, ThemeAction::Set)
-}
-
-fn set_theme_impl(&mut self, theme: Theme, preview: ThemeAction) -> anyhow::Result<()> {
-    // 最低要求：必须定义 ui.selection 样式
-    if theme.find_highlight_exact("ui.selection").is_none() {
-        bail!("Invalid theme: `ui.selection` required");
-    }
-    
-    // 更新语法高亮加载器的作用域列表
-    let scopes = theme.scopes();
-    (*self.syn_loader).load().set_scopes(scopes.to_vec());
-    
-    // 更新主题
-    self.theme = theme;
-    
-    // 触发界面刷新和事件通知
-    self._refresh();
-    self.config_events.0.send(ConfigEvent::ThemeChanged)?;
-    
-    Ok(())
-}
-```
-
-**关键步骤**：
-1. 验证主题必须包含 `ui.selection`（这是编辑器正常工作的最低要求）
-2. 更新语法高亮加载器的作用域列表（影响语法高亮的解析）
-3. 设置新主题到 `self.theme`
-4. 调用 `_refresh()` 标记需要重绘
-5. 发送 `ThemeChanged` 事件通知其他组件
-
-### 5.4 状态栏：多作用域分层应用
-
-状态栏是主题样式最集中的 UI 组件之一，使用了多种作用域。
+状态栏是主题样式最集中的 UI 组件之一。
 
 #### 基础样式选择 [helix-term/src/ui/statusline.rs#L53-L60](helix-term/src/ui/statusline.rs#L53-L60)
 
@@ -499,16 +710,6 @@ for sev in &context.editor.config().statusline.diagnostics {
 }
 ```
 
-#### 分隔符样式 [helix-term/src/ui/statusline.rs#L518-L526](helix-term/src/ui/statusline.rs#L518-L526)
-
-```rust
-fn render_separator<'a, F>(context: &mut RenderContext<'a>, write: F) {
-    let sep = &context.editor.config().statusline.separator;
-    let style = context.editor.theme.get("ui.statusline.separator");
-    write(context, Span::styled(sep.to_string(), style));
-}
-```
-
 #### 样式层叠机制 [helix-term/src/ui/statusline.rs#L123-L126](helix-term/src/ui/statusline.rs#L123-L126)
 
 ```rust
@@ -533,9 +734,9 @@ fn append<'a>(buffer: &mut Spans<'a>, mut span: Span<'a>, base_style: Style) {
 | `info` | 信息诊断计数圆点 |
 | `hint` | 提示诊断计数圆点 |
 
-### 5.5 文档渲染：语法高亮 + 虚拟文本 + 叠加层
+### 5.7 文档渲染：语法高亮 + 虚拟文本 + 叠加层
 
-文档渲染是主题应用最复杂的部分，涉及语法高亮、虚拟文本、诊断叠加等多层样式叠加。
+文档渲染是主题应用最复杂的部分，涉及多层样式叠加。
 
 #### 渲染入口 [helix-term/src/ui/editor.rs#L77-L117](helix-term/src/ui/editor.rs#L77-L117)
 
@@ -657,7 +858,7 @@ pub fn highlight(&self, highlight: Highlight) -> Style {
 | `keyword`、`string`、`function` 等 | 语法高亮作用域（上百种） |
 | `rainbow.0` ~ `rainbow.N` | 彩虹括号颜色 |
 
-### 5.6 补全菜单：多层样式组合
+### 5.8 补全菜单：多层样式组合
 
 补全菜单结合了通用 Menu 组件和补全项的自定义样式。
 
@@ -752,51 +953,60 @@ surface.clear_with(doc_area, background);
 | `ui.text.directory` | 文件夹类补全项 | 无 |
 | `ui.popup` | 补全文档弹窗背景 | 无 |
 
-### 5.7 其他 UI 组件
-
-以下是其他常见组件使用的主题作用域：
-
-| 组件 | 文件 | 主要作用域 |
-|------|------|-----------|
-| 行号栏 | `helix-term/src/ui/editor.rs` | `ui.linenr`、`ui.linenr.selected` |
-| 分隔线 | `helix-term/src/ui/editor.rs` | `ui.background.separator` |
-| 命令行/提示框 | `helix-term/src/ui/prompt.rs` | `ui.text`、`ui.text.focus` |
-| 弹出窗口 | `helix-term/src/ui/popup.rs` | `ui.popup`、`ui.window` |
-| 信息提示 | `helix-term/src/ui/info.rs` | `ui.help` |
-| 选取器 | `helix-term/src/ui/picker.rs` | `ui.menu` 系列 |
-| 悬浮提示 | `helix-term/src/ui/lsp/hover.rs` | `ui.popup` |
-
-### 5.8 主题切换与重绘触发
-
-#### 主题变更事件流
+### 5.9 主题切换完整事件流
 
 ```
-用户执行 :theme 命令
-    │
-    ▼
-Editor::set_theme(theme)
-    ├─► 验证 ui.selection 必需样式
-    ├─► 更新语法高亮 scopes
-    ├─► 设置 self.theme
-    ├─► self._refresh()         → 标记 needs_redraw = true
-    └─► ConfigEvent::ThemeChanged → 通知其他配置消费者
-    │
-    ▼
-事件循环检测到 needs_redraw
-    │
-    ▼
-Application::render()
-    ├─► terminal.clear() (如果 full_redraw)
-    ├─► compositor.render() → 逐层调用各组件 render()
-    │   └─► EditorView::render()
-    │       ├─► 设置 ui.background 背景色
-    │       ├─► 渲染 bufferline
-    │       ├─► 渲染各 view（文档 + 状态栏）
-    │       │   ├─► render_document() → 语法高亮 + 叠加层
-    │       │   └─► statusline::render() → 状态栏各元素
-    │       └─► 渲染 status message
-    ├─► 计算光标位置
-    └─► terminal.draw() → 输出到终端
+用户执行 :theme 命令 或 修改配置后 SIGUSR1
+        │
+        ▼
+theme() 命令处理函数
+        │
+        ▼
+editor.set_theme(theme)
+        │
+        ├─► 验证 ui.selection 必需样式
+        ├─► 更新语法高亮 scopes
+        ├─► 设置 self.theme
+        ├─► self._refresh()         → 同步视图状态（不是标记重绘）
+        └─► ConfigEvent::ThemeChanged → 发送到 config_events 通道
+        │
+        ▼
+事件循环接收到 EditorEvent::ConfigEvent
+        │
+        ▼
+Application::handle_config_events()
+        │
+        └─► ConfigEvent::ThemeChanged 分支
+            │
+            └─► terminal.backend_mut().set_background_color()
+                │
+                ├─► 检查 dynamic_background_color 能力（tmux 下禁用）
+                ├─► theme.try_get_exact("ui.background") → 精确提取 bg
+                └─► 发送 OSC 11 控制序列到终端
+        │
+        ▼
+Application::render()    ← 事件处理后立即调用
+        │
+        ├─► 检查 full_redraw （主题切换不触发，保持 false）
+        ├─► 清除 needs_redraw 标志
+        ├─► compositor.render() → 逐层调用各组件 render()
+        │   └─► EditorView::render()
+        │       ├─► surface.set_style(area, theme.get("ui.background"))
+        │       ├─► 渲染 bufferline
+        │       ├─► 渲染各 view（文档 + 状态栏）
+        │       │   ├─► render_document()
+        │       │   │   ├─► text_style = theme.get("ui.text")
+        │       │   │   ├─► syntax_style = theme.highlight(idx)  [O(1)]
+        │       │   │   ├─► whitespace_style 叠加
+        │       │   │   └─► overlay_style 叠加（诊断、选区等）
+        │       │   └─► statusline::render()
+        │       │       ├─► base_style: ui.statusline / inactive
+        │       │       ├─► 模式: insert / select / normal
+        │       │       ├─► 诊断: error / warning / info / hint
+        │       │       └─► 分隔符: ui.statusline.separator
+        │       └─► 渲染 status message
+        ├─► 计算光标位置
+        └─► terminal.draw() → 双缓冲差异比较 → 输出到终端
 ```
 
 ## 六、完整流程图
@@ -847,10 +1057,16 @@ Editor::set_theme()
         ├─► 检查必需的 ui.selection 样式
         ├─► 更新语法高亮 scopes
         ├─► 设置 self.theme
-        ├─► 触发界面刷新 (_refresh)
-        └─► 发送 ThemeChanged 事件
+        ├─► _refresh() 同步视图状态
+        └─► 发送 ConfigEvent::ThemeChanged 事件
         │
         ▼
+Application 接收 ConfigEvent::ThemeChanged
+        ├─► set_background_color()  → OSC 11 同步终端背景色
+        │   └─► try_get_exact("ui.background") 精确提取 bg
+        └─► render() 立即重绘
+            │
+            ▼
 渲染循环 (每帧)
         ├─► EditorView::render()
         │   └─► surface.set_style(area, theme.get("ui.background"))
@@ -873,6 +1089,8 @@ Editor::set_theme()
 
 ## 七、关键设计要点
 
+### 主题加载与合并
+
 1. **多目录优先级**：支持用户自定义主题覆盖内置主题，方便定制
 
 2. **循环继承检测**：通过 `visited_paths` 防止 `A inherits B, B inherits A` 导致的死循环
@@ -883,11 +1101,24 @@ Editor::set_theme()
 
 5. **多层兜底机制**：配置失败 → 真彩色检测 → 16 色兼容 → 默认主题 → Style::default()，确保编辑器始终可用
 
-6. **性能优化**：
+### 界面应用与渲染
+
+6. **终端背景色同步**：通过 OSC 11 协议同步 `ui.background` 到终端，tmux 环境下禁用避免闪烁
+
+7. **两级重绘机制**：
+   - 普通重绘（`needs_redraw`）：双缓冲差异渲染，性能开销小，适合频繁触发
+   - 全屏重绘（`full_redraw`）：清屏 + 全量重绘，性能开销大，仅特殊场景使用
+
+8. **事件驱动渲染**：主题切换通过 `ConfigEvent::ThemeChanged` 事件触发渲染，而非直接调用，解耦主题变更与渲染逻辑
+
+9. **性能优化**：
    - 语法高亮使用索引数组（O(1)）而非 HashMap 查找
-   - UI 样式使用 HashMap + 逐级回退缓存
+   - UI 样式使用 HashMap + 逐级回退
    - RGB 颜色直接编码在 Highlight 索引中，无需额外存储
+   - 33ms 重绘防抖，合并短时间内的多次重绘请求
 
-7. **样式叠加机制**：基础样式 → 语法高亮 → 空白字符 → 叠加层，各层通过 `patch()` 方法合并，实现丰富的视觉效果
+10. **样式叠加机制**：基础样式 → 语法高亮 → 空白字符 → 叠加层，各层通过 `patch()` 方法合并，实现丰富的视觉效果
 
-8. **完整的主题变更事件**：`ThemeChanged` 事件确保主题切换时所有相关组件都能正确响应
+11. **精确匹配 vs 逐级回退**：
+    - `try_get()`：逐级回退，适用于 UI 样式查询
+    - `try_get_exact()`：精确匹配，适用于终端背景色等特殊场景（避免回退导致意外效果）
