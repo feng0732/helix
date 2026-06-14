@@ -21,7 +21,7 @@
 
 ## 1. 概述：三种同步模式
 
-LSP 协议定义了 `TextDocumentSyncKind` 枚举（helix-lsp-types/src/lib.rs#L1768-L1790），控制编辑器如何将文本变更同步给语言服务器：
+LSP 协议定义了 `TextDocumentSyncKind` 枚举（helix-lsp-types/src/lib.rs#L1774-L1786），控制编辑器如何将文本变更同步给语言服务器：
 
 | 值 | 含义 | 传输内容 |
 |----|------|----------|
@@ -292,7 +292,7 @@ fn traverse(pos: lsp::Position, text: RopeSlice, offset_encoding: OffsetEncoding
 
 ### 第一层：发送队列——Unbounded Channel
 
-**位置**：`Client::start()` 中创建（helix-lsp/src/client.rs#L246），由 `server_tx` / `client_rx` 构成。
+**位置**：`Transport::start()` 中创建（helix-lsp/src/transport.rs#L61-L62），`let (tx, client_rx) = unbounded_channel();` 中的 `tx` 作为 `server_tx` 返回给 Client，`client_rx` 留在 Transport 内部。
 
 **类型**：`tokio::sync::mpsc::unbounded_channel()`——无界通道。
 
@@ -430,7 +430,7 @@ Document.apply_impl()                  Transport::send()
 
 **方向**：语言服务器 → 编辑器
 
-**版本携带方式**：`PublishDiagnosticsParams.version: Option<i32>`（helix-lsp-types/src/lib.rs#L2266-L2273）。服务器**可以**在诊断通知中附带 version，表示该诊断基于哪个文档版本计算得出。此字段可选——并非所有服务器都提供。
+**版本携带方式**：`PublishDiagnosticsParams.version: Option<i32>`（helix-lsp-types/src/lib.rs#L2544-L2546）。服务器**可以**在诊断通知中附带 version，表示该诊断基于哪个文档版本计算得出。此字段可选——并非所有服务器都提供。
 
 **对齐机制**：`handle_lsp_diagnostics()`（helix-view/src/handlers/lsp.rs#L279-L296）在处理诊断时：
 
@@ -561,7 +561,7 @@ if !event.ghost_transaction {
 | traverse 辅助函数 | helix-lsp/src/client.rs | L966-L995 | `fn traverse()` |
 | pos_to_lsp_pos | helix-lsp/src/lib.rs | L223-L251 | `fn pos_to_lsp_pos()` |
 | Client::notify | helix-lsp/src/client.rs | L502-L533 | `fn notify()` |
-| Channel 创建 | helix-lsp/src/client.rs | L246 | `unbounded_channel()` |
+| Channel 创建 | helix-lsp/src/transport.rs | L61-L62 | `unbounded_channel()` |
 | Transport::send 循环 | helix-lsp/src/transport.rs | L338-L441 | `async fn send()` |
 | pending_messages 缓存 | helix-lsp/src/transport.rs | L345 | `Vec<Payload>` |
 | 初始化前通知丢弃 | helix-lsp/src/transport.rs | L418-L421 | `continue` |
@@ -572,7 +572,8 @@ if !event.ghost_transaction {
 | apply_temporary | helix-view/src/document.rs | L1658-L1663 | 幽灵事务入口 |
 | ghost_transaction 赋值 | helix-view/src/document.rs | L1610 | `!emit_lsp_notification` |
 | LanguageServerInitialized 钩子 | helix-view/src/handlers/lsp.rs | L387-L404 | 重发 didOpen |
-| TextDocumentSyncKind | helix-lsp-types/src/lib.rs | L1768-L1790 | 同步模式枚举 |
+| TextDocumentSyncKind | helix-lsp-types/src/lib.rs | L1774-L1786 | 同步模式枚举 |
+| PublishDiagnosticsParams | helix-lsp-types/src/lib.rs | L2537-L2547 | 诊断通知参数 |
 | VersionedTextDocumentIdentifier | helix-lsp-types/src/lib.rs | L970-L980 | 版本号+URI |
 | DidChangeTextDocumentParams | helix-lsp-types/src/lib.rs | L2266-L2273 | didChange 参数 |
 | TextDocumentContentChangeEvent | helix-lsp-types/src/lib.rs | L2279-L2292 | 增量变更事件 |
