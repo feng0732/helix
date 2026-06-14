@@ -91,8 +91,9 @@ fn inject_nucleo_item<T, D>(
 
 关键点：
 - 只将 `filter = true` 的列文本传递给 nucleo 进行匹配
-- 闭包在 nucleo 内部线程执行，格式化文本供匹配使用
-- `dst` 是 nucleo 提供的目标缓冲区，每个可过滤列对应一个 slot
+- 闭包在 `push` 调用时**同步执行**（在调用者线程），将格式化好的列文本写入 boxcar::Vec 的对应 slot
+- `dst` 是 boxcar::Vec 提供的 `Utf32String` 缓冲区，每个可过滤列对应一个 slot
+- Worker 线程只读已写入的 `matcher_columns`，不做格式化
 
 ---
 
@@ -191,8 +192,9 @@ Nucleo 匹配器内部不是"无锁队列消费"模型，而是**共享 append-o
 ```
 调用方（主线程/异步任务）
     │  Injector::push(item, fill_fn)
+    │  → 同步执行 fill_fn：格式化列文本写入 slot
     │  → 追加到 boxcar::Vec<T>（共享）
-    │  → 调用 notify() 请求重绘（每次 push 都触发）
+    │  → notify() [路径 A：候选追加触发重绘]
     ▼
 Arc<boxcar::Vec<T>>      ← Injector / Worker / Snapshot 三方共享
     │  Worker.last_snapshot 游标追踪已处理位置
@@ -203,7 +205,7 @@ rayon 线程池（异步）
     │  → 增量扫描 boxcar::Vec，对新项执行模糊匹配
     │  → 对已有项若 pattern 变更则重新打分
     │  → par_quicksort 并行排序
-    │  → 完成后若 should_notify=true 再调一次 notify()
+    │  → notify() [路径 B：匹配完成触发重绘，若 should_notify=true]
     ▼
 Worker.matches 结果向量
     │  下一帧 tick 获取锁时 → snapshot.update()
@@ -226,15 +228,24 @@ pub fn push(&self, value: T, fill_columns: impl FnOnce(&T, &mut [Utf32String])) 
 }
 ```
 
-1. `self.items.push()` 把 `T` 和列文本（`fill_fn` 闭包写入 `dst` 缓冲区）追加到共享 vector，返回分配的索引 `idx`——这就是 [inject_nucleo_item()](helix-term/src/ui/picker.rs#L132-L143) 所做的事。
-2. **push 之后立刻调用 `notify()`**，不是等匹配完成后才通知。这意味着用户每输入一个字符就会触发一次重绘请求，即使匹配还没开始。
+1. `self.items.push()` 把 `T` 和列文本追加到共享 vector：先分配索引 slot，再在**当前调用线程中同步执行** `fill_fn` 闭包（即 [inject_nucleo_item()](helix-term/src/ui/picker.rs#L132-L143) 中的 `|item, dst| { ... }`），将格式化好的列文本写入 `dst` 缓冲区，最后返回分配的索引 `idx`。
+2. **push 之后立刻调用 `notify()`**，通知 UI 有新候选项。这意味着批量注入场景（如文件扫描、动态查询）每追加一批就会触发一次重绘请求，即使匹配还没开始。
 
-#### 重绘通知 `notify` 的触发时机
+> **注意**：普通用户在查询框中输入字符（pattern 变化）**不会**走这条路径触发重绘——那条路径见第 3.2 节的 tick 派发机制。
 
-Picker 创建时传给 `Nucleo::new()` 的 notify 回调是 `Arc::new(helix_event::request_redraw)`（见 [picker.rs#L282-L287](helix-term/src/ui/picker.rs#L282-L287) 和 [picker.rs#L317-L322](helix-term/src/ui/picker.rs#L317-L322)）。它在**两个时机**被调用：
+#### 重绘通知 `notify` 的两条触发路径
 
-1. **`Injector::push()` / `extend()`**：每次追加候选后立即触发
-2. **`Worker::run()` 末尾**：匹配和排序完成后，若 `should_notify` 原子标志为 `true`，再触发一次
+Picker 创建时传给 `Nucleo::new()` 的 notify 回调是 `Arc::new(helix_event::request_redraw)`（见 [picker.rs#L282-L287](helix-term/src/ui/picker.rs#L282-L287) 和 [picker.rs#L317-L322](helix-term/src/ui/picker.rs#L317-L322)）。它在**两类共两个时机**被调用：
+
+**路径 A：候选追加触发（Injector 侧）**
+- `Injector::push()` / `extend()`：每次追加候选后立即触发
+- 适用场景：动态查询、文件扫描等候选在变化的场景
+- 特点：不等匹配开始，push 完立刻通知
+
+**路径 B：匹配完成触发（Worker 侧）**
+- `Worker::run()` 末尾：匹配和排序完成后，若 `should_notify` 原子标志为 `true`，再触发一次
+- 适用场景：**普通查询输入**（pattern 变化 → 下一帧 tick 派发 Worker → Worker 跑完通知）、候选追加后的首次匹配完成
+- 特点：在 rayon 线程池异步完成后触发
 
 `request_redraw()` 的实现（[helix-event/src/redraw.rs#L28-L30](helix-event/src/redraw.rs#L28-L30)）非常轻量：
 ```rust
@@ -243,6 +254,8 @@ pub fn request_redraw() {
 }
 ```
 它不会立即重绘，只是向 tokio 的 `Notify` 发送一次通知。Helix 主循环会以**30 FPS 去抖**速率合并这些通知，保证实际重绘不会过于频繁。
+
+> **普通查询输入的重绘时序**：用户键入字符 → prompt 内容变化（当前帧已渲染，由 UI 事件循环驱动）→ `handle_prompt_change()` 调用 `matcher.pattern.reparse()` → 下一帧 `tick()` 检测到 pattern 变化、派发 Worker → Worker 在 rayon 线程池完成匹配排序 → `should_notify=true` 时调用 `notify()` → 再下一帧 `tick()` 拿到新结果、更新 snapshot → 界面显示新匹配列表。也就是说，用户输入一个字符后，**至少经过两帧**才能看到新的匹配结果（前提是匹配足够快）。
 
 ### 3.2 tick — 协调 snapshot 与异步 worker
 
