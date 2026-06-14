@@ -353,6 +353,7 @@ pub enum Layout {
 
       Container(container) → container.area = area
         if layout == Horizontal (上下分):
+          // 水平分栏完全没有间隔线，直接等分高度
           height = area.height / len(children)
           child_y = area.y
           for (i, child) in children.iter().enumerate():
@@ -364,19 +365,21 @@ pub enum Layout {
             stack.push((child, area))
 
         if layout == Vertical (左右分):
-          width = (area.width - gaps) / len(children)
           // 左右分栏之间有 1px 间隔线
           inner_gap = 1
-          total_gap = inner_gap * (len-1)
+          // 注意：total_gap 用 len-2 近似，不是 len-1
+          // 这是一种近似算法：先少估一个 gap，每个孩子后都加 gap
+          // 最后靠最后一个孩子的修正来占满剩余空间
+          total_gap = inner_gap * len.saturating_sub(2)
           used_area = area.width - total_gap
           width = used_area / len
           child_x = area.x
           for (i, child) in children.iter().enumerate():
             area = Rect(x: child_x, y: container.y,
                         w: width, h: container.height)
-            // 最后一个孩子拿走剩余
+            // 最后一个孩子拿走剩余（因此通常比其他孩子略小）
             if i == last: area.width = container.right() - area.x
-            child_x += width + inner_gap  // 加上分隔线宽度
+            child_x += width + inner_gap  // 每个孩子后都跳过分隔线
             stack.push((child, area))
 ```
 
@@ -1219,15 +1222,28 @@ termina = ["dep:termina", "dep:crossterm"]  # Windows 下 term 功能仍需 cros
 
 `CrosstermBackend` (helix-tui/src/backend/crossterm.rs) 基于 crossterm 库，通过 terminfo 数据库查询终端能力。
 
+#### 能力检测时机（分两阶段）
+
+| 能力类型 | 检测时机 | 检测方式 |
+|---------|---------|---------|
+| 扩展下划线、光标重置命令 | **构造时同步检测** | `Capabilities::from_env_or_default()` 读 terminfo + 环境变量 |
+| 键盘增强协议（Kitty Keyboard） | **延迟检测（OnceCell）** | 第一次调用 `supports_keyboard_enhancement_protocol()` 时才探测 |
+| 括号粘贴 | 构造时直接设为 true | 假设支持，crossterm 库内部处理 |
+
+构造时：`CrosstermBackend::new()` → `Capabilities::from_env_or_default(&config)` → 一次性检测 terminfo 中的 Smulx/Su/VTE 版本/WezTerm 等。
+
+键盘增强协议使用 `OnceCell<bool>` 惰性初始化：第一次在 `get_cursor_style` 等方法中需要时才调用 `terminal::supports_keyboard_enhancement()` 探测，之后缓存结果。
+
 #### 核心数据结构
 
 ```rust
 pub struct CrosstermBackend<W: Write> {
     buffer: W,                          // 通常是 Stdout
     config: Config,
-    capabilities: Capabilities,        // 终端能力检测结果
-    reset_cursor_command: String,      // 光标重置序列
-    supports_keyboard_enhancement: bool,
+    capabilities: Capabilities,        // 终端能力检测结果（构造时同步获得）
+    supports_keyboard_enhancement_protocol: OnceCell<bool>,  // 延迟检测（第一次用时才探）
+    mouse_capture_enabled: bool,
+    supports_bracketed_paste: bool,     // 默认 true
 }
 ```
 
@@ -1366,13 +1382,16 @@ struct Capabilities {
        {CSI}c                  ; 查询主设备属性
      ")
   3. flush() 发送到终端
-  4. poll 等待响应（最多 50ms 超时）
+  4. poll 等待响应（最多 100ms 超时，Duration::from_millis(100)）
+     - 收到 Primary Device Attributes 响应后，继续读取所有已缓冲的转义响应
+     - 超时则使用默认值（都不支持）
   5. 根据收到的响应设置 capabilities：
      - 收到 2026 响应 → synchronized_output = true
      - 收到 SGR 查询响应含 true color → true_color = true
      - 收到 SGR 查询响应含 underline color → extended_underlines = true
      - 收到 OSC11 响应 → original_background_color = 解析颜色
-     - 超时 → 使用默认值（都不支持）
+     - 收到 Keyboard ReportFlags → kitty_keyboard = Some
+     - 收到 theme 响应 → theme_mode = Some(mode)
 ```
 
 #### Backend::draw()：同步输出包装 + 状态机压缩
@@ -1501,7 +1520,7 @@ fn end_sychronized_render(&mut self) -> io::Result<()> {
 |------|---------------------------|------------------------------|
 | 底层库 | crossterm | termina |
 | 能力检测方式 | 被动查询 terminfo 数据库 + 环境变量 | 主动发送 CSI 查询序列 + 解析响应 |
-| 能力检测时机 | 每次 draw 前查询 | 启动时一次性探测（带 50ms 超时） |
+| 能力检测时机 | 基本能力：构造时同步检测<br>键盘增强协议：OnceCell 延迟检测 | 启动时一次性探测（带 100ms 超时） |
 | 同步输出 | ❌ 不支持 | ✅ DEC 2026（如终端支持） |
 | 光标位置编码 | `MoveTo(x, y)` 0-based → 终端自动 1-based | `OneBased::from_zero_based(x)` 显式转换 |
 | SGR 属性编码 | `SetColors(colors)` + `SetAttribute(attr)` | `SgrAttributes { foreground, background, modifiers }` 批量 |
@@ -1644,11 +1663,12 @@ Application::render() (helix-term/src/application.rs:255)
 ### 两个垂直分栏（左右分）的宽度怎么算？
 - 在 `Tree::recalculate()` (helix-view/src/tree.rs:408-437) 中：
   - `inner_gap = 1`（左右分栏间 1px 竖线）
-  - `total_gap = inner_gap * (len-1)` = 有几列就有几条分隔线
+  - `total_gap = inner_gap * len.saturating_sub(2)`（用 len-2 近似，不是 len-1）
   - `used_area = editor_area.width - total_gap`
-  - `width = used_area / len(children)`（每个孩子等分）
-  - 最后一个孩子 width 再 += 余数（防止整除后有缝隙）
-  - 每个孩子 x = child_x，child_x += width + inner_gap（下一孩子跳过分隔线）
+  - `width = used_area / len(children)`（每个孩子等分，整数除法）
+  - 每个孩子 x = child_x，child_x += width + inner_gap（每个孩子后都跳过分隔线）
+  - 最后一个孩子 width 修正为占满剩余空间（因此通常比其他孩子略小）
+- 注意：水平分栏（上下分）完全没有间隔线，直接 `height = area.height / len` 等分
 
 ### 如何让某个 View 获得自己的 inner_area（文本区）？
 - 调用 `View::inner_area(doc)`：
@@ -1688,15 +1708,17 @@ Application::render() (helix-term/src/application.rs:255)
 - **测试模式**：`feature = "integration"` 时统一使用 `TestBackend`（内存虚拟终端，不实际输出）
 
 ### TerminaBackend 的能力是怎么检测的？为什么比 CrosstermBackend 强？
-- **CrosstermBackend**：只读 terminfo 数据库 + 环境变量（`$TERM`, `$VTE_VERSION`, `$TERM_PROGRAM`）
-  - 优点：同步、无延迟
-  - 缺点：如果 terminfo 不全/旧，会漏能力
-- **TerminaBackend**：启动时主动发 CSI 查询序列，终端会回发响应（带 100ms 超时）
+- **CrosstermBackend**：分两阶段检测
+  - 基本能力（扩展下划线、光标重置）：**构造时同步**读 terminfo 数据库 + 环境变量（`$TERM`, `$VTE_VERSION`, `$TERM_PROGRAM`）
+  - 键盘增强协议：**延迟检测**（`OnceCell<bool>`，第一次用时才调 `supports_keyboard_enhancement()`）
+  - 优点：基本能力零延迟、同步
+  - 缺点：如果 terminfo 不全/旧，会漏能力；键盘协议第一次调用时有微小延迟
+- **TerminaBackend**：启动时主动发 CSI 查询序列，终端会回发响应（带 100ms 超时，`Duration::from_millis(100)`）
   - 查询的能力包括：
     - `DEC 2026` → 同步输出
     - `?theme` → 主题模式（light/dark）
     - 发 SGR 设置测试颜色，再用 `DECRQSS` 查询回 → 判断真彩色和扩展下划线
     - `OSC 11;?` → 查询终端原有背景色（退出时恢复）
-    - `DECRPSS` + 主设备属性 → 通用探测
+    - 主设备属性 + Kitty 键盘协议查询 → 通用探测
   - 收到响应前用默认值（全不支持），收到后动态升级
   - 所以新终端（如 kitty/WezTerm/Alacritty）在 Linux 下能拿到更好的渲染效果
