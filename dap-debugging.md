@@ -49,13 +49,15 @@ UI 刷新 ← helix-view 事件处理 ← helix-dap Transport 接收 ← Adapter
 
 | 命令 | 别名 | 对应函数 | 说明 |
 |------|------|---------|------|
-| `:debug-start` | `dbg` | [debug_start](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/typed.rs#L2051-L2062) | 使用 stdio 启动本地调试会话，可指定模板名和参数 |
-| `:debug-remote` | `dbg-tcp` | [debug_remote](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/typed.rs#L2064-L2083) | 通过 TCP 地址连接远程 Adapter，再指定模板名和参数 |
+| `:debug-start` | `dbg` | [debug_start](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/typed.rs#L2051-L2062) | 本地启动调试会话（传输方式由 `languages.toml` 中的 `debugger.transport` 配置决定，可能是 stdio 也可能是 tcp），可指定模板名和参数 |
+| `:debug-remote` | `dbg-tcp` | [debug_remote](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/typed.rs#L2064-L2083) | 通过 TCP 地址连接已运行的远程 Adapter，再指定模板名和参数 |
 | `:debug-eval` | （无别名） | [debug_eval](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/typed.rs#L2029-L2049) | 在当前调试上下文（栈帧）中求值表达式，**非启动命令** |
 
 命令参数格式：
 - `:debug-start [模板名] [参数1] [参数2] ...`
 - `:debug-remote [host:port] [模板名] [参数1] [参数2] ...`
+
+> **注意**：不要将命令入口等同于传输类型。`:debug-start` 只是"本地启动"的意思，实际使用 stdio 还是 tcp 取决于 `languages.toml` 中 `debugger.transport` 的配置。
 
 #### 1.1.3 鼠标交互（仅用于设断点，非启动）
 
@@ -118,20 +120,94 @@ dap_start_impl(cx, name, socket, params)
               └─ dap_start_impl 函数此时立即返回 Ok(())，不等待 launch/attach 响应
 ```
 
-### 1.4 Client 创建与连接方式
+### 1.4 传输路径与分发逻辑
 
-[Client::process](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L55-L70) 根据 transport 类型和 socket 参数分发到不同的连接方式：
+所有 Client 的创建都经过 [Registry::start_client](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/registry.rs#L33-L59)，它根据 `socket` 参数是否存在，将请求分发到两条不同的路径：
 
-| 场景 | 方式 | 方法 | 说明 |
-|------|------|------|------|
-| `:debug-start` 或 `Space G l` | `stdio` | [Client::stdio](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L114-L145) | 启动 Adapter 子进程，通过 stdin/stdout 通信，stderr 单独输出到日志 |
-| config.transport="tcp" + port_arg | `tcp` 自启动 | [Client::tcp_process](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L165-L203) | 启动 Adapter 子进程并传入端口参数（如 `--port 12345`），等待 500ms 后 TCP 连接 |
-| `:debug-remote` | `tcp` 远程连接 | [Client::tcp](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L105-L112) | 直接连接远程 Adapter 的 TCP 地址，不启动子进程 |
+```
+Registry::start_client(socket, config)
+   │
+   ├─ socket == Some(addr) → Client::tcp(addr, id)   ← 纯 TCP 连接，不启动进程
+   │
+   └─ socket == None → Client::process(transport, command, args, port_arg, id)
+                          │
+                          ├─ transport=="tcp" && port_arg.is_some()
+                          │    → Client::tcp_process(...)   ← 启动进程 + TCP 连接
+                          │
+                          ├─ transport=="stdio"
+                          │    → Client::stdio(...)        ← 启动进程 + stdio 通信
+                          │
+                          └─ 其他 → 报错 "Incorrect transport"
+```
 
-所有方式最终都汇聚到 [Client::streams](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L72-L103)，它：
+因此，**共有三种实际的传输路径**，它们的触发条件、行为和适用场景各不相同。
+
+#### 1.4.1 路径一：stdio 本地进程通信
+
+**触发条件**：`socket == None` 且 `config.transport == "stdio"`
+
+**方法**：[Client::stdio](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L114-L145)
+
+**行为**：
+- 使用 `helix_stdx::env::which()` 解析 Adapter 可执行文件路径
+- 启动 Adapter 子进程，设置 `kill_on_drop(true)`（Client 销毁时自动杀死进程）
+- 子进程的 stdin/stdout 用于 DAP 协议通信
+- 子进程的 stderr 单独捕获，通过 Transport 层转发为日志输出
+- `client.socket = None`（stdio 模式没有 TCP 端口）
+
+**特点**：最常见的本地调试方式，通信延迟最低，进程生命周期与 Client 绑定。
+
+#### 1.4.2 路径二：tcp 本地进程（自启动 + port_arg）
+
+**触发条件**：`socket == None` 且 `config.transport == "tcp"` 且 `config.port_arg` 不为空
+
+**方法**：[Client::tcp_process](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L165-L203)
+
+**行为**：
+- 先调用 `Self::get_port()` 绑定一个随机可用的本地端口（127.0.0.1:0）
+- 启动 Adapter 子进程，将 port_arg 中的 `{}` 替换为实际端口号作为额外参数传入（如 `--port 12345`）
+- 子进程的 stdin/stdout/stderr 全部设为 null（不由 Helix 接管）
+- **不设置** `kill_on_drop`（注释说明"adapter should exit automatically"）
+- 等待 500ms 让 Adapter 准备就绪
+- 通过 `TcpStream::connect(socket)` 建立 TCP 连接
+- `client.socket = Some(socket)`（保存 TCP 端口地址，供子调试会话复用）
+
+**特点**：适用于某些只能通过 TCP 通信的 Adapter，或需要启动子调试会话的场景。进程生命周期不完全由 Client 控制。
+
+#### 1.4.3 路径三：tcp 远程连接（不启动进程）
+
+**触发条件**：`socket == Some(address)`（即调用方显式传入了 TCP 地址）
+
+**方法**：[Client::tcp](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L105-L112)
+
+**行为**：
+- 直接通过 `TcpStream::connect(addr)` 连接已运行的 Adapter
+- 不启动任何子进程
+- 没有 stderr 捕获
+- `client.process = None`
+- ⚠️ **注意**：此方法不会设置 `client.socket` 字段，`client.socket` 保持为 `None`
+
+**特点**：用于 `:debug-remote` 连接远程或已在运行的 Adapter。由于 `client.socket` 为 None，**无法启动子调试会话**（见 2.6.2 节）。
+
+#### 1.4.4 命令入口与传输路径的对应关系
+
+| 命令入口 | socket 参数 | 实际传输路径 | 说明 |
+|---------|------------|-------------|------|
+| `Space G l` | `None` | 取决于 `config.transport` | 本地启动，传输方式由配置决定 |
+| `:debug-start` | `None` | 取决于 `config.transport` | 同左 |
+| `:debug-remote host:port` | `Some(host:port)` | tcp 远程连接 | 连接已运行的 Adapter |
+| StartDebugging 反向请求 | `Some(父调试器.socket)` | tcp 远程连接（到同一 Adapter） | 子调试会话复用父调试器的 TCP 端口 |
+
+> **关键区分**：命令入口描述的是"用户如何触发"，传输路径描述的是"底层如何通信"。二者不是一一对应的。`:debug-start` 可能走 stdio 也可能走 tcp 本地进程，取决于 `languages.toml` 配置。
+
+#### 1.4.5 统一出口：Client::streams
+
+三种路径最终都汇聚到 [Client::streams](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L72-L103)，它：
 - 创建 `Transport` 层处理底层的消息编解码
 - 启动 `recv` 协程转发 Adapter 消息到上层
 - 返回 `(Client, UnboundedReceiver<(DebugAdapterId, Payload)>)` 对
+
+所有路径创建的 Client 结构在语义上是等价的，上层代码无需关心底层使用哪种传输方式。
 
 ### 1.5 初始化握手协议（initialize）
 
@@ -372,6 +448,76 @@ jobs.callback(async {
 });
 ```
 
+### 2.6 反向请求与子调试会话
+
+DAP 协议是双向的：不仅 Client 可以向 Adapter 发请求，Adapter 也可以向 Client 发**反向请求**（Reverse Request）。Helix 目前处理两种反向请求：`RunInTerminal` 和 `StartDebugging`。
+
+反向请求的通用处理流程（位于 [handlers/dap.rs](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-view/src/handlers/dap.rs#L484-L582)）：
+
+```
+收到 Payload::Request
+  ├─ Request::parse(command, arguments) 解析请求类型
+  ├─ 匹配具体请求类型，执行处理逻辑，返回 Result<Value, Error>
+  └─ 通过 debugger.reply(request.seq, &command, reply) 发回响应
+```
+
+#### 2.6.1 RunInTerminal 反向请求
+
+**触发条件**：
+- Adapter 需要在外部终端中运行被调试程序时发送
+- 常见场景：调试模板中设置了 `runInTerminal: true`（如 `languages.toml` 中的 `"binary (terminal)"` 模板）
+- Helix 需要在 `config.terminal` 中配置了外部终端命令
+
+**处理逻辑**（位于 [handlers/dap.rs](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-view/src/handlers/dap.rs#L486-L512)）：
+1. 检查 `self.config().terminal` 是否配置了外部终端
+2. 使用 `std::process::Command::new` 启动外部终端，传入 Adapter 提供的 `args`
+3. 返回 `RunInTerminalResponse`，包含 `process_id`
+
+**失败处理**：
+- 未配置终端 → `set_error("No external terminal defined")`
+- 启动失败 → `set_error("Error starting external terminal: ...")`
+
+#### 2.6.2 StartDebugging 反向请求（子调试会话）
+
+**触发条件**：
+- Adapter 需要启动一个**子调试会话**（child debug session）时发送
+- 常见场景：调试父进程 fork 出子进程、调试多进程程序时需要同时调试子进程
+- 前置限制：**父调试器必须使用 TCP 传输且 `client.socket` 不为 None**
+
+**处理逻辑**（位于 [handlers/dap.rs](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-view/src/handlers/dap.rs#L513-L572)）：
+
+```
+StartDebugging 请求处理
+  ├─ 1. 从 self.debug_adapters 获取父调试器 Client
+  ├─ 2. 检查 debugger.socket 是否存在
+  │     └─ 若为 None → set_error("Child debugger can only be started if the parent debugger is using TCP transport.")
+  ├─ 3. 获取父调试器的 config（克隆）
+  ├─ 4. 调用 debug_adapters.start_client(Some(socket), &config) 创建子调试器
+  │     └─ 复用父调试器的同一个 TCP socket 地址
+  │        走 Client::tcp 路径（纯 TCP 连接，不启动新进程）
+  ├─ 5. 根据 arguments.request 判断启动方式：
+  │     ├─ ConnectionType::Launch → client.launch(arguments.configuration)
+  │     └─ ConnectionType::Attach → client.attach(arguments.configuration)
+  ├─ 6. 返回 { success: true } 响应
+  └─ 7. 通过 debugger.reply() 将响应发回给 Adapter
+```
+
+**Socket 复用机制**：
+- 子调试器与父调试器连接到**同一个 TCP socket 地址**（同一个 Adapter 进程）
+- Adapter 通过同一个 TCP 连接的不同逻辑通道（由 DAP 协议层区分）与多个 Client 通信
+- 子调试器也会经历完整的 initialize 握手（由 `Registry::start_client` 中的 `block_on(client.initialize())` 保证）
+
+**限制与注意事项**：
+| 限制项 | 说明 |
+|--------|------|
+| 传输方式限制 | 仅 TCP 传输的父调试器可以启动子调试器 |
+| stdio 模式 | 不支持子调试（因为无法在 stdio 上复用多个逻辑连接） |
+| `:debug-remote` | 不支持子调试（因为 `Client::tcp` 创建的 Client 的 `socket` 字段为 None） |
+| 配置来源 | 子调试器复用父调试器的 `DebugAdapterConfig` |
+| 会话数量 | 理论上可以有多个子调试器，由 SlotMap 统一管理 |
+
+> ⚠️ **代码细节**：`Client::tcp` 方法（远程连接路径）不会设置 `client.socket` 字段，因此通过 `:debug-remote` 连接的调试器即使底层是 TCP，也无法启动子调试会话。只有通过 `Client::tcp_process` 路径（本地 tcp+port_arg）创建的 Client 才会设置 `socket` 字段。这是当前实现的一个特性，可能是为了避免远程场景下的端口可达性问题。
+
 ---
 
 ## 三、断点状态管理（Breakpoint State）
@@ -582,7 +728,12 @@ Stopped 事件
 
 | 字段 | 类型 | 用途 |
 |------|------|------|
+| `id` | `DebugAdapterId` | Client 的唯一标识（SlotMap 键） |
+| `_process` | `Option<Child>` | Adapter 子进程（stdio/tcp_process 路径有，tcp 远程连接路径没有） |
+| `server_tx` | `UnboundedSender<Payload>` | 向 Adapter 发送消息的通道 |
+| `request_counter` | `AtomicU64` | 请求序列号计数器 |
 | `caps` | `Option<DebuggerCapabilities>` | Adapter 能力（initialize 后填充） |
+| `socket` | `Option<SocketAddr>` | TCP 端口地址（tcp_process 路径设置，用于子调试会话复用） |
 | `stack_frames` | `HashMap<ThreadId, Vec<StackFrame>>` | 每个线程的栈帧缓存 |
 | `thread_states` | `ThreadStates` (= `HashMap<ThreadId, String>`) | 线程运行状态 |
 | `thread_id` | `Option<ThreadId>` | 当前活跃线程 |
@@ -591,13 +742,14 @@ Stopped 事件
 | `connection_type` | `Option<ConnectionType>` | Launch 或 Attach |
 | `starting_request_args` | `Option<Value>` | 启动参数（用于 restart） |
 | `quirks` | `DebuggerQuirks` | Adapter 的特殊行为适配 |
+| `config` | `Option<DebugAdapterConfig>` | 启动时使用的配置（用于子调试会话复用） |
 
 ### 5.4 反向请求处理
 
-Adapter 可以向 Client 发送反向请求：
+Adapter 可以向 Client 发送反向请求，详细处理逻辑见 2.6 节。总结两种反向请求：
 
-- **RunInTerminal**：Adapter 请求在终端运行程序，Helix 使用配置的外部终端启动进程，返回 process_id
-- **StartDebugging**：Adapter 请求启动子调试会话，Helix 在同一 TCP socket 上创建新的 Client，根据 request 类型执行 launch 或 attach
+- **RunInTerminal**：Adapter 请求在外部终端运行被调试程序。触发条件：调试模板设置了 `runInTerminal: true`，且 Helix 配置了外部终端。
+- **StartDebugging**：Adapter 请求启动子调试会话。触发条件：Adapter 检测到需要调试子进程（如 fork 场景）。限制：父调试器必须通过 tcp_process 路径创建（`client.socket` 不为 None），子调试器复用同一 TCP socket。
 
 ---
 
