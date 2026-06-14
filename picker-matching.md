@@ -160,9 +160,9 @@ Picker 使用 **nucleo** 库（fzf 匹配算法的 Rust 实现）进行核心匹
 
 2. **匹配过程**（在 nucleo 内部线程执行）：
    - 对每个候选项的每个可过滤列执行模糊匹配
-   - 计算匹配得分（0-65535），得分越高越相关
-   - 按得分降序排列结果
-   - 多列匹配时，所有列都必须匹配成功
+   - 计算匹配得分：底层 `nucleo_matcher::Matcher` 的单列匹配返回 `Option<u16>`（0-65535）；高层 `nucleo::MultiPattern::score()` 将各列 `u16` 累加为 `u32`，存入 `Match { score: u32, idx: u32 }`
+   - 按得分降序排列结果（同分 tie breaker 见第 3.3 节）
+   - 多列匹配时，所有 filter=true 的列都必须匹配成功（任一列返回 `None` 即排除）
 
 3. **匹配高亮**：
    在 [render_picker()](helix-term/src/ui/picker.rs#L760-L835) 中获取匹配索引并高亮：
@@ -234,17 +234,49 @@ fn render_picker(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context)
 
 ### 3.3 排序机制
 
-Nucleo 内部的排序规则（基于 FZF 算法）：
+Nucleo 内部的排序在 `nucleo/src/worker.rs` 的 worker 匹配流程中完成，核心是对 `self.matches` 调用并行快速排序 `par_quicksort`：
 
-1. **得分计算**：对每个匹配成功的项计算一个 `u16` 得分，综合考虑：
-   - 匹配字符的连续性（连续匹配得分更高）
-   - 匹配位置（开头匹配得分更高）
-   - 分隔符感知（`/`、`_`、`-` 等分隔符后匹配得分更高，路径模式下 `/` 后匹配加分）
-   - 大小写精确匹配的额外加分
+#### 排序优先级（从高到低）
 
-2. **多列合并**：当有多列匹配时，nucleo 对每列独立计算得分，然后合并为总得分。**所有 filter=true 的列都必须匹配成功**，否则该项被排除。
+1. **得分降序**：`Match.score: u32` 越大越靠前。得分是各列 `u16` 得分之和。
 
-3. **结果顺序**：`snapshot.matched_items()` 返回的结果按总得分**降序**排列，得分相同的项目保持注入顺序（稳定排序）。
+2. **同分 tie breaker — 列文本总长度升序**：得分相同时，比较各列 `matcher_columns` 的 UTF-32 码点总长度，**更短的排在前面**。这体现了"更精确的匹配更相关"的直觉——较短的文本中出现相同数量的匹配字符，匹配密度更高。
+
+3. **长度也相同 — 注入索引升序**：如果连列文本总长度都相同，则按注入索引 `idx` 升序（即先注入的排前面，`reverse_items=false` 时）。
+
+对应源码（`worker.rs` 中 `sort_matches` 的比较闭包）：
+
+```rust
+|match1, match2| {
+    if match1.score != match2.score {
+        return match1.score > match2.score;    // 得分降序
+    }
+    if match1.idx == u32::MAX { return false; } // 已删除项排后面
+    if match2.idx == u32::MAX { return true; }
+    let len1: u32 = item1.matcher_columns.iter()
+        .map(|haystack| haystack.len() as u32).sum();
+    let len2: u32 = item2.matcher_columns.iter()
+        .map(|haystack| haystack.len() as u32).sum();
+    if len1 == len2 {
+        match1.idx < match2.idx                  // 注入索引升序
+    } else {
+        len1 < len2                              // 总长度升序
+    }
+}
+```
+
+> **注意**：这不是稳定排序。`par_quicksort` 不保证相同键的元素保持原始相对顺序。但由于第三优先级是注入索引，实际效果等同于：得分和长度均相同的项按注入顺序排列。
+
+#### 两种得分类型的区分
+
+| 来源 | 得分类型 | 说明 |
+|------|---------|------|
+| `nucleo_matcher::Matcher` 单列匹配 | `Option<u16>` | 底层匹配器，单列单次匹配的原始得分 |
+| `nucleo::MultiPattern::score()` | `Option<u32>` | 高层多列累加得分，各列 `u16` 之和 |
+| `nucleo::Match.score` | `u32` | 匹配结果中的得分字段 |
+| `helix_core::fuzzy::fuzzy_match()` | `Vec<(T, u16)>` | 便捷函数，使用底层 `Atom::match_list()`，返回单列 `u16` 得分 |
+
+`helix_core::fuzzy::fuzzy_match()`（[helix-core/src/fuzzy.rs#L31-L48](helix-core/src/fuzzy.rs#L31-L48)）是 Helix 提供的便捷函数，适用于小规模同步匹配场景（如命令补全），**不适用于** Picker 的大规模异步匹配。它返回 `Vec<(T, u16)>`——元素和得分对，已按得分降序排列。而 Picker 使用的是 `nucleo::Nucleo<T>` 的异步管线，得分类型为 `u32`（多列累加）。
 
 ### 3.4 选中项同步 — cursor 如何跟随匹配结果
 
