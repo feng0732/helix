@@ -625,6 +625,94 @@ pub fn cursor(self, text: RopeSlice) -> usize {
 - `next/prev` 是相对移动，使用 `apply_motion` 以便与其他 motion 行为一致（如扩展选择等）
 - `next` 用正向选区让光标落在诊断最右端，`prev` 用反向选区（见代码注释 [commands.rs#L4182-L4183](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4182-L4183)）让光标落在诊断最左端，两者配合确保连续跳转时不会重复命中同一诊断
 
+##### 零宽诊断（start == end）的边界行为
+
+零宽诊断是指 `diag.range.start == diag.range.end` 的诊断，通常用于表示某个位置（而非一段范围）的提示或警告。文档中的语义注释见 [selection.rs#L40](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-core/src/selection.rs#L40)：
+
+```
+- (1, 1): `S[]ome text`.  ← 零宽选区，位于 S 和 o 之间
+```
+
+**零宽诊断的 cursor() 计算**：
+
+当 `anchor == head` 时（零宽选区），`head > anchor` 为 false，走 `else` 分支：
+
+```rust
+pub fn cursor(self, text: RopeSlice) -> usize {
+    if self.head > self.anchor {
+        prev_grapheme_boundary(text, self.head)
+    } else {
+        self.head  // ← 零宽选区走这个分支
+    }
+}
+```
+
+因此，**零宽诊断无论正向还是反向选区，cursor 都等于 start（= end）**。
+
+| 命令 | 选区构造 | anchor | head | anchor == head | cursor = | 光标落点 |
+|------|---------|--------|------|---------------|----------|---------|
+| first/last/next_diag | `single(start, end)` | start | end（= start） | ✅ 是 | `start` | 诊断位置本身（start = end） |
+| prev_diag | `single(end, start)` | end | start（= end） | ✅ 是 | `start` | 诊断位置本身（start = end） |
+
+**prev_grapheme_boundary 的边界保护**（[graphemes.rs#L126-L161](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-core/src/graphemes.rs#L126-L161)）：
+
+```rust
+match gc.prev_boundary(chunk, chunk_byte_idx) {
+    Ok(None) => return 0,  // ← char_idx == 0 时，直接返回 0，不会出现负数
+    Ok(Some(n)) => { byte_idx = n; break; }
+    ...
+}
+```
+
+当 `char_idx == 0`（文档最开头）时，`prev_boundary` 返回 `None`，函数立即返回 `0`，确保索引不会越界。
+
+**零宽诊断的连续跳转示例**：
+
+```
+诊断 A (零宽): range [15, 15)    诊断 B (零宽): range [30, 30)
+字符:   |...|15|...|30|...
+           A        B
+
+next_diag 正向跳转:
+  步骤 1: 光标在 10
+    查找: A.start(15) > 10 → true，命中 A
+    跳转: single(15, 15) → cursor = head = 15
+    光标落点: 15（A 的位置）
+
+  步骤 2: 再次按 ]d，光标在 15
+    查找: diag.range.start > 15
+      - A.start(15) > 15 → false  ← 不命中 A ✓
+      - B.start(30) > 15 → true   ← 命中 B
+    跳转: single(30, 30) → cursor = 30
+
+prev_diag 反向跳转:
+  步骤 1: 光标在 40
+    反向查找: B.start(30) < 40 → true，命中 B
+    跳转: single(30, 30) → cursor = head = 30
+    光标落点: 30（B 的位置）
+
+  步骤 2: 再次按 [d，光标在 30
+    反向查找: diag.range.start < 30
+      - B.start(30) < 30 → false  ← 不命中 B ✓
+      - A.start(15) < 30 → true   ← 命中 A
+    跳转: single(15, 15) → cursor = 15
+```
+
+**零宽诊断不重复命中的关键**：
+- `next_diag` 查找条件 `start > cursor`：跳转后 cursor = start，因此 `start > start` 为 false，不会重复命中
+- `prev_diag` 查找条件 `start < cursor`：跳转后 cursor = start，因此 `start < start` 为 false，不会重复命中
+
+**零宽诊断与非零宽诊断的对比总结**：
+
+| 维度 | 非零宽诊断 (start < end) | 零宽诊断 (start == end) |
+|------|------------------------|------------------------|
+| Range 语义 | 覆盖一段字符范围 [start, end) | 标记字符间的一个位置 |
+| 正向选区 cursor | `prev_grapheme_boundary(end)` = 范围最右端字符 | `start` = 位置本身 |
+| 反向选区 cursor | `start` = 范围最左端 | `start` = 位置本身 |
+| next 不重复命中 | cursor = end-1 ≥ start → `start > cursor` 为 false | cursor = start → `start > cursor` 为 false |
+| prev 不重复命中 | cursor = start → `start < cursor` 为 false | cursor = start → `start < cursor` 为 false |
+| 文档开头边界 | prev_grapheme_boundary(0) 返回 0（安全） | 直接为 0（安全） |
+
 #### 4.5.4 与普通光标移动的对比
 
 | 步骤 | 普通光标移动 | 诊断跳转（immediately_show） |
