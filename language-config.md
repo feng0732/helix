@@ -73,8 +73,8 @@ source = { git = "https://github.com/tree-sitter/tree-sitter-rust", rev = "..." 
 | `[[language]].name` | `LanguageConfiguration.language_id` | `helix-core/src/syntax/config.rs:30` | 语言唯一标识 |
 | `[[language]].language-id` | `LanguageConfiguration.language_server_language_id` | `helix-core/src/syntax/config.rs:33` | 发给 LSP 的 `textDocument/didOpen` 中的 languageId |
 | `[[language]].grammar` | `LanguageConfiguration.grammar` | `helix-core/src/syntax/config.rs:70` | 指向 `[[grammar]].name`，默认等于 `language_id` |
-| `[[language]].language-servers[i]`（简写字符串） | `LanguageServerFeatures.name` | `helix-core/src/syntax/config.rs:372` | 对应 `[language-server]` 的 key |
-| `[[language]].language-servers[i].name`（表形式） | `LanguageServerFeatures.name` | `helix-core/src/syntax/config.rs:372` | 同上 |
+| `[[language]].language-servers[i]`（简写字符串） | `LanguageServerFeatures.name`（经 `deserialize_lang_features` 反序列化） | `helix-core/src/syntax/config.rs:383-396` | 对应 `[language-server]` 的 key |
+| `[[language]].language-servers[i].name`（表形式） | `LanguageServerFeatures.name`（经 `deserialize_lang_features` 反序列化） | `helix-core/src/syntax/config.rs:397-405` | 同上 |
 | `[[language]].language-servers[i].only-features` | `LanguageServerFeatures.only` | `helix-core/src/syntax/config.rs:373` | 特性白名单 |
 | `[[language]].language-servers[i].except-features` | `LanguageServerFeatures.excluded` | `helix-core/src/syntax/config.rs:374` | 特性黑名单 |
 | `[language-server].<key>` | `Configuration.language_server` 的 HashMap key | `helix-core/src/syntax/config.rs:20` | LSP 全局配置 |
@@ -139,11 +139,19 @@ helix-term/src/main.rs
 
 **合并算法细节**（`helix-loader/src/lib.rs:207` `merge_toml_values`）：
 - 深度参数为 3：`[[language]]` / `[language-server]` 顶层（depth=3）→ 字段层（depth=2）→ 子表层（depth=1）会递归合并
-- 例：`[[language]].language-server = { command = "taplo", args = ["..."] }`
-  - `language-server` 表在 depth=2，其下的 `command` / `args` 在 depth=1，**会分别合并**，更深层直接覆盖
+- 例1（`[language-server]` 表合并）：`[language-server].taplo = { command = "taplo", args = ["lsp", "stdio"] }`
+  - 顶层 `[language-server]` 表在 depth=3
+  - 其下的 key `taplo` 在 depth=2
+  - key 的值 `{ command = "...", args = "..." }` 在 depth=1，**会分别合并**，更深层直接覆盖
+- 例2（`[[language]].language-servers` 数组合并）：`language-servers = [ "taplo", { name = "tombi", only-features = ["format"] } ]`
+  - 顶层 `[[language]]` 表在 depth=3
+  - `language-servers` 字段在 depth=2，值是数组
+  - 数组成员是字符串或表，在 depth=1，按 `name` 字段匹配合并
 - 数组合并通过 `name` 字段匹配（`get_name` 函数，`helix-loader/src/lib.rs:210`）：同名条目深度减 1 递归合并，不同名条目追加
 - 表合并：key 相同则深度减 1 递归合并，key 不同则直接插入
 - 其他类型（字符串、数字、布尔）：右值直接覆盖左值
+
+> 注意：`merge_toml_values` 函数上方注释（第 184-206 行）中的示例使用了过时的 `language-server` 字段名，实际已改为 `language-servers` 数组 + `[language-server]` 顶层表的双层结构。
 
 **注意**：折叠顺序是 `fold(default, |a, b| merge(a, b))`，即
 1. 第 1 步：`a = default`, `b = global` → 结果 = global 覆盖 default
@@ -153,14 +161,14 @@ helix-term/src/main.rs
 **信任状态如何影响 LSP 自动启动**：
 1. 启动时 `user_lang_loader(insecure)` 决定是否合并工作区 `languages.toml`
 2. 打开文档后，如果没有 LSP 自动启动，`DocumentDidOpen` hook 会触发 prompt 函数（`helix-term/src/handlers/workspace_trust.rs:36`）
-3. 用户选择 "AllowAlways" 后，路径写入 `data_dir()/trusted_workspaces`（`helix-loader/src/lib.rs:168`）
+3. 用户选择 "AllowAlways" 后，路径写入 `data_dir()/trusted_workspaces`（`helix-loader/src/lib.rs:167`）
 4. 下次启动时 `quick_query_workspace()` 返回 Trusted，工作区配置生效，LSP 自动启动
 
 **信任相关文件路径**（由 `helix-loader/src/lib.rs` 定义）：
-- 信任列表：`workspace_trust_file()`（第 168 行） → `data_dir()/trusted_workspaces`
-- 排除列表：`workspace_exclude_file()`（第 172 行） → `data_dir()/excluded_workspaces`
-- 工作区配置：`workspace_lang_config_file()`（第 156 行） → `<workspace>/.helix/languages.toml`
-- 全局配置：`lang_config_file()`（第 160 行） → `config_dir()/languages.toml`
+- 信任列表：`workspace_trust_file()`（第 167 行） → `data_dir()/trusted_workspaces`
+- 排除列表：`workspace_exclude_file()`（第 171 行） → `data_dir()/excluded_workspaces`
+- 工作区配置：`workspace_lang_config_file()`（第 155 行） → `<workspace>/.helix/languages.toml`
+- 全局配置：`lang_config_file()`（第 159 行） → `config_dir()/languages.toml`
 
 ### 2.4 Configuration 数据结构
 
@@ -634,10 +642,13 @@ runtime/
 | `[[language]].name` | `LanguageConfiguration.language_id` | `helix-core/src/syntax/config.rs:30` |
 | `[[language]].grammar` | `LanguageConfiguration.grammar` | `helix-core/src/syntax/config.rs:70` |
 | `[[language]].grammar` → 默认 `[[language]].name` | `get_language(parser_name)` 的参数 | `helix-core/src/syntax.rs:72` |
-| `[[language]].language-servers[i]`（字符串） | `LanguageServerFeatures.name` | `helix-core/src/syntax/config.rs:393` |
-| `[[language]].language-servers[i].name`（表） | `LanguageServerFeatures.name` | `helix-core/src/syntax/config.rs:402` |
-| `LanguageServerFeatures.name` | `language_server_configs().get(name)` 的 key | `helix-lsp/src/lib.rs:631` |
-| `[language-server].<key>` | `Configuration.language_server` 的 HashMap key | `helix-core/src/syntax/config.rs:20` |
+| `[[language]].language-servers[i]`（简写字符串 `"taplo"`） | `LanguageServerFeatures.name`（经 `deserialize_lang_features` 反序列化） | `helix-core/src/syntax/config.rs:383-396` |
+| `[[language]].language-servers[i].name`（表形式 `{ name = "taplo" }`） | `LanguageServerFeatures.name`（经 `deserialize_lang_features` 反序列化） | `helix-core/src/syntax/config.rs:397-405` |
+| `LanguageServerFeatures.name` | `language_server_configs().get(name)` 的 key（LSP 启动时查找） | `helix-lsp/src/lib.rs:630` |
+| `[language-server].<key>` | `Configuration.language_server` 的 HashMap key（`Loader::new` 时存入） | `helix-core/src/syntax/config.rs:20` |
+| `[language-server].<key>.command` | `LanguageServerConfiguration.command`（LSP 启动参数） | `helix-core/src/syntax/config.rs:437` |
+| `[language-server].<key>.args` | `LanguageServerConfiguration.args`（LSP 启动参数） | `helix-core/src/syntax/config.rs:438` |
+| `[language-server].<key>.config` | `LanguageServerConfiguration.config`（initializationOptions） | `helix-core/src/syntax/config.rs:441` |
 | `[[grammar]].name` | `GrammarConfiguration.grammar_id` | `helix-loader/src/grammar.rs:46` |
 | `GrammarConfiguration.grammar_id` | 动态库文件名 `grammars/<id>.dll` | `helix-loader/src/grammar.rs:75` |
 | `LanguageConfiguration.language_id` | 查询目录 `queries/<id>/` | `helix-loader/src/grammar.rs:719` |
@@ -649,9 +660,12 @@ runtime/
 |----------|----------|
 | 工作区信任检查（决定是否读 workspace languages.toml） | `helix-loader/src/config.rs:17` |
 | insecure 模式绕过信任检查 | `helix-loader/src/workspace_trust.rs:143` |
-| 信任列表文件路径 | `helix-loader/src/lib.rs:168` `workspace_trust_file()` |
-| 工作区 languages.toml 路径 | `helix-loader/src/lib.rs:156` `workspace_lang_config_file()` |
-| 打开文档后检查信任并提示 | `helix-term/src/handlers/workspace_trust.rs:24` |
+| 信任列表文件路径 | `helix-loader/src/lib.rs:167` `workspace_trust_file()` |
+| 排除列表文件路径 | `helix-loader/src/lib.rs:171` `workspace_exclude_file()` |
+| 工作区 languages.toml 路径 | `helix-loader/src/lib.rs:155` `workspace_lang_config_file()` |
+| 全局 languages.toml 路径 | `helix-loader/src/lib.rs:159` `lang_config_file()` |
+| 打开文档后检查信任并提示（DocumentDidOpen hook） | `helix-term/src/handlers/workspace_trust.rs:24-29` |
 | merge 右值覆盖左值，优先级：workspace > global > default | `helix-loader/src/config.rs:32` `fold(default, ...)` |
 | merge 深度 3 层递归合并 | `helix-loader/src/lib.rs:207` `merge_toml_values` |
 | 数组通过 `name` 字段匹配合并 | `helix-loader/src/lib.rs:210-223` `get_name()` |
+| LSP 启动时用 name 查找配置 | `helix-lsp/src/lib.rs:630` `.get(&name)` |
