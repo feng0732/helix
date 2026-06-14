@@ -17,10 +17,10 @@ helix-term         ← 命令入口、UI 渲染、键盘映射（终端交互层
 数据流方向：
 
 ```
-用户按键 → helix-term 命令 → helix-view/editor 状态变更 → helix-dap Client 发请求
-                                                                        ↓
-                                                            DAP Adapter 进程 (stdio/TCP)
-                                                                        ↓
+用户按键/命令 → helix-term 命令层 → helix-view/editor 状态变更 → helix-dap Client 发请求
+                                                                           ↓
+                                                             DAP Adapter 进程 (stdio/TCP)
+                                                                           ↓
 UI 刷新 ← helix-view 事件处理 ← helix-dap Transport 接收 ← Adapter 响应/事件
 ```
 
@@ -28,74 +28,245 @@ UI 刷新 ← helix-view 事件处理 ← helix-dap Transport 接收 ← Adapter
 
 ## 一、会话启动（Session Startup）
 
-### 1.1 入口：用户触发
+### 1.1 入口：所有可用的启动方式
 
-会话启动有两个入口：
+用户可以通过以下三类入口触发调试会话启动，它们最终都汇聚到同一个核心函数 `dap_start_impl`。
 
-- **键盘快捷键** `G l`（Space 下 `G` 进入 Debug 菜单，`l` 启动）：映射到 [dap_launch](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L234-L287)
-- **命令行** `:debug` 或 `:debug-remote`：定义在 [typed.rs](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/typed.rs)，最终都调用 [dap_start_impl](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L116-L187)
+#### 1.1.1 键盘快捷键（Space 菜单）
+
+在 Normal 模式下按 **`Space`** 进入 Space 菜单，再按 **`G`** 进入 Debug 子菜单（该子菜单标记为 `sticky=true`，即进入后可连续执行操作，无需每次重新按 Space）。
+
+启动相关的按键如下（位于 [keymap/default.rs](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/keymap/default.rs#L239-L259)）：
+
+| 按键序列 | 对应函数 | 说明 |
+|---------|---------|------|
+| `Space G l` | [dap_launch](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L234-L287) | 通过交互式 Picker 选择调试模板并启动 |
+| `Space G r` | [dap_restart](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L289-L317) | 重启当前调试会话（需 Adapter 支持 restart 能力） |
+
+#### 1.1.2 命令行（Typed 命令）
+
+在 Normal 模式下按 `:` 进入命令行，可以使用以下调试相关命令（位于 [commands/typed.rs](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/typed.rs#L3598-L3630)）：
+
+| 命令 | 别名 | 对应函数 | 说明 |
+|------|------|---------|------|
+| `:debug-start` | `dbg` | [debug_start](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/typed.rs#L2051-L2062) | 使用 stdio 启动本地调试会话，可指定模板名和参数 |
+| `:debug-remote` | `dbg-tcp` | [debug_remote](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/typed.rs#L2064-L2083) | 通过 TCP 地址连接远程 Adapter，再指定模板名和参数 |
+| `:debug-eval` | （无别名） | [debug_eval](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/typed.rs#L2029-L2049) | 在当前调试上下文（栈帧）中求值表达式，**非启动命令** |
+
+命令参数格式：
+- `:debug-start [模板名] [参数1] [参数2] ...`
+- `:debug-remote [host:port] [模板名] [参数1] [参数2] ...`
+
+#### 1.1.3 鼠标交互（仅用于设断点，非启动）
+
+左键点击 gutter 区域可以切换断点（见 [ui/editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/ui/editor.rs#L1260-L1276)），但无法启动会话。
 
 ### 1.2 启动流程详解
 
-以 `dap_launch` 为例，完整链路如下：
+根据入口不同，启动流程分为两条路径，但核心都是 `dap_start_impl`。
+
+#### 1.2.1 路径一：键盘 `Space G l` → dap_launch
+
+[dap_launch](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L234-L287) 是交互式启动：
 
 ```
 dap_launch()
-  ├─ 1. 检查是否已有活跃调试器（同一时间只允许一个）
-  ├─ 2. 从当前文档的 language_config 中获取 DebugAdapterConfig
-  ├─ 3. 展示 Picker 让用户选择 DebugTemplate
-  │     └─ 若 template 有 completion 字段 → 弹出 Prompt 逐项收集参数
-  │         └─ debug_parameter_prompt() 循环收集，最后调用 dap_start_impl()
-  └─ 4. 若无 completion → 直接调用 dap_start_impl()
+  ├─ 1. 检查 editor.debug_adapters.get_active_client()，已有活跃调试器则报错返回
+  ├─ 2. 从当前文档 language_config().debugger 获取 DebugAdapterConfig
+  │     └─ 若不存在 → set_error("No debug adapter available for language") 并返回
+  ├─ 3. 构建 Picker 列出 config.templates 供用户选择
+  └─ 4. 用户选择模板后：
+        ├─ 若 template.completion 为空 → 直接调用 dap_start_impl(cx, Some(&name), None, None)
+        └─ 若 template.completion 非空 → 通过 debug_parameter_prompt() 逐项弹出 Prompt 收集参数
+               └─ 参数收集完成后 → 调用 dap_start_impl(cx, Some(&name), None, Some(params))
+```
+
+#### 1.2.2 路径二：命令行 `:debug-start` / `:debug-remote` → debug_start / debug_remote
+
+这两个函数直接解析命令行参数并调用 `dap_start_impl`。区别在于 `debug_remote` 第一个参数是 TCP 地址（解析为 SocketAddr 传入 socket 参数），而 `debug_start` 的 socket 参数为 None。
+
+两个函数最终都调用：
+```rust
+dap_start_impl(cx, name.as_deref(), socket /* None 或 Some(address) */, Some(args))
 ```
 
 ### 1.3 dap_start_impl 核心逻辑
 
-[dap_start_impl](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L116-L187) 做了以下关键步骤：
+[dap_start_impl](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L116-L187) 是所有启动路径的汇合点，执行以下关键步骤：
 
-1. **启动 Client**：调用 `editor.debug_adapters.start_client(socket, config)`
-   - 内部通过 [Registry::start_client](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/registry.rs#L33-L59) 创建 Client
-   - 根据 transport 类型选择 `stdio` 或 `tcp` 方式连接 Adapter 进程
-   - 立即发送 `initialize` 请求，获取 Adapter 的 `DebuggerCapabilities`
-   - 将 Client 的 incoming receiver 注册到 Registry 的 `SelectAll` 流中
-
-2. **组装 launch/attach 参数**：将 DebugTemplate 的 args 与用户输入的参数合并，插入 `cwd`
-
-3. **发送 launch 或 attach 请求**：根据 template.request 判断是 `"launch"` 还是 `"attach"`，通过 `dap_callback` 异步执行
+```
+dap_start_impl(cx, name, socket, params)
+  │
+  ├─ 步骤 A：创建 Client 并完成 initialize 握手（同步阻塞）
+  │     ├─ editor.debug_adapters.start_client(socket, config)
+  │     │    └─ Registry::start_client → Client 创建（见 1.4 节）
+  │     │       ├─ 启动 Transport 层建立 stdio/TCP 连接
+  │     │       ├─ block_on(client.initialize())  ← **同步等待 initialize 响应**
+  │     │       └─ 将 Client 的 receiver 注册到 Registry.incoming 流
+  │     └─ 此处已拿到 DebugAdapterId，Adapter 能力已存入 client.caps
+  │
+  ├─ 步骤 B：选择 DebugTemplate 并组装参数
+  │     ├─ 根据 name 在 config.templates 中查找（name=None 则取第一个）
+  │     ├─ 将 template.args 与 params 合并（支持 {0}/{1} 占位符替换）
+  │     └─ 插入 cwd = 当前工作目录
+  │
+  └─ 步骤 C：异步发送 launch 或 attach 请求（非阻塞）
+        ├─ 根据 template.request 判断：
+        │     "launch" → debugger.launch(args)
+        │     "attach" → debugger.attach(args)
+        └─ 通过 dap_callback() 将 Future 提交给 Jobs 系统异步执行
+              └─ dap_start_impl 函数此时立即返回 Ok(())，不等待 launch/attach 响应
+```
 
 ### 1.4 Client 创建与连接方式
 
-[Client::process](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L55-L70) 根据 transport 类型分发：
+[Client::process](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L55-L70) 根据 transport 类型和 socket 参数分发到不同的连接方式：
 
-| 方式 | 方法 | 说明 |
-|------|------|------|
-| `stdio` | [Client::stdio](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L114-L145) | 启动 Adapter 子进程，通过 stdin/stdout 通信 |
-| `tcp` + port_arg | [Client::tcp_process](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L165-L203) | 启动 Adapter 子进程并传入端口参数，再 TCP 连接 |
-| `tcp` (远程) | [Client::tcp](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L105-L112) | 直接连接远程 Adapter 地址（`:debug-remote` 命令） |
+| 场景 | 方式 | 方法 | 说明 |
+|------|------|------|------|
+| `:debug-start` 或 `Space G l` | `stdio` | [Client::stdio](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L114-L145) | 启动 Adapter 子进程，通过 stdin/stdout 通信，stderr 单独输出到日志 |
+| config.transport="tcp" + port_arg | `tcp` 自启动 | [Client::tcp_process](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L165-L203) | 启动 Adapter 子进程并传入端口参数（如 `--port 12345`），等待 500ms 后 TCP 连接 |
+| `:debug-remote` | `tcp` 远程连接 | [Client::tcp](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L105-L112) | 直接连接远程 Adapter 的 TCP 地址，不启动子进程 |
 
 所有方式最终都汇聚到 [Client::streams](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L72-L103)，它：
-- 创建 Transport 层处理底层的消息编解码
+- 创建 `Transport` 层处理底层的消息编解码
 - 启动 `recv` 协程转发 Adapter 消息到上层
 - 返回 `(Client, UnboundedReceiver<(DebugAdapterId, Payload)>)` 对
 
-### 1.5 初始化握手协议
+### 1.5 初始化握手协议（initialize）
 
-DAP 规范要求在 launch/attach 之前先完成 initialize。在 [Registry::start_client](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/registry.rs#L53-L54) 中：
+DAP 规范要求所有操作之前先完成 initialize 握手。在 Helix 中，这个握手是 **同步阻塞**执行的，发生在 [Registry::start_client](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/registry.rs#L53-L54)：
 
 ```rust
 block_on(client.initialize(config.name.clone()))?;
 client.quirks = config.quirks.clone();
 ```
 
-[Client::initialize](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L371-L392) 发送 `InitializeArguments`，声明 Helix 的客户端能力（如 `supports_run_in_terminal_request`、`supports_progress_reporting` 等），Adapter 返回 `DebuggerCapabilities` 存入 `client.caps`。
+时序如下：
 
-### 1.6 会话启动后的 "Initialized" 事件流
+```
+Helix (Client)                          DAP Adapter
+     │                                       │
+     │  ① 请求：initialize                   │
+     │  ──────────────────────────────────► │
+     │     (client_id="hx", adapter_id,     │
+     │      supports_run_in_terminal=true,  │
+     │      supports_progress_reporting=...) │
+     │                                       │
+     │  ② 响应：DebuggerCapabilities         │
+     │  ◄────────────────────────────────── │
+     │     (存入 client.caps)                │
+     │                                       │
+```
 
-Adapter 在准备好接收配置时会发送 `Initialized` 事件。[handle_debugger_message](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-view/src/handlers/dap.rs#L375-L396) 处理此事件时：
+[Client::initialize](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L371-L392) 发送 `InitializeArguments`，声明 Helix 作为调试客户端的能力：
+- `client_id/client_name = "hx"/"helix"`
+- `lines_start_at_one/columns_start_at_one = true`（行列从 1 开始计数）
+- `path_format = "path"`
+- `supports_variable_type = true`
+- `supports_run_in_terminal_request = true`（允许 Adapter 反向请求在终端运行程序）
+- `supports_progress_reporting = true`
 
-1. 遍历 `editor.breakpoints` 中已有的断点，逐一调用 `breakpoints_changed()` 同步给 Adapter
-2. 调用 `debugger.configuration_done()` 通知 Adapter 配置完成
-3. 调用 `debug_adapters.set_active_client(id)` 标记当前活跃调试器
+Adapter 返回 `DebuggerCapabilities`，存入 `client.caps`，后续操作（如条件断点、exception breakpoint 等）会根据这些能力判断是否可用。
+
+**关键注意**：initialize 是 block_on 同步执行的，在其返回之前，Helix 主循环被阻塞，不会处理用户输入或渲染。这保证了后续 launch/attach 请求发送时，Adapter 能力已经确定。
+
+### 1.6 launch/attach 请求的异步发送
+
+initialize 完成后，`dap_start_impl` 根据 `DebugTemplate.request` 字段的值（`"launch"` 或 `"attach"`）通过 [dap_callback](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L94-L114) 异步提交请求：
+
+```rust
+match &template.request[..] {
+    "launch" => {
+        let call = debugger.launch(args);
+        dap_callback(cx.jobs, call, callback);   // 异步执行，立即返回
+    }
+    "attach" => {
+        let call = debugger.attach(args);
+        dap_callback(cx.jobs, call, callback);   // 异步执行，立即返回
+    }
+    request => bail!("Unsupported request '{}'", request),
+};
+// dap_start_impl 立即返回 Ok(())
+```
+
+[Client::launch](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L410-L414) 和 [Client::attach](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-dap/src/client.rs#L416-L420) 除了发送 DAP 请求外，还会设置：
+- `connection_type = Some(ConnectionType::Launch)` 或 `ConnectionType::Attach`
+- `starting_request_args = Some(args.clone())`（用于后续 restart）
+
+### 1.7 Initialized 事件与配置完成
+
+Adapter 在 launch/attach 请求处理完成、**准备好接收配置**（如断点、异常过滤）时，会发送 `Initialized` **事件**（注意是 Event 不是 Response）。
+
+[handle_debugger_message](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-view/src/handlers/dap.rs#L375-L396) 处理 `Initialized` 事件时，完成最后的配置阶段：
+
+```
+Initialized 事件处理
+  ├─ 1. set_status("Debugger initialized...")
+  ├─ 2. 同步已有断点：
+  │     └─ 遍历 editor.breakpoints 中所有文件的断点
+  │        └─ 对每个 path 调用 breakpoints_changed(debugger, path, breakpoints)
+  │              └─ 发送 setBreakpoints 请求给 Adapter
+  ├─ 3. 发送 configurationDone 请求（仅当 Adapter 支持时）
+  │     └─ 通知 Adapter：所有初始配置已发送完毕，可以开始执行被调试程序
+  ├─ 4. 成功则 set_status("Debugged application started")
+  └─ 5. debug_adapters.set_active_client(id)  ← 标记当前 Client 为活跃调试器
+```
+
+这一步完成后，调试会话才算真正建立，用户可以进行步进、查看变量等操作。
+
+### 1.8 启动全流程时序图
+
+综合 1.3–1.7 节，完整时序如下：
+
+```
+用户输入
+   │
+   ▼
+dap_start_impl()
+   │
+   ├─► Registry::start_client() ──┐
+   │     （同步阻塞）              │
+   │                               │
+   │          ┌────────────────────┴────────────┐
+   │          │  ① Transport 建立连接            │
+   │          │     stdio / TCP                  │
+   │          │                                   │
+   │          │  ② block_on(initialize)          │
+   │          │     Client → "initialize"        │
+   │          │     Adapter → DebuggerCapabilities│
+   │          │     存入 client.caps             │
+   │          └────────────────────┬────────────┘
+   │                               │
+   ├─ 选择 DebugTemplate、组装参数
+   │
+   ├─► dap_callback(launch/attach) ──┐
+   │     （异步提交，立即返回）       │
+   │                                  │
+   │          ┌───────────────────────┴──────────────┐
+   │          │  ③ Client → "launch" 或 "attach"      │
+   │          │     （异步，通过 Jobs 调度）          │
+   │          └───────────────────────┬──────────────┘
+   │                                  │
+dap_start_impl 返回 Ok(())            │
+   ▼                                  │
+（主循环继续处理事件）                 │
+                                      │
+          ┌───────────────────────────┴───────────────┐
+          │  ④ Adapter → "initialized" 事件           │
+          │     （通过 Registry.incoming 流到达）      │
+          └───────────────────────────┬───────────────┘
+                                      │
+                                      ▼
+                       handle_debugger_message()
+                       ├─ 同步已有断点 → setBreakpoints
+                       ├─ configurationDone
+                       ├─ set_status("Debugged application started")
+                       └─ set_active_client(id)
+                                      │
+                                      ▼
+                              调试会话就绪
+```
 
 ---
 
@@ -116,7 +287,7 @@ Adapter 在准备好接收配置时会发送 `Initialized` 事件。[handle_debu
 
 ```rust
 pub enum Payload {
-    Event(Event),      // Adapter → Client 的单向通知（如 stopped、continued）
+    Event(Event),      // Adapter → Client 的单向通知（如 stopped、continued、initialized）
     Response(Response), // Adapter 对 Client 请求的响应
     Request(Request),   // Adapter → Client 的反向请求（如 runInTerminal）
 }
@@ -228,8 +399,8 @@ pub struct Breakpoint {
 
 有两种方式设置断点：
 
-1. **键盘命令** `G b`：[dap_toggle_breakpoint](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L390-L402) 在当前光标行切换断点
-2. **鼠标点击 gutter**：[ui/editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/ui/editor.rs#L1273) 中，左键点击 gutter 区域时调用 `dap_toggle_breakpoint_impl`
+1. **键盘命令** `Space G b`：[dap_toggle_breakpoint](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L390-L402) 在当前光标行切换断点
+2. **鼠标点击 gutter**：[ui/editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/ui/editor.rs#L1260-L1276) 中，左键点击 gutter 区域时调用 `dap_toggle_breakpoint_impl`
 
 ### 3.3 断点切换逻辑
 
@@ -309,26 +480,30 @@ Adapter 可以通过 `Breakpoint` 事件主动通知断点状态变化，[handle
 - `ProgressStart/Update/End` → 进度信息
 - `Initialized` 事件 → `"Debugger initialized..."` → `"Debugged application started"`
 
-### 4.5 调试操作与界面联动
+### 4.5 调试操作与界面联动（完整键盘映射）
 
-| 操作 | 快捷键 | 函数 | 界面效果 |
-|------|--------|------|----------|
-| 启动调试 | `G l` | dap_launch | 弹出模板选择 Picker |
-| 切换断点 | `G b` | dap_toggle_breakpoint | gutter 显示/隐藏断点标记 |
-| 继续执行 | `G c` | dap_continue | 清除暂停指示器 |
-| 暂停 | `G h` | dap_pause | 弹出线程 Picker |
-| 单步进入 | `G i` | dap_step_in | 清除暂停指示器，等待 Stopped 事件 |
-| 单步跳出 | `G o` | dap_step_out | 同上 |
-| 单步跳过 | `G n` | dap_next | 同上 |
-| 查看变量 | `G v` | dap_variables | 弹出变量 Popup |
-| 终止调试 | `G t` | dap_terminate | 清除断点验证状态 |
-| 编辑条件 | `G C-c` | dap_edit_condition | 弹出条件输入 Prompt |
-| 编辑日志 | `G C-l` | dap_edit_log | 弹出日志消息 Prompt |
-| 切换线程 | `G s t` | dap_switch_thread | 弹出线程 Picker |
-| 切换栈帧 | `G s f` | dap_switch_stack_frame | 弹出栈帧 Picker |
-| 启用异常 | `G e` | dap_enable_exceptions | 设置异常断点过滤器 |
-| 禁用异常 | `G E` | dap_disable_exceptions | 清除异常断点过滤器 |
-| 重启调试 | `G r` | dap_restart | 重启当前调试会话 |
+Normal 模式下按 **`Space G`** 进入 Debug sticky 子菜单，以下是该子菜单下所有可用操作（见 [keymap/default.rs](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/keymap/default.rs#L239-L259)）：
+
+| 操作 | 子菜单内按键 | 函数 | 界面效果 |
+|------|------------|------|----------|
+| 启动调试 | `l` | [dap_launch](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L234-L287) | 弹出模板选择 Picker |
+| 重启调试 | `r` | [dap_restart](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L289-L317) | 重启当前调试会话 |
+| 切换断点 | `b` | [dap_toggle_breakpoint](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L390-L402) | gutter 显示/隐藏断点标记 |
+| 继续执行 | `c` | [dap_continue](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L430-L447) | 清除暂停指示器 |
+| 暂停 | `h` | [dap_pause](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L449-L458) | 弹出线程 Picker |
+| 单步进入 | `i` | [dap_step_in](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L460-L473) | 清除暂停指示器，等待 Stopped 事件 |
+| 单步跳出 | `o` | [dap_step_out](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L475-L487) | 同上 |
+| 单步跳过 | `n` | [dap_next](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L489-L501) | 同上 |
+| 查看变量 | `v` | [dap_variables](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L503-L585) | 弹出变量 Popup |
+| 终止调试 | `t` | [dap_terminate](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L587-L608) | 清除断点验证状态 |
+| 编辑条件 | `C-c` | [dap_edit_condition](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L644-L683) | 弹出条件输入 Prompt |
+| 编辑日志 | `C-l` | [dap_edit_log](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L685-L723) | 弹出日志消息 Prompt |
+| 切换线程 | `s t` | [dap_switch_thread](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L725-L729) | 弹出线程 Picker |
+| 切换栈帧 | `s f` | [dap_switch_stack_frame](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L730-L783) | 弹出栈帧 Picker |
+| 启用异常 | `e` | [dap_enable_exceptions](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L610-L627) | 设置异常断点过滤器 |
+| 禁用异常 | `E` | [dap_disable_exceptions](file:///d:/fz/0601/solo-dogfeeding/code/277-helix/helix-term/src/commands/dap.rs#L629-L641) | 清除异常断点过滤器 |
+
+**注意**：因为 Debug 子菜单 `sticky=true`，进入 `Space G` 后可以连续按键。例如按 `Space G` 进入 Debug 菜单后，直接按 `b` 切换断点，再按 `n` 单步跳过，无需每次都按 `Space G`。
 
 ### 4.6 Stopped 事件后的界面联动
 
@@ -364,15 +539,15 @@ Stopped 事件
 ### 5.1 完整的调试会话生命周期
 
 ```
-1. 用户按 G l → dap_launch
+1. 用户按 Space G l → dap_launch
    ↓
 2. 选择 DebugTemplate → dap_start_impl
    ↓
-3. Registry::start_client → 创建 Client → Transport 启动 → initialize 请求
+3. Registry::start_client → 创建 Client → Transport 启动 → block_on(initialize) ← 同步握手
    ↓
-4. Client::launch/attach → 异步等待响应
+4. Client::launch/attach → 异步通过 dap_callback 提交 → dap_start_impl 返回
    ↓
-5. Adapter 发送 Initialized 事件
+5. Adapter 发送 Initialized 事件（通过 Registry.incoming 流）
    ↓
 6. handle_debugger_message: 同步断点 → configurationDone → set_active_client
    ↓
@@ -382,11 +557,11 @@ Stopped 事件
    ↓
 9. handle_debugger_message: 获取线程/栈帧 → 跳转位置 → 显示暂停指示器
    ↓
-10. 用户按 G c → dap_continue → resume_application → 清除暂停指示器
+10. 用户按 Space G c → dap_continue → resume_application → 清除暂停指示器
    ↓
 ... 循环 7-10 ...
    ↓
-11. Adapter 发送 Terminated 事件 或 用户按 G t → dap_terminate
+11. Adapter 发送 Terminated 事件 或 用户按 Space G t → dap_terminate
    ↓
 12. 断开连接 → 清除断点验证状态 → unset_active_client
 ```
@@ -429,44 +604,46 @@ Adapter 可以向 Client 发送反向请求：
 ## 六、模块间依赖关系图
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    helix-term                            │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────────┐ │
-│  │ commands/dap │  │ commands/typed│  │  ui/editor.rs  │ │
-│  │ (DAP 命令)   │  │ (:debug 命令) │  │ (鼠标设断点)    │ │
-│  └──────┬───────┘  └──────┬───────┘  └───────┬────────┘ │
-│         │                 │                   │          │
-│  ┌──────┴─────────────────┴───────────────────┴────────┐ │
-│  │              keymap/default.rs (G 快捷键)            │ │
-│  └──────────────────────────────────────────────────────┘ │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-┌──────────────────────────┴──────────────────────────────┐
-│                     helix-view                           │
-│  ┌──────────────────┐  ┌──────────────────────────────┐ │
-│  │ handlers/dap.rs  │  │       editor.rs               │ │
-│  │ (事件处理/断点同步) │  │ (breakpoints/Registry/事件循环)│ │
-│  └────────┬─────────┘  └──────────────┬───────────────┘ │
-│           │                           │                  │
-│  ┌────────┴───────────────────────────┴───────────────┐ │
-│  │              gutter.rs (断点/暂停指示器渲染)          │ │
-│  └────────────────────────────────────────────────────┘ │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-┌──────────────────────────┴──────────────────────────────┐
-│                      helix-dap                           │
-│  ┌──────────────┐  ┌───────────┐  ┌──────────────────┐ │
-│  │  client.rs   │  │transport.rs│  │  registry.rs     │ │
-│  │ (DAP 客户端)  │  │ (消息编解码) │  │ (多客户端管理)    │ │
-│  └──────┬───────┘  └─────┬─────┘  └──────────────────┘ │
-└─────────┼────────────────┼─────────────────────────────┘
-          │                │
-┌─────────┴────────────────┴─────────────────────────────┐
-│                   helix-dap-types                        │
-│  ┌─────────────────────────────────────────────────────┐│
-│  │  lib.rs (Request/Event/Response 类型、Breakpoint 等) ││
-│  └─────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│                       helix-term                            │
+│  ┌────────────────┐  ┌──────────────────┐  ┌─────────────┐ │
+│  │ commands/dap.rs│  │ commands/typed.rs│  │ ui/editor.rs│ │
+│  │ (Space G 命令) │  │ (:debug-start,   │  │ (鼠标设断点) │ │
+│  │                │  │  :debug-remote,  │  │             │ │
+│  │                │  │  :debug-eval)    │  │             │ │
+│  └───────┬────────┘  └────────┬─────────┘  └──────┬──────┘ │
+│          │                   │                    │        │
+│  ┌───────┴───────────────────┴────────────────────┴──────┐ │
+│  │           keymap/default.rs (Space G 子菜单)           │ │
+│  └────────────────────────────────────────────────────────┘ │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+┌──────────────────────────────┴──────────────────────────────┐
+│                        helix-view                             │
+│  ┌──────────────────┐  ┌──────────────────────────────────┐ │
+│  │ handlers/dap.rs  │  │          editor.rs               │ │
+│  │ (事件处理/断点同步)│  │ (breakpoints/Registry/事件循环)  │ │
+│  └────────┬─────────┘  └──────────────┬───────────────────┘ │
+│           │                           │                     │
+│  ┌────────┴───────────────────────────┴───────────────────┐ │
+│  │           gutter.rs (断点/暂停指示器渲染)                │ │
+│  └────────────────────────────────────────────────────────┘ │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+┌──────────────────────────────┴──────────────────────────────┐
+│                        helix-dap                              │
+│  ┌──────────────┐  ┌─────────────┐  ┌───────────────────┐  │
+│  │  client.rs   │  │ transport.rs│  │   registry.rs     │  │
+│  │ (DAP 客户端)  │  │ (消息编解码) │  │  (多客户端管理)   │  │
+│  └──────┬───────┘  └──────┬──────┘  └───────────────────┘  │
+└─────────┼─────────────────┼────────────────────────────────┘
+          │                 │
+┌─────────┴─────────────────┴────────────────────────────────┐
+│                   helix-dap-types                            │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │  lib.rs (Request/Event/Response 类型、Breakpoint 等)    ││
+│  └─────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -478,16 +655,28 @@ Adapter 可以向 Client 发送反向请求：
 ```toml
 [[language]]
 name = "rust"
-debugger = { name = "lldb-vscode", transport = "stdio", command = "lldb-vscode",
-             templates = [
-               { name = "binary", request = "launch", completion = [{ name = "binary", completion = "filename" }], args = { program = "{0}" } }
-             ]}
+
+[language.debugger]
+name = "lldb-dap"
+transport = "stdio"
+command = "lldb-dap"
+
+[[language.debugger.templates]]
+name = "binary"
+request = "launch"
+completion = [ { name = "binary", completion = "filename" } ]
+args = { program = "{0}" }
 ```
 
+配置字段说明：
 - `name`: Adapter 标识符（传递给 initialize 请求的 adapter_id）
 - `transport`: `"stdio"` 或 `"tcp"`
 - `command`: Adapter 可执行文件
-- `args`: Adapter 启动参数
+- `args`: Adapter 启动参数（不是被调试程序的参数）
 - `port_arg`: TCP 模式的端口参数格式（如 `"--port {}"`）
-- `templates`: 调试模板列表，每个模板定义名称、请求类型、参数补全和启动参数
+- `templates`: 调试模板列表，每个模板定义：
+  - `name`: 模板名（用于 `:debug-start <name>` 选择）
+  - `request`: `"launch"` 或 `"attach"`
+  - `completion`: 参数补全配置列表（Named 或 Advanced）
+  - `args`: 启动参数（支持 `{0}`、`{1}` 等占位符）
 - `quirks`: Adapter 行为适配（如 `absolute_paths`）
