@@ -508,11 +508,9 @@ if self.background_color.is_some() {
 
 启动时还会查询终端原始背景色并保存（`original_background_color`），用于退出时恢复。
 
-### 5.3 两种重绘机制：`full_redraw` vs 普通重绘
+### 5.3 双缓冲渲染基础 [helix-tui/src/terminal.rs#L67-L69](helix-tui/src/terminal.rs#L67-L69)
 
-Helix 有两级重绘机制，作用和触发时机各不相同。
-
-#### 双缓冲渲染基础 [helix-tui/src/terminal.rs#L67-L69](helix-tui/src/terminal.rs#L67-L69)
+无论哪条触发路径，最终渲染都基于双缓冲机制：
 
 ```rust
 buffers: [Buffer; 2],  // 前后双缓冲
@@ -525,11 +523,91 @@ current: usize,        // 当前缓冲索引
 3. 只输出变化的部分到终端
 4. 交换前后缓冲
 
-#### 普通重绘：`needs_redraw` 标志
+`terminal.clear()` 强制全量重绘 [helix-tui/src/terminal.rs#L238-L243](helix-tui/src/terminal.rs#L238-L243)：
+```rust
+pub fn clear(&mut self) -> io::Result<()> {
+    self.backend.clear()?;                   // 发送清屏控制序列
+    self.buffers[1 - self.current].reset();  // 重置后缓冲，强制全量重绘
+    Ok(())
+}
+```
 
-`needs_redraw` 是 `Editor` 结构体上的标志 [helix-view/src/editor.rs#L1245](helix-view/src/editor.rs#L1245)，表示编辑器内部状态发生变化，需要重新渲染界面。
+### 5.4 三条重绘触发路径
 
-**触发方式**：通过 `request_redraw()` 事件 [helix-view/src/editor.rs#L2396-L2404](helix-view/src/editor.rs#L2396-L2404)：
+Helix 有三条独立的重绘触发路径，最终都会调用 `Application::render()`，但触发条件和时机完全不同。
+
+---
+
+#### 路径一：配置事件直接渲染（主题切换走这条路）
+
+**核心特征**：不经过 `needs_redraw` 标志和 `Redraw` 事件，事件处理完直接调用 `render()`。
+
+##### 触发链路
+
+```
+① editor.set_theme()
+   └─► 发送 ConfigEvent::ThemeChanged 到 config_events 通道
+
+② Editor::wait_event() 从通道接收事件 [helix-view/src/editor.rs#L2386-L2388]
+   └─► return EditorEvent::ConfigEvent(config_event)
+
+③ Application::handle_editor_event() 处理事件 [helix-term/src/application.rs#L653-L656]
+   ├─► EditorEvent::ConfigEvent(event) => {
+   │     self.handle_config_events(event);
+   │     self.render().await;      ← 直接调用 render()
+   │   }
+```
+
+##### 步骤 ③ 的详细代码 [helix-term/src/application.rs#L653-L656](helix-term/src/application.rs#L653-L656)
+
+```rust
+EditorEvent::ConfigEvent(event) => {
+    self.handle_config_events(event);  // 设置终端 OSC 11 背景色
+    self.render().await;               // 直接调用 render()
+}
+```
+
+##### 同路径的其他触发事件
+
+| 事件类型 | 触发源 | 处理函数中的分支 |
+|---------|--------|----------------|
+| `EditorEvent::DocumentSaved` | 文件保存完成 | `handle_editor_event()` L649-L652 |
+| `EditorEvent::ConfigEvent` | 主题切换、配置变更 | `handle_editor_event()` L653-L656 |
+| `EditorEvent::DebuggerEvent(needs_render=true)` | 调试器事件需要渲染 | `handle_editor_event()` L662-L666 |
+| `EditorEvent::Redraw` | 详见路径二 | `handle_editor_event()` L668-L670 |
+| 终端事件 `should_redraw=true` | 键盘输入、窗口 resize | `handle_terminal_events()` L757-L759 |
+| 信号 `SIGUSR1` | 配置热重载 | `handle_signals()` L550-L553 |
+| 信号 `SIGCONT` | 从挂起恢复 | `handle_signals()` L531-L549（额外调用 `terminal.clear()`） |
+| Job 回调完成 | 异步任务完成 | 事件循环 L323-L325、L338-L341 |
+
+**主题切换专走此路径**：与 `needs_redraw` 标志**无关**，事件处理完立即渲染。
+
+---
+
+#### 路径二：普通重绘请求（`needs_redraw` + `Redraw` 事件）
+
+**核心特征**：通过 `request_redraw()` 发起请求 → 33ms 防抖 → `EditorEvent::Redraw` → 直接调用 `render()`。
+
+##### 触发链路
+
+```
+① 各处调用 helix_event::request_redraw()
+   ├─► LSP 消息处理完成 [application.rs#L658-L660]
+   ├─► 状态消息更新 [application.rs#L336]
+   └─► 其他编辑器内部状态变更
+
+② Editor::wait_event() 处理 redraw_requested [helix-view/src/editor.rs#L2396-L2404]
+   ├─► 首次请求设置 self.needs_redraw = true
+   └─► redraw_timer 重置为 33ms 后（防抖合并多次请求）
+
+③ 33ms 后 redraw_timer 到期 [helix-view/src/editor.rs#L2406-L2409]
+   └─► return EditorEvent::Redraw
+
+④ Application::handle_editor_event() [helix-term/src/application.rs#L668-L670]
+   └─► EditorEvent::Redraw => { self.render().await; }
+```
+
+##### 步骤 ② 的详细代码 [helix-view/src/editor.rs#L2396-L2404](helix-view/src/editor.rs#L2396-L2404)
 
 ```rust
 _ = helix_event::redraw_requested() => {
@@ -544,68 +622,110 @@ _ = helix_event::redraw_requested() => {
 }
 ```
 
-**渲染时机** [helix-term/src/application.rs#L570-L573](helix-term/src/application.rs#L570-L573)：
+##### 补充触发点：空闲超时检查 [helix-term/src/application.rs#L570-L573](helix-term/src/application.rs#L570-L573)
+
+如果 `IdleTimer` 先于 `redraw_timer` 到期，也会检查并重绘：
 ```rust
 let should_render = self.compositor.handle_event(&Event::IdleTimeout, &mut cx);
 if should_render || self.editor.needs_redraw {
-    self.render().await;
+    self.render().await;  // 检查 needs_redraw 标志是否为 true
 }
 ```
 
-**普通重绘的特点**：
+##### 此路径特点
+
+- 33ms 防抖合并频繁请求（约 30fps）
 - 基于双缓冲差异渲染，只输出变化的字符
-- 性能开销小，适合频繁触发（光标移动、文本编辑等）
-- 主题切换通过 `ConfigEvent` 事件触发，属于普通重绘
+- 性能开销小，适合频繁触发（光标移动、文本编辑、诊断更新等）
 
-#### 全屏清屏重绘：`full_redraw` 标志
+---
 
-`full_redraw` 是 `Compositor` 结构体上的标志 [helix-term/src/compositor.rs#L83](helix-term/src/compositor.rs#L83)，表示需要完全清除终端后重新绘制。
+#### 路径三：全屏清屏重绘（`full_redraw` 标志）
 
-**设置方法** [helix-term/src/compositor.rs#L220-L222](helix-term/src/compositor.rs#L220-L222)：
+**核心特征**：这不是一条独立的触发路径，而是 `render()` 函数内部的行为修饰符。下次调用 `render()` 时（无论通过路径一还是路径二），先清屏再渲染。
+
+##### 触发链路
+
+```
+① 某处设置 compositor.full_redraw = true
+   ├─► :redraw 命令 → 通过回调调用 compositor.need_full_redraw()
+   └─► 其他代码直接调用 compositor.need_full_redraw()
+
+② 下次 render() 被调用时（通过路径一或路径二）
+   └─► [application.rs#L256-L259] 检查 full_redraw 标志
+```
+
+##### 设置标志：`:redraw` 命令 [helix-term/src/commands/typed.rs#L2692-L2704](helix-term/src/commands/typed.rs#L2692-L2704)
+
 ```rust
-pub fn need_full_redraw(&mut self) {
-    self.full_redraw = true;
+fn redraw(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let callback = Box::pin(async move {
+        let call: job::Callback =
+            job::Callback::EditorCompositor(Box::new(|_editor, compositor| {
+                compositor.need_full_redraw();  // 设置 full_redraw 标志
+            }));
+        Ok(call)
+    });
+    // 回调通过事件循环 L323-L325 处理后调用 render()
 }
 ```
 
-**渲染时处理** [helix-term/src/application.rs#L256-L259](helix-term/src/application.rs#L256-L259)：
+##### `render()` 内处理标志 [helix-term/src/application.rs#L256-L259](helix-term/src/application.rs#L256-L259)
+
 ```rust
 if self.compositor.full_redraw {
-    self.terminal.clear().expect("Cannot clear the terminal");
+    self.terminal.clear().expect("Cannot clear the terminal");  // 清屏 + 重置后缓冲
     self.compositor.full_redraw = false;
 }
 ```
 
-`terminal.clear()` 做了两件事 [helix-tui/src/terminal.rs#L238-L243](helix-tui/src/terminal.rs#L238-L243)：
+##### 特殊场景：`SIGCONT` 信号 [helix-term/src/application.rs#L531-L549](helix-term/src/application.rs#L531-L549)
+
+从挂起恢复时**不使用** `full_redraw` 标志，直接清屏后渲染：
 ```rust
-pub fn clear(&mut self) -> io::Result<()> {
-    self.backend.clear()?;               // 发送清屏控制序列
-    self.buffers[1 - self.current].reset();  // 重置后缓冲，强制全量重绘
-    Ok(())
+signal::SIGCONT => {
+    // ... 重新 claim 终端 ...
+    let area = self.terminal.size();
+    self.compositor.resize(area);
+    self.terminal.clear().expect("couldn't clear terminal");  // 直接清屏
+    self.render().await;                                       // 直接渲染
 }
 ```
 
-**全屏重绘的特点**：
-- 清除整个终端屏幕，重置后缓冲
-- 下一帧所有内容都需要重新绘制和输出
-- 性能开销大，只在必要时使用
+##### 此路径特点
 
-#### 触发场景对比
+- 清除整个终端屏幕 + 重置后缓冲
+- 下一帧所有内容都需要重新绘制和输出（无差异优化）
+- 性能开销大，仅用于 `:redraw` 命令等极端场景
 
-| 重绘类型 | 标志位置 | 触发场景 | 性能开销 |
-|---------|---------|---------|---------|
-| 普通重绘 | `Editor.needs_redraw` | 光标移动、文本编辑、诊断更新、主题切换 | 小（差异渲染） |
-| 全屏重绘 | `Compositor.full_redraw` | `:redraw` 命令、SIGCONT 恢复终端 | 大（全量重绘） |
+---
 
-**重要纠正**：主题切换 **不会** 触发 `full_redraw`，它通过 `ConfigEvent::ThemeChanged` 事件触发一次普通重绘。由于双缓冲机制，所有字符的样式都会因为主题变化而被检测为差异，实际效果接近全量重绘，但技术上仍属于普通重绘范畴。
+#### 三条路径对比总结
 
-### 5.4 渲染循环与组件渲染
+| 特性 | 路径一：配置事件直接渲染 | 路径二：普通重绘请求 | 路径三：全屏清屏重绘 |
+|------|------------------------|-------------------|-------------------|
+| **触发入口** | ConfigEvent/DocumentSaved/键盘事件等 | `request_redraw()` | `:redraw` 命令 |
+| **关键标志** | 无标志，事件处理完直接调用 | `Editor.needs_redraw` + `redraw_timer` | `Compositor.full_redraw` |
+| **防抖机制** | 无（立即响应） | 33ms 合并请求 | 无 |
+| **触发 `render()` 位置** | `handle_editor_event()` / `handle_terminal_events()` / 信号处理 | `handle_editor_event(EditorEvent::Redraw)` / `handle_idle_timeout()` | `render()` 内部检查标志 |
+| **清屏行为** | 默认不清屏（SIGCONT 例外） | 不清屏 | 先清屏 + 重置后缓冲 |
+| **缓冲策略** | 双缓冲差异渲染 | 双缓冲差异渲染 | 无差异，全量输出 |
+| **性能开销** | 小（差异优化） | 小（差异优化） | 大（全量重绘） |
+| **典型场景** | 主题切换、保存文件、配置变更 | 光标移动、LSP 诊断、状态消息更新 | `:redraw` 命令、屏幕乱码恢复 |
 
-#### 渲染函数 [helix-term/src/application.rs#L255-L282](helix-term/src/application.rs#L255-L282)
+**主题切换走路径一**：直接 `render()`，不经过 `needs_redraw`，不触发 `full_redraw`。双缓冲会检测到所有字符样式变化，实际效果接近全量重绘，但技术上属于路径一的差异渲染优化范畴。
+
+### 5.5 渲染函数 `render()` 内部流程 [helix-term/src/application.rs#L255-L286](helix-term/src/application.rs#L255-L286)
+
+三条路径最终汇合到此函数：
 
 ```rust
 async fn render(&mut self) {
-    // 全屏重绘：先清屏
+    // ┌─ 路径三的清屏处理（仅 full_redraw=true 时执行）
+    // ▼
     if self.compositor.full_redraw {
         self.terminal.clear().expect("Cannot clear the terminal");
         self.compositor.full_redraw = false;
@@ -614,18 +734,19 @@ async fn render(&mut self) {
     let mut cx = crate::compositor::Context { ... };
     
     helix_event::start_frame();
-    cx.editor.needs_redraw = false;  // 清除重绘标志
+    cx.editor.needs_redraw = false;  // 清除路径二的标志，供下次请求使用
 
     let area = self.terminal.autoresize().expect("...");
     let surface = self.terminal.current_buffer_mut();
 
-    // 逐层渲染所有组件
+    // ┌─ 逐层渲染所有组件（路径一、二、三共同执行）
+    // ▼
     self.compositor.render(area, surface, &mut cx);
     
     // 计算光标位置
     let (pos, kind) = self.compositor.cursor(area, &self.editor);
     
-    // 输出到终端
+    // 双缓冲差异比较 → 输出到终端
     self.terminal.draw(pos, kind).unwrap();
 }
 ```
@@ -640,7 +761,7 @@ pub fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
 }
 ```
 
-### 5.5 编辑器背景：`EditorView` 根组件
+### 5.6 编辑器背景：`EditorView` 根组件
 
 `EditorView` 是最底层组件，负责绘制编辑器背景和调度所有子视图渲染。
 
@@ -659,7 +780,7 @@ fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
 - 这是所有 UI 元素的底色基础
 - 使用 `theme.get()` 支持逐级回退
 
-### 5.6 状态栏：多作用域分层应用
+### 5.7 状态栏：多作用域分层应用
 
 状态栏是主题样式最集中的 UI 组件之一。
 
@@ -734,7 +855,7 @@ fn append<'a>(buffer: &mut Spans<'a>, mut span: Span<'a>, base_style: Style) {
 | `info` | 信息诊断计数圆点 |
 | `hint` | 提示诊断计数圆点 |
 
-### 5.7 文档渲染：语法高亮 + 虚拟文本 + 叠加层
+### 5.8 文档渲染：语法高亮 + 虚拟文本 + 叠加层
 
 文档渲染是主题应用最复杂的部分，涉及多层样式叠加。
 
@@ -858,7 +979,7 @@ pub fn highlight(&self, highlight: Highlight) -> Style {
 | `keyword`、`string`、`function` 等 | 语法高亮作用域（上百种） |
 | `rainbow.0` ~ `rainbow.N` | 彩虹括号颜色 |
 
-### 5.8 补全菜单：多层样式组合
+### 5.9 补全菜单：多层样式组合
 
 补全菜单结合了通用 Menu 组件和补全项的自定义样式。
 
@@ -953,7 +1074,7 @@ surface.clear_with(doc_area, background);
 | `ui.text.directory` | 文件夹类补全项 | 无 |
 | `ui.popup` | 补全文档弹窗背景 | 无 |
 
-### 5.9 主题切换完整事件流
+### 5.10 主题切换完整事件流（路径一：配置事件直接渲染）
 
 ```
 用户执行 :theme 命令 或 修改配置后 SIGUSR1
@@ -962,7 +1083,7 @@ surface.clear_with(doc_area, background);
 theme() 命令处理函数
         │
         ▼
-editor.set_theme(theme)
+editor.set_theme(theme)  [helix-view/src/editor.rs#L1499-L1528]
         │
         ├─► 验证 ui.selection 必需样式
         ├─► 更新语法高亮 scopes
@@ -971,21 +1092,26 @@ editor.set_theme(theme)
         └─► ConfigEvent::ThemeChanged → 发送到 config_events 通道
         │
         ▼
-事件循环接收到 EditorEvent::ConfigEvent
+Editor::wait_event() 从通道接收事件  [helix-view/src/editor.rs#L2386-L2388]
+        │
+        └─► return EditorEvent::ConfigEvent(config_event)
         │
         ▼
-Application::handle_config_events()
+Application::handle_editor_event()  [helix-term/src/application.rs#L653-L656]
         │
-        └─► ConfigEvent::ThemeChanged 分支
-            │
-            └─► terminal.backend_mut().set_background_color()
-                │
-                ├─► 检查 dynamic_background_color 能力（tmux 下禁用）
-                ├─► theme.try_get_exact("ui.background") → 精确提取 bg
-                └─► 发送 OSC 11 控制序列到终端
+        ├─► EditorEvent::ConfigEvent(event) 分支
         │
-        ▼
-Application::render()    ← 事件处理后立即调用
+        ├─► 1. handle_config_events(event)
+        │      └─► ConfigEvent::ThemeChanged 分支
+        │           └─► terminal.backend_mut().set_background_color()
+        │                ├─► 检查 dynamic_background_color 能力（tmux 下禁用）
+        │                ├─► theme.try_get_exact("ui.background") → 精确提取 bg
+        │                └─► 发送 OSC 11 控制序列到终端
+        │
+        └─► 2. self.render().await  ← 路径一：事件处理完直接调用 render()
+              │
+              ▼
+        render() 函数开始执行  [helix-term/src/application.rs#L255-L286]
         │
         ├─► 检查 full_redraw （主题切换不触发，保持 false）
         ├─► 清除 needs_redraw 标志
@@ -1008,6 +1134,11 @@ Application::render()    ← 事件处理后立即调用
         ├─► 计算光标位置
         └─► terminal.draw() → 双缓冲差异比较 → 输出到终端
 ```
+
+**关键代码注释**：
+- 主题切换**不走**路径二：不调用 `request_redraw()`，不经过 `needs_redraw` 标志
+- 主题切换**不走**路径三：不触发 `full_redraw`，不会清屏
+- 实际效果：双缓冲检测到所有字符样式变化 → 全量输出，但技术上是路径一的差异渲染优化
 
 ## 六、完整流程图
 
