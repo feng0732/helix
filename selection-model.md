@@ -625,27 +625,10 @@ pub fn insert(doc: &Rope, selection: &Selection, text: Tendril) -> Self {
 }
 ```
 
-`insert` 也是替换（零宽替换 = 插入），替换范围 `[head, head)` 是零宽的。这时：
-- 替换起始点 = head，AfterSticky + stay_at_gaps → 固定为 new_pos
-- 替换终点 = head，也正好是替换起始点（零宽）
-- 但因为是零宽替换，`to` 也是 head...
+`insert` 传入的替换范围是零宽的 `[head, head)`。在 `change_by_selection` 内部：
 
-等等，让我们仔细分析零宽替换：
-- 替换范围 `[head, head)`，old_pos = head, old_len = 0
-- from = head = old_pos，AfterSticky → stay_at_gaps → 固定为 new_pos
-- to = head = old_pos，BeforeSticky → stay_at_gaps？
+[transaction.rs:546-558](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L546-L558)
 
-BeforeSticky 的 stay_at_gaps = true，所以 to = head 也会固定为 new_pos？
-
-那结果 from = to = new_pos，零宽选择，位置在新文本开头？这不对啊...
-
-让我们重新验证。零宽替换（即纯插入）：
-- Insert + Delete(0) = 零宽替换
-- 但代码中 `Delete(len)` 中 len = 0 时... 实际上 Insert 后面跟一个 Delete(0) 是没有意义的。
-
-再看 `change_by_selection` 的实现：当 `from == to` 且 replacement 是 Some 时，生成的是 Insert + Delete(0) 吗？
-
-让我们回到 from_changes 的代码：
 ```rust
 Some(text) => {
     changeset.insert(text);
@@ -653,37 +636,24 @@ Some(text) => {
 }
 ```
 
-如果 span.len() == 0（即 from == to），则 delete(0)。而在 update_positions 中，`iter.peek()` 看到 Delete(0) 也会当作替换。
+当 `span.len() == 0` 时（零宽范围），`delete(0)` 是 no-op：
 
-零宽替换时：
-- old_pos = head, old_len = 0
-- from = head = old_pos, AfterSticky, stay_at_gaps = true → new_pos
-- to = head = old_pos, BeforeSticky, stay_at_gaps = true → new_pos
+[transaction.rs:282-286](file:///d:/fz/0601/solo-dogfeeding/code/264-helix/helix-core/src/transaction.rs#L282-L286)
 
-结果 from = to = new_pos？但这和纯 Insert 的行为不同！纯 Insert 时 from = head 映射为 new_pos + s.len()。
-
-等等，这里有个矛盾。让我重新检查...
-
-实际上，`Transaction::insert` 生成的是 Insert（没有后续 Delete 因为 span.len() == 0 ？还是有 Delete(0)？）
-
-让我看 ChangeSet::delete：
 ```rust
 fn delete(&mut self, n: usize) {
     if n == 0 {
-        return;
+        return;  // ★ 零长度删除直接返回，不进入变更集
     }
-    ...
+    // ...
 }
 ```
 
-哦！delete(0) 是 no-op，什么都不做。所以当 span.len() == 0 时，只有 Insert 被添加，没有 Delete。因此：
-- `Transaction::insert` 生成的是纯 Insert，不是替换
-- 所以 `from = head` 按纯 Insert 规则映射 → `new_pos + s.len()`（AfterSticky）
-- 结果正确：光标跳到插入文本之后
+**直接结论**：零长度删除不会进入 ChangeSet，因此实际生成的是**纯 Insert** 操作（没有后续 Delete）。在 `update_positions` 中走纯 Insert 分支，`from = head` 按纯 Insert 规则映射为 `new_pos + s.len()`（AfterSticky），光标正确跳到插入文本之后。
 
-这验证了纯插入和零宽替换的区别：零宽替换在实际代码中不会发生，因为 delete(0) 被优化掉了。
+**零宽替换在实际代码中不会发生**——因为 `delete(0)` 被优化掉，零宽范围的变更永远生成纯 Insert。
 
-**回到语义差异总结**：
+**语义差异总结**：
 - **纯插入**（光标处输入）：Insert 操作，光标跳到新文本之后 → 符合输入直觉
 - **选区替换**（选中内容替换）：Insert+Delete 操作，选区保持选中状态 → 符合编辑直觉
 - 两者在代码层面是不同的 ChangeSet 结构，导致了不同的边界漂移行为
