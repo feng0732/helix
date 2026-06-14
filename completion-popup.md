@@ -57,8 +57,8 @@ fn request_completions_from_language_server(ls, doc, view, context, priority, sa
 ```
 
 - 向每个支持 `Completion` 特性的 language server 发送 `textDocument/completion` LSP 请求
-- 每个 LS 的 priority 为 `-(enumerate顺序 as i8)`，即第一个 LS priority=0，第二个=-1，以此类推
-- 返回前按 LSP 的 `sort_text`（fallback 到 `label`）对 items 做初始排序
+- 每个 LS 的 `provider_priority` 为 `-(enumerate 顺序 as i8)`：**配置顺序越靠后的 LS，priority 数值越小，排序越靠前**
+- 返回前按 LSP 的 `sort_text`（fallback 到 `label`）对 items 做 LSP 侧初始排序
 - 封装为 `CompletionResponse { items: CompletionItems::Lsp(items), provider: CompletionProvider::Lsp(ls_id), context }`
 
 #### (B) 路径补全（Path）
@@ -71,7 +71,7 @@ pub(crate) fn path_completion(selection, doc, handle, savepoint)
 - 检查 `doc.path_completion_enabled()`
 - 解析光标前行的路径后缀（`get_path_suffix`），得到目录路径 + 已输入文件名
 - 读取目录 `std::fs::read_dir`，为每个条目生成 `CompletionItem::Other(core::CompletionItem { provider: CompletionProvider::Path, .. })`
-- priority 固定为 `1`（排在 LSP 之后）
+- `ResponseContext.priority` 固定为 `1`，但 `CompletionItem::Other` 的 `provider_priority()` 方法直接返回 1（不使用 context 中的 priority）
 
 #### (C) 单词补全（Word）
 
@@ -84,7 +84,7 @@ pub(super) fn completion(editor, trigger, handle, savepoint)
 - 从 `editor.handlers.word_index` 中查找匹配当前输入词的单词
 - 已输入词长需 >= `trigger_length`（默认 2）
 - 生成 `CompletionItem::Other(core::CompletionItem { provider: CompletionProvider::Word, .. })`
-- priority 为 `0`
+- `ResponseContext.priority` 为 `0`，但 `CompletionItem::Other` 的 `provider_priority()` 方法直接返回 1（不使用 context 中的 priority）
 
 ### 2.4 响应汇聚与首屏展示
 
@@ -139,7 +139,7 @@ impl CompletionResponse {
 }
 ```
 
-LSP items 在转换时被包装为 `LspCompletionItem`，记录 provider 和 priority；Non-LSP items 直接追加。
+LSP items 在转换时被包装为 `LspCompletionItem`，其中 `provider_priority` 取自 `self.context.priority`（即 `-(enumerate index)`）；Non-LSP items 直接追加，其 `provider_priority()` 方法固定返回 1。
 
 ---
 
@@ -219,22 +219,32 @@ matches.sort_unstable_by_key(|&(i, score)| {
 });
 ```
 
-排序键优先级从高到低：
+排序键优先级从高到低（按元组字段顺序）：
 
-| 优先级 | 键 | 说明 |
+| 优先级 | 键 | 类型 | 排序方向 | 说明 |
+|---|---|---|---|---|
+| 1 | `score <= min_score` | bool | 升序（false 在前） | 低于最低阈值的项统一沉底。`false=0 < true=1`，所以匹配质量达标的项全部排在不达标之前 |
+| 2 | `Reverse(option.preselect())` | bool | 降序（true 在前） | LSP 标记 `preselect=true` 的项优先。`Reverse` 反转 bool 默认顺序，使 true 排在 false 前面 |
+| 3 | `option.provider_priority()` | i8 | **升序（越小越前）** | 来源优先级。数值越小排名越靠前 |
+| 4 | `Reverse(score)` | u32 | 降序（越高越前） | 模糊匹配得分。得分越高排名越靠前 |
+| 5 | `i` | u32 | 升序（越小越前） | 原始索引保序。当以上所有键都相等时，按在 options 中出现的先后顺序排列 |
+
+其中 `min_score = (7 + needle_len * 14) / 3`，是一个启发式阈值，用于过滤掉匹配质量过差的候选项（但不直接剔除，只是沉底）。
+
+#### Step 3: `provider_priority` 的数值与来源
+
+`provider_priority()` 返回值（升序，越小越靠前）：
+
+| 来源 | provider_priority 值 | 排序位置 |
 |---|---|---|
-| 1 | `score <= min_score` | 低于最低阈值的候选项排到末尾（布尔值，false=0 < true=1） |
-| 2 | `Reverse(option.preselect())` | LSP 标记 `preselect=true` 的项排到前面 |
-| 3 | `option.provider_priority()` | provider 优先级：LSP 第一个=0, 第二个=-1; Word=0; Path=1 |
-| 4 | `Reverse(score)` | 模糊匹配得分越高排越前 |
-| 5 | `i` | 原始顺序保序 |
+| 第 N 个配置的 LSP（N 越大越靠后配置） | `-(N-1)` 即 0, -1, -2, ... | 越靠后配置的 LSP 数值越小，排名越靠前 |
+| Path 补全 | 1 | LSP 之后 |
+| Word 补全 | 1 | LSP 之后，与 Path 同级 |
 
-其中 `min_score = (7 + needle_len * 14) / 3`，是一个启发式阈值，过滤掉匹配质量过差的候选项。
-
-#### Step 3: `provider_priority` 的来源
+**注意**：所有非 LSP 来源（Path、Word）在 `CompletionItem::Other` 分支中**统一返回 1**，与 `ResponseContext.priority` 无关。
 
 ```rust
-// item.rs#L106-L112
+// item.rs#L105-L127
 impl CompletionItem {
     pub fn provider_priority(&self) -> i8 {
         match self {
@@ -242,13 +252,57 @@ impl CompletionItem {
             CompletionItem::Other(_) => 1,  // Path/Word 固定为 1
         }
     }
+
+    pub fn preselect(&self) -> bool {
+        match self {
+            CompletionItem::Lsp(item) => item.item.preselect.unwrap_or(false),
+            CompletionItem::Other(_) => false,  // 非 LSP 项永远不会被 preselect
+        }
+    }
 }
 ```
 
-- 第一个 LSP server: priority=0（最高优先）
-- 第二个 LSP server: priority=-1
-- Word 补全: priority=0（但被 `CompletionItem::Other` 映射为 1）
-- Path 补全: priority=1（最低优先）
+##### LSP provider_priority 的计算
+
+在 [request.rs#L203-L241](file:///d:/fz/0601/solo-dogfeeding/code/267-helix/helix-term/src/handlers/completion/request.rs#L203-L241) 中：
+
+```rust
+for (priority, ls) in language_servers.iter().enumerate() {
+    requests.spawn(request_completions_from_language_server(
+        ...,
+        -(priority as i8),   // priority 是 enumerate 索引：0, 1, 2...
+        ...,
+    ));
+}
+```
+
+- `language_servers` 按 `language_config()` 配置顺序返回（第一个配置的 LS 最先返回）
+- 取负后：第一个配置的 LS → priority=0，第二个 → priority=-1，第三个 → priority=-2，依此类推
+- 排序时按升序排列：-2 < -1 < 0 < 1
+- **结论：配置中越靠后的 LSP，在补全列表中优先级越高**
+
+##### Path 和 Word 的优先级关系
+
+Path 和 Word 的 `provider_priority` 都是 1，处于同一层级。它们之间的相对顺序由后续排序键决定：
+1. 先比较模糊匹配得分 `Reverse(score)`
+2. 得分相同则比较原始索引 `i`（先加入 options 的排在前面）
+
+##### 多 LSP 场景下的完整排序示例
+
+假设有 3 个 LSP（rust-analyzer, rls, clippy）按顺序配置，以及 Path、Word 补全：
+
+| 候选项 | 来源 | provider_priority | preselect | score (假设) | 最终排序位置 |
+|---|---|---|---|---|---|
+| func_a | clippy (第3个) | -2 | false | 150 | 1 |
+| func_b | rls (第2个) | -1 | true | 100 | 2 |
+| func_c | rust-analyzer (第1个) | 0 | false | 200 | 3 |
+| func_d | rust-analyzer (第1个) | 0 | false | 180 | 4 |
+| src/ | Path | 1 | false | 160 | 5 |
+| some_word | Word | 1 | false | 140 | 6 |
+| low_qual | rls (第2个) | -1 | false | 5 | 7（低于 min_score 沉底） |
+
+> 注意：func_b 虽然 score 只有 100，但因为 preselect=true，所以排在 func_c 前面。
+> clippy 的 func_a 虽然 score 不是最高，但因为 provider_priority=-2 最小，所以排第 1。
 
 ### 3.4 过滤更新：`update_filter`
 
@@ -571,8 +625,8 @@ PostInsertChar hook ──→ trigger_auto_completion() ──→ CompletionEven
 ## 六、关键设计决策
 
 1. **三个来源并行 + 首屏超时**：LSP 请求异步、word/path 同步计算，首批结果立即展示，后续结果 100ms 内继续等待，超时后异步替换
-2. **统一的 `CompletionItem` 枚举**：LSP 和非 LSP 来源在排序/过滤/展示层面统一处理，仅在插入时分支
-3. **多级排序策略**：模糊匹配分 → preselect → provider_priority → 原始序，兼顾了 LSP 意图、来源优先级和匹配质量
+2. **统一的 `CompletionItem` 枚举**：LSP 和非 LSP 来源在排序/过滤/展示层面统一处理，仅在插入时分支；非 LSP 项的 `provider_priority` 固定为 1，与 `ResponseContext.priority` 无关
+3. **五级排序策略**：阈值沉底 → LSP preselect → provider_priority（配置越靠后的 LSP 优先级越高） → 模糊匹配分 → 原始索引。兼顾 LSP 意图、来源优先级和匹配质量
 4. **Ghost Transaction 机制**：预览插入用 `apply_temporary`（不通知 LSP），确认插入用 `apply`（通知 LSP），通过 savepoint 保证状态一致性
 5. **延迟 resolve**：只在用户选中某项时才异步请求 `completionItem/resolve`，避免大量无用的 resolve 请求
 6. **Incomplete list 处理**：LSP 标记 `is_incomplete` 的响应在用户继续输入时会被重新请求（`request_incomplete_completion_list`），而非仅做本地过滤
