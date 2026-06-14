@@ -10,31 +10,40 @@
 用户按键 `:` 
   → 静态命令 command_mode() 被触发 [keymap/default.rs#L64]
     → 创建 Prompt UI 组件并推入 compositor [commands/typed.rs#L4058-L4074]
-      ┌───────────────────────────────────────────────────────────┐
-      │                     Prompt 事件循环                      │
-      │                                                           │
-      │  按键事件 → Prompt::handle_event [ui/prompt.rs#L606-L766] │
-      │         │                                                 │
-      │         ├─ 字符输入 → 更新 self.line → 触发 Update 事件    │
-      │         │       ↓                                         │
-      │         │  1. doc_fn 文档提示 [commands/typed.rs#L4076-L4146] │
-      │         │  2. completion_fn 命令补全 [commands/typed.rs#L4148-L4326] │
-      │         │       ├─ 命令名补全 → fuzzy_match(TYPABLE_COMMAND_LIST) │
-      │         │       └─ 参数补全 → complete_command_args → 8种分支 │
-      │         │  3. execute_command_line(Update) → 无验证无展开 │
-      │         │                                                 │
-      │         ├─ Enter 键 → 关闭 Prompt → 触发 Validate 事件    │
-      │         │       ↓                                         │
-      │         │  1. 保存输入到历史寄存器                        │
-      │         │  2. execute_command_line(Validate)              │
-      │         │       → 完整解析 + 验证 + 展开 + 执行           │
-      │         │       → 失败 → set_error → 状态栏渲染           │
-      │         │                                                 │
-      │         └─ Esc/C-c → 关闭 Prompt → 触发 Abort 事件        │
-      │                 ↓                                         │
-      │                 命令函数可选择恢复状态（如 theme 预览恢复）│
-      └───────────────────────────────────────────────────────────┘
+      ┌───────────────────────────────────────────────────────────────┐
+      │                        Prompt 事件循环                        │
+      │                                                               │
+      │  ═════════════ handle_event 阶段（按键后立即执行）════════════ │
+      │  按键事件 → Prompt::handle_event [ui/prompt.rs#L606-L766]     │
+      │         │                                                     │
+      │         ├─ 字符输入 → 修改 self.line                          │
+      │         │       ↓                                             │
+      │         │  1. recalculate_completion [ui/prompt.rs#L157-L160] │
+      │         │     调用 completion_fn → 计算补全候选，保存到 self.completion │
+      │         │  2. callback_fn(Update) → execute_command_line(Update) │
+      │         │     无验证、无展开，仅让命令感知输入变化             │
+      │         │                                                     │
+      │         ├─ Enter 键 → 关闭 Prompt → 触发 Validate 事件        │
+      │         │       ↓                                             │
+      │         │  1. 保存输入到历史寄存器                            │
+      │         │  2. callback_fn(Validate) → execute_command_line(Validate) │
+      │         │     完整解析 + 验证 + 展开 + 执行                   │
+      │         │     失败 → set_error → 状态栏渲染                   │
+      │         │                                                     │
+      │         └─ Esc/C-c → 关闭 Prompt → 触发 Abort 事件            │
+      │                 ↓                                             │
+      │                 callback_fn(Abort) → 命令函数可恢复状态（如 theme 预览）│
+      │                                                               │
+      │  ═════════════════ render 阶段（红屏时执行）═════════════════ │
+      │  Prompt::render → render_prompt [ui/prompt.rs#L469-L511]      │
+      │         │                                                     │
+      │         ├─ 渲染补全列表（使用 handle_event 阶段计算好的 completion）│
+      │         └─ doc_fn(&self.line) [commands/typed.rs#L4076-L4146] │
+      │            计算文档提示 → 渲染帮助浮窗（在命令行上方）         │
+      └───────────────────────────────────────────────────────────────┘
 ```
+
+> **重要纠正**：`doc_fn` 文档提示计算 **不在 handle_event/Update 回调阶段**执行，而是在随后的 `render` 阶段执行。两者是完全分离的两个阶段。
 
 ---
 
@@ -148,15 +157,52 @@ key!(Enter) => {
 
 ---
 
-## 第三层：三大并行分支：补全、文档提示、命令解析
+## 第三层：两个阶段的动作划分：handle_event 阶段 vs render 阶段
 
-**注意：Update 事件会同时触发三个分支，而 Validate 事件只触发命令解析分支。**
+> **纠正**：之前文档将文档提示描述为 Update 事件的并行分支是错误的。实际流程分为两个串行阶段：
+> 1. **handle_event 阶段**（按键后立即执行）：补全计算 + Update 回调
+> 2. **render 阶段**（随后红屏时执行）：文档提示计算 + 所有渲染
 
-### 分支 A：文档提示 command_line_doc
+### 完整调用时序（以用户输入单个字符为例）
+
+```
+application::handle_terminal_events() [application.rs#L685-L760]
+  ↓
+compositor::handle_event() [compositor.rs#L144-L175]
+  ↓ (从顶层 UI 层向下传递，Prompt 是顶层)
+Prompt::handle_event() [ui/prompt.rs#L606-L766]
+  ├─ 步骤 1：修改 self.line（如 self.insert_char(c, cx)）
+  │   └─ 内部调用 self.recalculate_completion(cx.editor) [ui/prompt.rs#L268-L268]
+  │       └─ 调用 completion_fn → 计算补全，保存到 self.completion
+  ├─ 步骤 2：调用 (self.callback_fn)(cx, &self.line, PromptEvent::Update)
+  │   └─ execute_command_line(Update) → 无验证无展开的命令解析
+  └─ 返回 EventResult::Consumed(None) → should_redraw = true
+  ↓
+application::handle_terminal_events() 检测到 should_redraw = true
+  ↓
+application::render() [application.rs#L255-L286]
+  ↓
+compositor::render() [compositor.rs]
+  ↓
+Prompt::render() → self.render_prompt() [ui/prompt.rs#L400-L511]
+  ├─ 渲染补全列表（使用 self.completion，已在 handle_event 阶段计算好）
+  └─ 步骤 3：调用 (self.doc_fn)(&self.line) [ui/prompt.rs#L479-L479]
+      └─ command_line_doc() → 计算文档提示 → 渲染帮助浮窗
+```
+
+| 阶段 | 执行时机 | 调用的函数 | 作用 |
+|------|---------|-----------|------|
+| **handle_event 阶段** | 按键后立即同步执行 | `recalculate_completion` → `completion_fn` | 计算补全候选，保存到 `self.completion` |
+| **handle_event 阶段** | 按键后立即同步执行 | `callback_fn(Update)` → `execute_command_line(Update)` | 命令感知输入变化（无验证无展开） |
+| **render 阶段** | handle_event 之后，should_redraw=true 时异步执行 | `doc_fn(&self.line)` → `command_line_doc` | 计算并渲染文档提示浮窗 |
+
+---
+
+## 第三层分支 A：文档提示 command_line_doc（render 阶段）
 
 定义在 [commands/typed.rs](./helix-term/src/commands/typed.rs#L4076-L4146)
 
-每次输入变化（Update 事件）时都会调用，用于在命令行上方显示当前命令的帮助文档。
+**调用时机**：在 `Prompt::render_prompt` 中调用 [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L479-L479)，属于 render 阶段，**与 Update 回调无关**。每次重绘时都会重新计算，用于在命令行上方显示当前命令的帮助文档。
 
 ```rust
 fn command_line_doc(input: &str) -> Option<Cow<'_, str>> {
@@ -220,7 +266,40 @@ command_line_doc(input)
            └─ 计算最大 flag 长度用于列对齐
 ```
 
-### 分支 B：命令补全 complete_command_line
+---
+
+## 第三层分支 B：命令补全（handle_event 阶段）
+
+### recalculate_completion 触发时机
+
+定义在 [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L157-L160)
+
+**调用时机**：在 `handle_event` 阶段，每次修改 `self.line` 后立即调用。具体触发点包括：
+
+| 操作 | 代码位置 |
+|------|---------|
+| 插入字符 | `insert_char()` → [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L268-L268) |
+| 插入字符串 | `insert_str()` → [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L274-L274) |
+| 删除字符（向前） | `delete_char_backwards()` → [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L295-L295) |
+| 删除字符（向后） | `delete_char_forwards()` → [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L302-L302) |
+| 删除单词（向前） | `delete_word_backwards()` → [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L310-L310) |
+| 删除单词（向后） | `delete_word_forwards()` → [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L317-L317) |
+| 删除到行尾 | `kill_to_end_of_line()` → [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L324-L324) |
+| 删除到行首 | `kill_to_start_of_line()` → [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L331-L331) |
+| 切换补全选项 | `change_completion_selection()` → [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L385-L385) |
+| 从寄存器粘贴 | `paste_from_register()` → [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L372-L372) |
+| 浏览历史记录 | `cycle_history()` → [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L372-L372) |
+| 设置输入行 | `set_line()` → [ui/prompt.rs](./helix-term/src/ui/prompt.rs#L124-L124) |
+| Prompt 创建时 | `command_mode()` → [commands/typed.rs](./helix-term/src/commands/typed.rs#L4072-L4072) |
+
+```rust
+pub fn recalculate_completion(&mut self, editor: &Editor) {
+    self.exit_selection();
+    self.completion = (self.completion_fn)(editor, &self.line);
+}
+```
+
+### complete_command_line 补全逻辑
 
 定义在 [commands/typed.rs](./helix-term/src/commands/typed.rs#L4148-L4168)
 
@@ -384,11 +463,11 @@ complete_command_args
       └─ ExpansionKind → complete_expansion_kind 补全展开类型（sh/reg/u/变量）
 ```
 
-### 分支 C：命令解析 execute_command_line
+### 分支 C：命令解析 execute_command_line（handle_event 阶段）
 
 定义在 [commands/typed.rs](./helix-term/src/commands/typed.rs#L4015-L4036)
 
-**Update 事件** 和 **Validate 事件** 都会走这个分支，但行为完全不同。
+**调用时机**：在 `handle_event` 阶段通过 `callback_fn` 调用。**Update 事件** 和 **Validate 事件** 都会走这个分支，但行为完全不同。**render 阶段不会调用此函数**。
 
 ```rust
 fn execute_command_line(
@@ -541,6 +620,13 @@ pub(super) fn execute_command(
     (cmd.fun)(cx, args, event).map_err(|err| anyhow!("'{}': {err}", cmd.name))
 }
 ```
+
+### 输入变化 vs 回车执行：触发动作总览
+
+| 事件类型 | 触发时机 | 触发的动作 |
+|---------|---------|-----------|
+| **输入变化**（普通字符、删除、Tab、方向键等） | `handle_event` 阶段 + `render` 阶段 | `handle_event` 阶段：<br>1. `recalculate_completion()` → 补全计算<br>2. `callback_fn(Update)` → `execute_command_line(Update)`<br><br>`render` 阶段：<br>3. 渲染补全列表<br>4. `doc_fn()` → 文档提示计算与渲染 |
+| **回车执行**（Enter 键） | 仅 `handle_event` 阶段 | `handle_event` 阶段：<br>1. 保存输入到历史寄存器<br>2. `callback_fn(Validate)` → `execute_command_line(Validate)`<br>3. 关闭 Prompt，从 compositor 栈移除<br><br>**没有 render 阶段**（因为 Prompt 已关闭） |
 
 ### Update vs Validate 解析动作完整对比
 
@@ -962,28 +1048,40 @@ fn theme(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
 
 ---
 
-## 完整示例对比：Update 与 Validate 的实际差异
+## 完整示例对比：输入变化（Update）与回车执行（Validate）的实际差异
 
 ### 场景：用户输入 `:write --no-format test.txt` 过程
 
-#### 阶段 1：输入过程（每次按键触发 Update）
+#### 阶段 1：输入过程（每次按键 → handle_event 阶段 + render 阶段）
 
-每次按键都会触发 **三个并行分支**：
+每次按键分为 **两个串行阶段** 执行：
 
-| 分支 | 执行动作 |
+**handle_event 阶段（按键后立即执行）：**
+
+| 步骤 | 执行动作 |
 |------|---------|
-| **文档提示** | `command_line_doc("write --no-format test.txt")` → 显示 write 命令的帮助，包括 Aliases 和 Flags 列表 |
-| **命令补全** | `complete_command_line("write --no-format test.txt")` → `complete_command=false` → 进入参数补全 → 根据光标位置补全文件名 |
-| **命令解析** | `execute_command_line(..., Update)` → `Args::parse(validate=false, no_expand)` → 不验证、不展开 → `write(cx, args, Update)` → 函数检测到 event != Validate，直接返回 Ok |
+| 1 | 修改 `self.line`，如插入字符 `t` → `self.line` 变为 `"write --no-format test.t"` |
+| 2 | `self.recalculate_completion(cx.editor)` → 调用 `complete_command_line("write --no-format test.t")` → `complete_command=false` → 进入参数补全 → 根据光标位置补全文件名，结果保存到 `self.completion` |
+| 3 | `callback_fn(Update)` → `execute_command_line(..., Update)` → `Args::parse(validate=false, no_expand)` → 不验证、不展开 → `write(cx, args, Update)` → 函数检测到 event != Validate，直接返回 Ok |
+| 4 | 返回 `EventResult::Consumed(None)` → `should_redraw = true` |
+
+**render 阶段（handle_event 之后，should_redraw=true 时执行）：**
+
+| 步骤 | 执行动作 |
+|------|---------|
+| 5 | `Prompt::render_prompt()` → 渲染补全列表（使用步骤 2 计算好的 `self.completion`） |
+| 6 | `doc_fn("write --no-format test.t")` → `command_line_doc()` → 计算 write 命令的帮助文档，包括 Aliases 和 Flags 列表 → 渲染帮助浮窗（在命令行上方） |
+
+---
 
 #### 阶段 2：按下 Enter（触发 Validate）
 
-只触发 **命令解析分支**：
+只触发 **handle_event 阶段**，没有后续 render 阶段（因为 Prompt 已关闭）：
 
 | 步骤 | 执行动作 |
 |------|---------|
 | 1 | 保存 `"write --no-format test.txt"` 到 `:` 历史寄存器 |
-| 2 | `execute_command_line(..., Validate)` |
+| 2 | `callback_fn(Validate)` → `execute_command_line(..., Validate)` |
 | 2a | `split()` → `("write", "--no-format test.txt", false)` |
 | 2b | 查找到 `write` 命令 |
 | 2c | `execute_command(..., validate=true)` |
@@ -1004,8 +1102,10 @@ fn theme(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow
 |------|------|
 | [helix-core/src/command_line.rs](./helix-core/src/command_line.rs) | Tokenizer、Args、Signature、Flag、ParseArgsError 等核心解析逻辑 |
 | [helix-term/src/commands/typed.rs](./helix-term/src/commands/typed.rs) | TypableCommand 定义、TYPABLE_COMMAND_LIST/MAP、execute_command_line/execute_command、complete_command_line/complete_command_args、command_line_doc、各命令实现 |
-| [helix-term/src/ui/prompt.rs](./helix-term/src/ui/prompt.rs) | Prompt UI 组件，处理键盘输入、光标移动、历史记录、补全渲染 |
+| [helix-term/src/ui/prompt.rs](./helix-term/src/ui/prompt.rs) | Prompt UI 组件，handle_event 阶段的输入处理、recalculate_completion、callback_fn 调用；render 阶段的 doc_fn 调用、文档/补全渲染 |
 | [helix-term/src/ui/mod.rs](./helix-term/src/ui/mod.rs#L424-L700) | completers 子模块：filename、directory、buffer、theme、language、setting 等补全函数 |
+| [helix-term/src/application.rs](./helix-term/src/application.rs#L685-L760) | 主循环：handle_terminal_events 中的事件分发，handle_event 与 render 两个阶段的调度 |
+| [helix-term/src/compositor.rs](./helix-term/src/compositor.rs#L144-L175) | UI 层事件分发：从顶层 UI 层（Prompt）向下传递键盘事件 |
 | [helix-term/src/ui/editor.rs](./helix-term/src/ui/editor.rs#L1644-L1660) | EditorView::render 中 status_msg 的状态栏渲染逻辑 |
 | [helix-term/src/commands.rs](./helix-term/src/commands.rs) | MappableCommand 定义，Static/Typable/Macro 命令分发 |
 | [helix-term/src/keymap/default.rs](./helix-term/src/keymap/default.rs#L64) | 按键映射，`:` → command_mode |
