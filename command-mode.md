@@ -41,7 +41,7 @@
       │                 callback_fn(Abort) → 命令函数可恢复状态       │
       │                 返回 close_fn → compositor.pop() 移除 Prompt  │
       │                                                               │
-      │  ═════════════════ render 阶段（红屏时执行）═════════════════ │
+      │  ═════════════════ render 阶段（重绘时执行）═════════════════ │
       │  输入变化时：Prompt 仍在 layers 中 → Prompt::render_prompt   │
       │         ├─ 渲染补全列表（使用 handle_event 阶段计算好的 completion）│
       │         └─ doc_fn(&self.line) → 计算文档提示 → 渲染帮助浮窗  │
@@ -171,7 +171,7 @@ key!(Enter) => {
 
 > **纠正**：之前文档将文档提示描述为 Update 事件的并行分支是错误的。实际流程分为两个串行阶段：
 > 1. **handle_event 阶段**（按键后立即执行）：补全计算 + Update 回调
-> 2. **render 阶段**（随后红屏时执行）：文档提示计算 + 所有渲染
+> 2. **render 阶段**（随后重绘时执行）：文档提示计算 + 所有渲染
 
 ### 完整调用时序
 
@@ -211,7 +211,9 @@ Prompt::handle_event() [ui/prompt.rs#L721-L728]
   ├─ 步骤 3：(self.callback_fn)(cx, &self.line, PromptEvent::Update)
   └─ 返回 EventResult::Consumed(None) → should_redraw=true
   ↓
-render 阶段：同上，渲染更新后的补全列表和文档提示
+render 阶段：
+  ├─ 渲染补全列表（self.completion 不变，但 self.selection 高亮更新到新索引）
+  └─ doc_fn(&self.line) → 用替换后的新 self.line 重新计算文档提示
 ```
 
 #### 时序 C：Enter 执行命令（Prompt 被移除，底层重绘）
