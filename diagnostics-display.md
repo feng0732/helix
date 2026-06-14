@@ -120,7 +120,7 @@ let doc = self.documents.values_mut()
 
 ## 3. 界面标记
 
-诊断在界面上的展示有四个层面：**行内高亮**、**Gutter 标记**、**行内文本**、**底部面板**。
+诊断在界面上的展示有五个层面：**行内高亮**、**Gutter 标记**、**行内文本（Inline + EOL）**、**底部面板**、**状态栏**。
 
 ### 3.1 行内高亮（Overlay Highlights）
 
@@ -146,11 +146,84 @@ let doc = self.documents.values_mut()
 - 还会过滤掉当前 LS 不支持 Diagnostics 特性的诊断
 - 与断点标记、执行暂停标记组合（`diagnostics_or_breakpoints`），优先级：执行暂停 > 断点 > 诊断
 
-### 3.3 行内文本展示（Inline Diagnostics）
+### 3.3 行内文本展示（Inline + EOL）
 
-这是最复杂的展示方式，分两层实现：
+这是最核心的展示方式，**inline（行下诊断）和 eol（行尾诊断）不是互斥关系，而是按 severity 分层的互补关系**，两者可以同时存在。
 
-#### 3.3.1 注解层（LineAnnotation）
+#### 3.3.1 分层互补机制
+
+核心代码在 [InlineDiagnostics::render_virt_lines](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/ui/text_decorations/diagnostics.rs#L247-L296)：
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ render_virt_lines 执行顺序：                                    │
+│                                                                │
+│  1. 获取当前行的 inline filter (cursor_line / other_lines)      │
+│     filter = cursor_line ? cursor_line_filter : other_lines    │
+│                                                                │
+│  2. 计算 eol 诊断（此时 stack 包含完整的该行诊断，未被过滤）     │
+│     ├─ eol 诊断条件：                                           │
+│     │   ├─ eol_diagnostics != Disable                          │
+│     │   ├─ severity >= eol_filter                              │
+│     │   └─ 如果 inline 是 Enable(filter):                      │
+│     │         severity < filter  ← 关键：只显示低于 inline 的  │
+│     │                                                          │
+│     └─ draw_eol_diagnostic() → 行尾显示                         │
+│                                                                │
+│  3. compute_line_diagnostics() → 过滤 stack                    │
+│     ├─ 只保留 severity >= inline_filter 的诊断                │
+│     └─ 清空不符合条件的诊断                                    │
+│                                                                │
+│  4. 绘制 inline 诊断（行下方的诊断消息）                        │
+│     └─ draw_multi_diagnostics + draw_diagnostics              │
+│                                                                │
+│  结果：                                                        │
+│    eol 显示： eol_filter ≤ severity < inline_filter            │
+│    inline 显示：severity ≥ inline_filter                       │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**关键执行顺序**：eol 诊断在 `compute_line_diagnostics` 过滤 stack 之前就获取了，因此 eol 可以看到完整的该行诊断，而 inline 只能看到过滤后的诊断。
+
+**典型配置（默认值）**：
+- `inline_diagnostics.cursor_line = Enable(Warning)`
+- `end_of_line_diagnostics = Enable(Hint)`
+
+| Severity | EOL 显示 | Inline 显示 |
+|----------|----------|-------------|
+| Hint     | ✅ 行尾   | ❌          |
+| Info     | ✅ 行尾   | ❌          |
+| Warning  | ❌       | ✅ 行下方   |
+| Error    | ❌       | ✅ 行下方   |
+
+**特殊情况**：当 inline filter 为 `Disable` 时，eol 会显示所有 `severity >= eol_filter` 的诊断（不再有上限）。
+
+#### 3.3.2 互斥触发边界
+
+三种展示方式的互斥关系发生在**配置层面**，在 [editor.rs](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/ui/editor.rs#L232-L236)：
+
+```rust
+// 底部面板仅当两者都禁用时才显示
+if config.inline_diagnostics.disabled()
+    && config.end_of_line_diagnostics == DiagnosticFilter::Disable
+{
+    Self::render_diagnostics(doc, view, inner, surface, theme);
+}
+```
+
+[disabled()](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-view/src/annotations/diagnostics.rs#L63-L72) 的定义：
+- 仅当 `cursor_line == Disable && other_lines == Disable` 时才返回 true
+
+| 场景 | Inline | EOL | 底部面板 |
+|------|--------|-----|----------|
+| 默认配置（cursor_line=Warning, other_lines=Disable, eol=Hint） | ✅ 行下 Warning+ | ✅ 行尾 Hint+ | ❌ |
+| 仅 cursor_line 禁用（但 other_lines 启用） | ✅ 行下 other_lines | ✅ 行尾 | ❌ |
+| inline.disabled() 但 eol 启用（cursor_line=Disable, other_lines=Disable, eol=Hint） | ❌ | ✅ 行尾 Hint+ | ❌ |
+| eol 禁用但 inline 启用 | ✅ 行下 | ❌ | ❌ |
+| 两者都禁用 | ❌ | ❌ | ✅ 右上角面板 |
+| 窗口宽度 < min_diagnostic_width + prefix_len（prepare 自动禁用） | ❌ | ✅（eol 不受宽度影响） | ❌ |
+
+#### 3.3.3 注解层（LineAnnotation）
 
 [InlineDiagnosticAccumulator](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-view/src/annotations/diagnostics.rs#L122-L255) 在文档格式化阶段工作：
 
@@ -171,13 +244,28 @@ let doc = self.documents.values_mut()
 | max_wrap | 20 | 最大软换行数 |
 | max_diagnostics | 10 | 每行最大诊断数 |
 
-#### 3.3.2 渲染层（Decoration）
+[prepare](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-view/src/annotations/diagnostics.rs#L74-L83) 方法会动态调整配置（在 editor.rs#L200 调用）：
+
+```rust
+pub fn prepare(&self, width: u16, enable_cursor_line: bool) -> Self {
+    let mut config = self.clone();
+    if width < self.min_diagnostic_width + self.prefix_len {
+        // 窗口太窄，完全禁用 inline 诊断
+        config.cursor_line = Disable;
+        config.other_lines = Disable;
+    } else if !enable_cursor_line {
+        // 光标刚移动，降级 cursor_line 为 other_lines（避免闪烁）
+        config.cursor_line = self.cursor_line.min(self.other_lines);
+    }
+    config
+}
+```
+
+#### 3.3.4 渲染层（Decoration）
 
 [InlineDiagnostics](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/ui/text_decorations/diagnostics.rs#L46-L314) 负责实际绘制：
 
-**EOL 诊断**：在行尾直接绘制诊断消息（由 `end_of_line_diagnostics` 配置控制），优先显示比 inline filter 更高 severity 的诊断
-
-**行下诊断**：使用 Box-drawing 字符绘制连接线和消息文本：
+**行下诊断**使用 Box-drawing 字符绘制连接线和消息文本：
 - `└` (BR_CORNER)：诊断起始列的底部角
 - `┌` (TR_CORNER)：多诊断合并后的起始角
 - `─` (HOR_BAR)：水平连接线
@@ -233,6 +321,7 @@ Pull 模式的 debounce：
 ┌──────────────────────────────────────────────────────────┐
 │  show_cursorline_diagnostics(doc, view)                  │
 │  ├─ 光标行/文档未变 → 比较 generation == active_generation│
+│  │    → 返回 (generation == active_generation)           │
 │  ├─ 光标行/文档变化  → generation++                      │
 │  │   └─ 发送 CursorLineChanged{generation} 事件         │
 │  │   └─ 返回 false（本次不显示行内诊断）                 │
@@ -246,6 +335,32 @@ Pull 模式的 debounce：
 │  └─ request_redraw()                                    │
 │  └─ 下次渲染时 show_cursorline_diagnostics 返回 true     │
 └──────────────────────────────────────────────────────────┘
+```
+
+[show_cursorline_diagnostics](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-view/src/handlers/diagnostics.rs#L107-L130) 的完整逻辑：
+
+```rust
+pub fn show_cursorline_diagnostics(&self, doc: &Document, view: ViewId) -> bool {
+    if !self.active {
+        return false;  // Insert 模式下直接返回 false
+    }
+    let cursor_line = doc.selection(view).primary().cursor_line(doc.text().slice(..));
+
+    if self.last_cursor_line.get() == cursor_line && self.last_doc.get() == doc.id() {
+        // 光标行未变，检查 generation 是否匹配
+        let active_generation = self.active_generation.load(atomic::Ordering::Relaxed);
+        self.generation.get() == active_generation
+    } else {
+        // 光标行变化，递增 generation 并发送事件
+        self.last_doc.set(doc.id());
+        self.last_cursor_line.set(cursor_line);
+        self.generation.set(self.generation.get() + 1);
+        send_blocking(&self.events, DiagnosticEvent::CursorLineChanged {
+            generation: self.generation.get(),
+        });
+        false  // 立即返回 false，等待 350ms 超时
+    }
+}
 ```
 
 **设计意图**：光标快速移动时不频繁计算行内诊断，移动停止 350ms 后才显示。
@@ -268,6 +383,7 @@ register_hook!(move |event: &mut DiagnosticsDidChange<'_>| {
 ```
 
 - 非 Insert 模式下，向所有 view 的 diagnostics_handler 发送 `Refresh` 事件
+- Refresh 事件会重置 350ms 超时（如果已有超时在进行）
 - Insert 模式下跳过（避免输入时频繁刷新）
 
 ### 4.4 模式切换
@@ -286,12 +402,89 @@ register_hook!(move |event: &mut OnModeSwitch<'_, '_>| {
 - Insert 模式：`diagnostics_handler.active = false`，光标行诊断不显示
 - 退出 Insert：`active = true`，恢复显示
 
-### 4.5 立即显示
+### 4.5 切到诊断位置立即刷新
 
-[immediately_show_diagnostic](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-view/src/handlers/diagnostics.rs#L97-L106)：
+[immediately_show_diagnostic](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-view/src/handlers/diagnostics.rs#L97-L106) 提供了跳过 350ms 延迟的机制：
 
-- 直接设置 `active_generation = generation`，跳过 350ms 延迟
-- 用于特定操作后需要立即显示诊断的场景（如切换到光标所在的诊断行）
+```rust
+pub fn immediately_show_diagnostic(&self, doc: &Document, view: ViewId) {
+    self.last_doc.set(doc.id());
+    let cursor_line = doc.selection(view).primary().cursor_line(doc.text().slice(..));
+    self.last_cursor_line.set(cursor_line);
+    self.active_generation.store(self.generation.get(), atomic::Ordering::Relaxed);
+}
+```
+
+**关键动作**：直接设置 `active_generation = generation`，强制两者相等。
+
+#### 4.5.1 调用场景
+
+| 命令 | 快捷键 | 代码位置 |
+|------|--------|----------|
+| `goto_first_diag` | `[d` | [commands.rs#L4115-L4124](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4115-L4124) |
+| `goto_last_diag` | `]d` | [commands.rs#L4127-L4136](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4127-L4136) |
+| `goto_next_diag` | `]d` | [commands.rs#L4139-L4160](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4139-L4160) |
+| `goto_prev_diag` | `[d` | [commands.rs#L4166-L4190](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands.rs#L4166-L4190) |
+| diagnostics picker 选择 | `space-d` | [lsp.rs#L301-L305](file:///d:/fz/0601/solo-dogfeeding/code/275-helix/helix-term/src/commands/lsp.rs#L301-L305) |
+
+#### 4.5.2 完整路径（以 `goto_next_diag` 为例）
+
+```
+用户按 ]d 触发 goto_next_diag
+    │
+    ▼
+1. 查找下一个诊断
+   let diag = doc.diagnostics().iter()
+       .find(|diag| diag.range.start > cursor_pos);
+    │
+    ▼
+2. 移动光标到诊断位置
+   let selection = Selection::single(diag.range.start, diag.range.end);
+   doc.set_selection(view.id, selection);
+    │
+    ▼
+3. 跳过 350ms 延迟，立即显示
+   view.diagnostics_handler.immediately_show_diagnostic(doc, view.id);
+   │
+   ├─ last_doc = doc.id()        ← 记录当前文档
+   ├─ last_cursor_line = new_line ← 记录新行号
+   └─ active_generation = generation ← 强制相等，跳过延迟
+    │
+    ▼
+4. 下一帧渲染（EditorView::render）
+   let enable_cursor_line = view.diagnostics_handler
+       .show_cursorline_diagnostics(doc, view.id);
+   │
+   ├─ active == true（非 Insert 模式）
+   ├─ last_cursor_line == cursor_line → 匹配
+   ├─ last_doc == doc.id() → 匹配
+   └─ generation == active_generation → 相等，返回 true
+    │
+    ▼
+5. 准备 inline 配置（enable_cursor_line=true）
+   let inline_diagnostic_config = config.inline_diagnostics
+       .prepare(width, enable_cursor_line=true);
+   │
+   └─ enable_cursor_line=true → cursor_line 不降级，使用原配置
+    │
+    ▼
+6. InlineDiagnostics 正常绘制
+   render_virt_lines 中：
+   ├─ filter = cursor_line filter（Enable(Warning)）
+   ├─ compute_line_diagnostics 保留 severity >= Warning 的诊断
+   └─ draw_diagnostics 绘制行下诊断文本
+```
+
+#### 4.5.3 与普通光标移动的对比
+
+| 步骤 | 普通光标移动 | 诊断跳转（immediately_show） |
+|------|-------------|-----------------------------|
+| 光标移动 | `doc.set_selection()` | `doc.set_selection()` |
+| show_cursorline_diagnostics | generation++ → 发送事件 → 返回 false | last_doc/line 更新，active_generation=generation |
+| prepare() 参数 | enable_cursor_line=false | enable_cursor_line=true |
+| cursor_line 配置 | 降级为 `cursor_line.min(other_lines)`（可能为 Disable） | 使用原配置（Enable(Warning)） |
+| 显示时机 | 350ms 超时后 | 下一帧立即显示 |
+| 行内诊断 | 延迟显示（光标停止移动后 350ms） | 立即显示 |
 
 ---
 
@@ -327,7 +520,9 @@ Editor.handle_lsp_diagnostics()
 
 渲染帧:
     │
-    ├─ show_cursorline_diagnostics() → 确定是否启用光标行诊断
+    ├─ show_cursorline_diagnostics() → enable_cursor_line
+    │     ├─ 普通移动：generation++ → 返回 false → 350ms 后显示
+    │     └─ 诊断跳转：immediately_show → 返回 true → 立即显示
     │
     ├─ doc_diagnostics_highlights_into() → 行内下划线/删除线高亮
     │     └─ overlay highlights (diagnostic.warning 等 scope)
@@ -337,11 +532,11 @@ Editor.handle_lsp_diagnostics()
     ├─ InlineDiagnosticAccumulator (LineAnnotation) → 计算虚拟行数
     │     └─ 顺序扫描 doc.diagnostics，收集每行的诊断 stack
     │
-    ├─ InlineDiagnostics (Decoration) → 绘制行下诊断文本
-    │     ├─ EOL 诊断（行尾显示）
-    │     └─ 行下诊断（Box-drawing 连接线 + 消息文本）
+    ├─ InlineDiagnostics (Decoration) → 绘制行下/行尾诊断文本
+    │     ├─ EOL 诊断：severity < inline_filter 且 >= eol_filter（行尾显示）
+    │     └─ 行下诊断：severity >= inline_filter（行下方绘制）
     │
-    ├─ render_diagnostics() → 底部面板（仅 inline+eol 都禁用时）
+    ├─ render_diagnostics() → 底部面板（仅 inline.disabled() && eol==Disable 时）
     │
     └─ statusline::render_diagnostics() → 状态栏诊断计数
 ```
