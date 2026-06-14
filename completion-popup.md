@@ -210,7 +210,7 @@ let pattern = Atom::new(pattern, CaseMatching::Ignore, Normalization::Smart, Ato
 matches.sort_unstable_by_key(|&(i, score)| {
     let option = &options[i as usize];
     (
-        score <= min_score,           // 1. 低于阈值排到末尾
+        score <= min_score,           // 1. score <= min_score（含等于）时沉底
         Reverse(option.preselect()),  // 2. LSP preselect 优先
         option.provider_priority(),   // 3. provider 优先级（越小越前）
         Reverse(score),               // 4. 模糊匹配分高的优先
@@ -223,18 +223,34 @@ matches.sort_unstable_by_key(|&(i, score)| {
 
 | 优先级 | 键 | 类型 | 排序方向 | 说明 |
 |---|---|---|---|---|
-| 1 | `score <= min_score` | bool | 升序（false 在前） | 低于最低阈值的项统一沉底。`false=0 < true=1`，所以匹配质量达标的项全部分在不达标项之前 |
+| 1 | `score <= min_score` | bool | 升序（false 在前） | 匹配质量分界线。`score <= min_score` 为 true（**含等于**）→ 值 1 → 沉底；`score > min_score` → 值 0 → 在前 |
 | 2 | `Reverse(option.preselect())` | `Reverse<bool>` | 升序 = 逻辑上 true 在前 | LSP 标记 `preselect=true` 的项优先。`Reverse(true)` < `Reverse(false)`，使 true 排在 false 前面。**这是第二键，只要 preselect 不同，就直接决定顺序，不看 provider_priority** |
-| 3 | `option.provider_priority()` | i8 | 升序（越小越前） | 来源优先级。数值越小排名越靠前。**仅当前两键（达标状态 + preselect）都相同时才比较此键** |
+| 3 | `option.provider_priority()` | i8 | 升序（越小越前） | 来源优先级。数值越小排名越靠前。**仅当前两键（质量分组 + preselect）都相同时才比较此键** |
 | 4 | `Reverse(score)` | `Reverse<u32>` | 升序 = 逻辑上 score 越高越前 | 模糊匹配得分。得分越高排名越靠前。**仅当前三键都相同时才比较此键** |
 | 5 | `i` | u32 | 升序（越小越前） | 原始索引保序。以上所有键都相等时，按在 options 中出现的先后顺序排列 |
 
-其中 `min_score = (7 + needle_len * 14) / 3`，是一个启发式阈值，用于将匹配质量过差的候选项沉底（不直接剔除）。
+#### `min_score` 阈值的计算与 score 缩放关系
+
+```rust
+// completion.rs(ui)#L352-L358  全量模式
+score as u32 / 3    // stored score = nucleo_score / 3
+
+// completion.rs(ui)#L344-L345  增量模式
+new_score as u32 / 2  // stored score = nucleo_score / 2
+
+// completion.rs(ui)#L369
+let min_score = (7 + pattern.needle_text().len() as u32 * 14) / 3;
+```
+
+- `min_score = (7 + needle_len × 14) / 3`，源自 nucleo 内部常量的启发式公式
+- **全量模式下** stored score 与 min_score 同尺度（均 ÷3），阈值判断等价于 `nucleo_score <= 7 + needle_len × 14`
+- **增量模式下** stored score ÷2 而 min_score ÷3，二者尺度不同——这是已知的启发式妥协，阈值判定在此模式下略偏宽松
+- 边界判定为 **`score <= min_score`（包含等于）**：`score` 恰好等于 `min_score` 时也归入"不达标"组被沉底
 
 **关键规则总结**：
-1. **达标/不达标是最高分界线**：低于 min_score 的项一律排在达标项之后，不论 preselect 和 provider_priority 如何
-2. **preselect 高于来源优先级**：同一达标组内，`preselect=true` 的项**全部排在** `preselect=false` 的项之前，即使其 provider_priority 数值更大（来源优先级更低）
-3. **provider_priority 仅在前两键相同时生效**：同为 preselect=false（或同为 preselect=true）且同为达标状态时，才按来源优先级分块
+1. **质量分组是最高分界线**：`score <= min_score`（含等于）的项一律排在 `score > min_score` 的项之后，不论 preselect 和 provider_priority 如何
+2. **preselect 高于来源优先级**：同一质量组内，`preselect=true` 的项**全部排在** `preselect=false` 的项之前，即使其 provider_priority 数值更大（来源优先级更低）
+3. **provider_priority 仅在前两键相同时生效**：同为 preselect=false（或同为 preselect=true）且同质量分组时，才按来源优先级分块
 4. **分块内按模糊分排序**：同一 provider_priority 组内按 nucleo 匹配得分从高到低
 5. **原始索引兜底**：所有键都相同时保持加入顺序
 
@@ -305,27 +321,30 @@ Path 和 Word 的 `provider_priority` 都是 1，处于同一层级。它们之�
 
 **provider_priority 升序关系**：`-2 (clippy) < -1 (rls) < 0 (rust-analyzer) < 1 (Path/Word)`
 
-假设当前已输入字符构成 needle 长度为 4，`min_score = (7 + 4×14)/3 = 21`，即 score < 21 的项判为不达标。
+假设当前已输入字符构成 needle 长度为 4，`min_score = (7 + 4×14)/3 = 21`。边界条件为 `score <= min_score`（**含等于**），即 `score ≤ 21` 的项归入不达标组，`score > 21` 的项归入达标组。
 
 候选项一览：
 
-| # | 候选项 | 来源 | provider_priority | preselect | score | 是否达标 |
+| # | 候选项 | 来源 | provider_priority | preselect | score | 质量分组（第 1 键） |
 |---|---|---|---|---|---|---|
-| A | func_clippy_a | clippy (配置第3, 来源最高) | -2 | false | 80 | 是 |
-| B | func_rls_pre | rls (配置第2) | -1 | **true** | 50 | 是 |
-| C | func_ra_best | rust-analyzer (配置第1, 来源最低) | 0 | false | 180 | 是 |
-| D | func_clippy_b | clippy (配置第3) | -2 | false | 95 | 是 |
-| E | src_dir/ | Path | 1 | false | 70 | 是 |
-| F | my_word_var | Word | 1 | false | 60 | 是 |
-| G | func_rls_weak | rls (配置第2) | -1 | false | 5 | **否** |
-| H | func_ra_pre2 | rust-analyzer (配置第1) | 0 | **true** | 30 | 是 |
+| A | func_clippy_a | clippy (配置第3, 来源最高) | -2 | false | 80 | 达标（80 > 21） |
+| B | func_rls_pre | rls (配置第2) | -1 | **true** | 50 | 达标（50 > 21） |
+| C | func_ra_best | rust-analyzer (配置第1, 来源最低) | 0 | false | 180 | 达标（180 > 21） |
+| D | func_clippy_b | clippy (配置第3) | -2 | false | 95 | 达标（95 > 21） |
+| E | src_dir/ | Path | 1 | false | 70 | 达标（70 > 21） |
+| F | my_word_var | Word | 1 | false | 60 | 达标（60 > 21） |
+| G | func_rls_weak | rls (配置第2) | -1 | false | 5 | **不达标（5 ≤ 21）** |
+| H | func_ra_pre2 | rust-analyzer (配置第1) | 0 | **true** | 30 | 达标（30 > 21） |
+| I | func_clippy_edge | clippy (配置第3) | -2 | false | 21 | **不达标（21 ≤ 21）** |
+
+> 注意项 I：`score == min_score == 21`，由于边界条件是 `<=`（含等于），即使来源优先级最高（priority=-2），也被归入不达标组。
 
 **逐步推演排序**：
 
-**第一步：按达标状态分块（第 1 键）**
+**第一步：按质量分组（第 1 键 `score <= min_score`）**
 ```
-达标组（score<=min_score = false=0）：A, B, C, D, E, F, H    ← 在前
-不达标组（score<=min_score = true=1）：G                    ← 沉底
+达标组（score <= min_score 为 false → 值 0）：A, B, C, D, E, F, H    ← 在前
+不达标组（score <= min_score 为 true → 值 1）：G, I                  ← 沉底
 ```
 
 **第二步：达标组内按 preselect 分块（第 2 键）**
@@ -353,21 +372,23 @@ priority=1（Path/Word 组）：E(score=70), F(score=60)
 
 **最终完整排序**：
 
-| 名次 | 候选项 | 来源 | preselect | provider_priority | score | 排在前面的原因 |
-|---|---|---|---|---|---|---|
-| 1 | **func_rls_pre (B)** | rls (配置第2) | ✅ true | -1 | 50 | preselect=true → 越过所有 preselect=false 的项（包括来源更高的 clippy） |
-| 2 | **func_ra_pre2 (H)** | rust-analyzer (配置第1) | ✅ true | 0 | 30 | preselect=true；来源优先级低于 B，所以排 B 之后 |
-| 3 | **func_clippy_b (D)** | clippy (配置第3) | ❌ | -2 | 95 | preselect=false 组内来源最高（-2 最小）；95 > 80 → 排 A 之前 |
-| 4 | **func_clippy_a (A)** | clippy (配置第3) | ❌ | -2 | 80 | 与 D 同来源同 preselect；score 较低 |
-| 5 | **func_ra_best (C)** | rust-analyzer (配置第1) | ❌ | 0 | 180 | 来源低于 clippy（0 > -2），所以在 clippy 组之后；尽管 score 最高也无法越界 |
-| 6 | **src_dir/ (E)** | Path | ❌ | 1 | 70 | 非 LSP 来源优先级（1）最低；70 > 60 |
-| 7 | **my_word_var (F)** | Word | ❌ | 1 | 60 | 与 E 同来源层；score 较低 |
-| 8 | **func_rls_weak (G)** | rls (配置第2) | ❌ | -1 | 5 | score 不达标（5 < 21）→ 沉底，即使来源优先级高也无济于事 |
+| 名次 | 候选项 | 来源 | preselect | provider_priority | score | 质量分组 | 排在前面的原因 |
+|---|---|---|---|---|---|---|---|
+| 1 | **func_rls_pre (B)** | rls (配置第2) | ✅ true | -1 | 50 | 达标 | preselect=true → 越过所有 preselect=false 的项（包括来源更高的 clippy） |
+| 2 | **func_ra_pre2 (H)** | rust-analyzer (配置第1) | ✅ true | 0 | 30 | 达标 | preselect=true；来源优先级低于 B，所以排 B 之后 |
+| 3 | **func_clippy_b (D)** | clippy (配置第3) | ❌ | -2 | 95 | 达标 | preselect=false 组内来源最高（-2 最小）；95 > 80 → 排 A 之前 |
+| 4 | **func_clippy_a (A)** | clippy (配置第3) | ❌ | -2 | 80 | 达标 | 与 D 同来源同 preselect；score 较低 |
+| 5 | **func_ra_best (C)** | rust-analyzer (配置第1) | ❌ | 0 | 180 | 达标 | 来源低于 clippy（0 > -2），所以在 clippy 组之后；尽管 score 最高也无法越界 |
+| 6 | **src_dir/ (E)** | Path | ❌ | 1 | 70 | 达标 | 非 LSP 来源优先级（1）最低；70 > 60 |
+| 7 | **my_word_var (F)** | Word | ❌ | 1 | 60 | 达标 | 与 E 同来源层；score 较低 |
+| 8 | **func_clippy_edge (I)** | clippy (配置第3) | ❌ | -2 | 21 | **不达标** | score == min_score，`21 ≤ 21` 成立 → 不达标组。即使 priority=-2 来源最高，也无法越界进入达标组 |
+| 9 | **func_rls_weak (G)** | rls (配置第2) | ❌ | -1 | 5 | **不达标** | score 远低于阈值（5 ≤ 21）→ 不达标组；同组内按 preselect 和 provider_priority 排在 I 之后 |
 
 **核心冲突点解释**：
 - **名次 1 vs 3**：`func_rls_pre`（B，来源次优，priority=-1）排在 `func_clippy_b`（D，来源最优，priority=-2）之前，原因是 preselect=true 是第二键、provider_priority 是第三键——**preselect 不同就不再比较来源优先级**。这体现了 LSP 服务器的 preselect 标志意图高于用户配置的来源顺序。
 - **名次 5 vs 3**：`func_ra_best`（C，score=180 最高）无法越过 `func_clippy_b`（D，score=95），原因是两者 preselect 相同（都是 false）时先比较 provider_priority，clippy 的 -2 < rust-analyzer 的 0 → clippy 组整体在前。
-- **名次 8 vs 1**：`func_rls_weak`（G）虽然 priority=-1 来源极高，但 score 不达标导致被**第一键**直接打入最后一组，彻底出局。
+- **名次 8 vs 3**：`func_clippy_edge`（I）虽然 priority=-2 来源最高，但 `score == min_score`，因为边界条件是 `<=`（含等于），被归入不达标组沉底——**来源优先级再高也无法弥补匹配质量不足**。
+- **名次 8 vs 9**：同为不达标组，I（priority=-2）排在 G（priority=-1）前面——在不达标组内部，preselect 和 provider_priority 仍然按原有优先级规则生效，只是整体被沉底。
 
 ### 3.4 过滤更新：`update_filter`
 
@@ -691,7 +712,7 @@ PostInsertChar hook ──→ trigger_auto_completion() ──→ CompletionEven
 
 1. **三个来源并行 + 首屏超时**：LSP 请求异步、word/path 同步计算，首批结果立即展示，后续结果 100ms 内继续等待，超时后异步替换
 2. **统一的 `CompletionItem` 枚举**：LSP 和非 LSP 来源在排序/过滤/展示层面统一处理，仅在插入时分支；非 LSP 项的 `provider_priority` 固定为 1，与 `ResponseContext.priority` 无关
-3. **五级排序策略**：阈值沉底 → LSP preselect → provider_priority（配置越靠后的 LSP 优先级越高） → 模糊匹配分 → 原始索引。兼顾 LSP 意图、来源优先级和匹配质量
+3. **五级排序策略**：质量分组（`score <= min_score` 含等于则沉底）→ LSP preselect → provider_priority（配置越靠后的 LSP 优先级越高）→ 模糊匹配分 → 原始索引。兼顾匹配质量、LSP 意图、来源优先级
 4. **Ghost Transaction 机制**：预览插入用 `apply_temporary`（不通知 LSP），确认插入用 `apply`（通知 LSP），通过 savepoint 保证状态一致性
 5. **延迟 resolve**：只在用户选中某项时才异步请求 `completionItem/resolve`，避免大量无用的 resolve 请求
 6. **Incomplete list 处理**：LSP 标记 `is_incomplete` 的响应在用户继续输入时会被重新请求（`request_incomplete_completion_list`），而非仅做本地过滤
