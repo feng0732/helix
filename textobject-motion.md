@@ -145,10 +145,13 @@ pub enum TextObject {
 2. 通过 `syntax.layer_for_byte_range` 确定当前注入层（支持嵌入语言）。
 3. 用 `loader.textobject_query` 获取当前语言的 textobject 查询。
 4. 构造捕获名 `"{object_name}.{textobject}"`（如 `"function.inside"`、`"class.around"`）。
-5. 从所有捕获节点中筛选包含当前 byte 位置的节点，选最小节点（最内层匹配）。
-6. 将节点的 byte 范围转为 char 范围，返回 `Range::new(start_char, end_char)`（始终 Forward 方向）。
+5. 调用 `capture_nodes(&capture_name, ...)` — **精确匹配单一捕获名，没有回退机制**。
+6. 从所有捕获节点中筛选包含当前 byte 位置的节点，选最小节点（最内层匹配）。
+7. 将节点的 byte 范围转为 char 范围，返回 `Range::new(start_char, end_char)`（始终 Forward 方向）。
 
 > **注意**：`textobject_treesitter` 返回的 Range 始终是 Forward 方向（anchor 在对象起点，head 在对象终点）。调用方负责根据需要调整方向。
+>
+> **无回退**：与 `goto_treesitter_object` 不同，`textobject_treesitter` 只查找精确指定的捕获名。如果查询文件中没有定义 `{name}.inside`，则 `mi f`（匹配 function inside）会失败，返回原始 Range。它不会尝试回退到 `{name}.around`。
 
 ---
 
@@ -253,7 +256,7 @@ pub fn goto_treesitter_object(
 
 **执行流程**：
 
-1. 依次尝试匹配 `{name}.movement`、`{name}.around`、`{name}.inside` 三种捕获名（`capture_nodes_any`）。
+1. **捕获查询优先级与回退**：调用 `capture_nodes_any(&[Movement, Around, Inside], ...)`，按数组顺序依次尝试三种捕获名（详见下文 4.6.1）。
 2. **Forward 方向**：找 `start_byte > cursor_byte` 的节点，按 `(start_byte, Reverse(end_byte))` 排序取最小（最近、最短的对象）。
 3. **Backward 方向**：找 `end_byte < cursor_byte` 的节点，按 `(end_byte, Reverse(start_byte))` 排序取最大（最近、最短的对象）。
 4. 循环 count 次逐步跳转，直到无法继续。
@@ -261,6 +264,72 @@ pub fn goto_treesitter_object(
 **返回值**：始终返回 Forward 方向的完整对象 Range：`Range::new(start_char, end_char)`。
 
 > **关键校正**：函数内注释 "head of range should be at beginning" 与代码不符。实际代码 `Range::new(start_char, end_char)` 中 head 在 `end_char`（对象终点），anchor 在 `start_char`（对象起点）。返回值是覆盖整个对象的 Forward Range。
+
+#### 4.6.1 捕获优先级与回退机制（[syntax.rs](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/helix-core/src/syntax.rs#L1045-L1069)）
+
+优先级由 `capture_nodes_any` 内部的 `find_map` 逻辑决定：
+
+```rust
+let capture = capture_names
+    .iter()
+    .find_map(|cap| self.query.get_capture(cap))?;
+```
+
+`find_map` 按数组顺序遍历，返回第一个 `Some(_)` 结果。这意味着优先级是严格的**数组顺序优先**。
+
+对于 `goto_treesitter_object`，传入的捕获名数组顺序是：
+**`[Movement, Around, Inside]`** — 优先级从高到低。
+
+| 优先级 | 捕获名 | 存在时的行为 |
+|--------|--------|-------------|
+| 1（最高） | `{name}.movement` | 使用该捕获的节点范围，通常是对象的关键标识部分（如函数名、参数名） |
+| 2 | `{name}.around` | 使用整个对象范围（含边界） |
+| 3（最低） | `{name}.inside` | 使用对象的内容范围（不含边界） |
+
+**回退触发条件**：`query.get_capture(cap)` 返回 `None` 表示当前查询文件中没有定义该捕获名。此时 `find_map` 继续尝试下一个捕获名。
+
+**实际查询文件示例**（[php/textobjects.scm](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/runtime/queries/php/textobjects.scm)）：
+```
+(array_element_initializer (_) @entry.inside) @entry.around @entry.movement
+```
+这个查询同时定义了三种捕获，`entry.movement` 和 `entry.around` 指向同一个节点范围。
+
+**查询文件示例**（[kdl/textobjects.scm](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/runtime/queries/kdl/textobjects.scm)）：
+```
+(node (identifier) @function.movement)
+```
+这个查询只为 function 定义了 `movement` 捕获，指向 `identifier` 节点（函数名）。此时 `]f` 会优先跳转到函数名位置，而非整个函数范围。
+
+#### 4.6.2 回退链与最终失败处理
+
+完整的回退链：
+1. 尝试 `{name}.movement` — 如果查询文件有定义，使用它
+2. 如果没有，回退到 `{name}.around` — 如果有定义，使用它
+3. 如果也没有，回退到 `{name}.inside` — 如果有定义，使用它
+4. 如果三者都没有定义，`find_map` 返回 `None`，通过 `?` 传播，`get_range` 闭包返回 `None`
+
+**最终失败处理**（[movement.rs](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/helix-core/src/movement.rs#L616-L623)）：
+```rust
+let mut last_range = range;
+for _ in 0..count {
+    match get_range(last_range) {
+        Some(r) if r != last_range => last_range = r,
+        _ => break,  // 捕获不存在或无匹配节点时跳出循环
+    }
+}
+last_range  // 返回原始 range，不移动
+```
+
+当所有捕获都不存在或没有找到匹配节点时，返回**原始 Range**，相当于"空操作"。
+
+#### 4.6.3 两种查询入口的对比
+
+| 功能 | 调用函数 | 捕获策略 | 回退机制 |
+|------|---------|----------|----------|
+| `mi f` / `ma f` | `textobject_treesitter` | 单个精确捕获名 | **无回退** — 找不到就返回原 Range |
+| `]f` / `[f` | `goto_treesitter_object` | `[Movement, Around, Inside]` 数组 | **三级回退** — 按优先级依次尝试 |
+
+> **设计意图**：选区操作需要精确匹配用户的意图（Inside 就是 Inside），而跳转操作更倾向于"能用就行"——即使没有专门的 movement 捕获，也应该能跳到对象范围。
 
 ### 4.7 父节点端点移动：move_parent_node_end（[movement.rs](file:///d:/fz/0601/solo-dogfeeding/code/278-helix/helix-core/src/movement.rs#L637-L699)）
 
@@ -466,11 +535,17 @@ Tree-sitter 节点级别的选区操作，用于 `]p` / `[p`、expand/shrink 等
 
 1. **keymap 查找**：Normal 模式下 `]f` → `goto_next_function`
 2. **命令入口**：`goto_next_function` → `goto_ts_object_impl("function", Direction::Forward)`
-3. **获取对象**：调用 `goto_treesitter_object` 找到下一个 function 节点，返回 `Range::new(start, end)`（Forward 方向，覆盖整个函数）
-4. **模式处理**：
-   - **Normal 模式**：`new_range.with_direction(Forward)` → 仍是 Forward Range，head 在函数末尾。可见光标落在函数的最后一个字符上。
-   - **Select 模式**：原 anchor 保留，head 设为 `new_range.head`（函数末尾）。选区从原 anchor 扩展到函数末尾。
-5. **应用与记录**：通过 `apply_motion` 执行，保存到 `last_motion` 供重复。
+3. **捕获查询与回退**：`goto_treesitter_object` 调用 `capture_nodes_any(&["function.movement", "function.around", "function.inside"], ...)`
+   - 优先查找 `function.movement` 捕获（如 kdl 查询中指向函数名 `identifier`）
+   - 如果不存在，回退到 `function.around` 捕获
+   - 如果也不存在，回退到 `function.inside` 捕获
+   - 如果三者都不存在，返回原始 Range，不移动
+4. **节点筛选**：找到下一个 start_byte > cursor_byte 的 function 节点（最近、最短）
+5. **构造 Range**：返回 `Range::new(start, end)`（Forward 方向，覆盖捕获的节点范围）
+6. **模式处理**：
+   - **Normal 模式**：`new_range.with_direction(Forward)` → 仍是 Forward Range，head 在节点末尾。可见光标落在节点的最后一个字符上。
+   - **Select 模式**：原 anchor 保留，head 设为 `new_range.head`（节点末尾）。选区从原 anchor 扩展到节点末尾。
+7. **应用与记录**：通过 `apply_motion` 执行，保存到 `last_motion` 供重复。
 
 ### 6.4 选区方向与光标的朝向
 
@@ -497,6 +572,9 @@ Range 的方向决定了可见光标的"朝向"，这对理解 `with_direction` 
 | Select 模式 | 不适用（本身就是选区替换） | 保留原 anchor，扩展 head 到对象的近端或远端 |
 | count 语义 | 嵌套层级（括号）/ 段落数 | 跳过的对象个数 |
 | 光标位置 | 对象内部（覆盖整个对象） | 对象边缘（Forward 在末尾，Backward 在开头） |
+| **捕获策略** | 单个精确捕获名 | `[Movement, Around, Inside]` 优先级数组 |
+| **回退机制** | 无 — 找不到就返回原 Range | 三级回退 — Movement → Around → Inside |
+| **设计原则** | 精确匹配用户意图 | 容错优先，"能用就行" |
 
 ---
 
