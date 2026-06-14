@@ -455,7 +455,7 @@ if let Some((version, doc)) = version.zip(doc.as_ref()) {
 
 **方向**：语言服务器 → 编辑器
 
-**版本携带方式**：`OptionalVersionedTextDocumentIdentifier.version: Option<i32>`（helix-lsp-types/src/lib.rs#L970-L980）。服务器在 `TextDocumentEdit` 中可以附带 version，表示"此编辑应精确应用到该版本的文档上"。
+**版本携带方式**：`OptionalVersionedTextDocumentIdentifier.version: Option<i32>`（helix-lsp-types/src/lib.rs#L990-L1005）。与 `VersionedTextDocumentIdentifier`（version 为必选 `i32`，helix-lsp-types/src/lib.rs#L970-L980）不同，该结构的 version 字段为可选（`Option<i32>`），专门用于服务器向客户端发送编辑请求时允许省略版本号。服务器在 `TextDocumentEdit` 中可以附带 version，表示"此编辑应精确应用到该版本的文档上"。
 
 **对齐机制**：`apply_text_edits()`（helix-view/src/handlers/lsp.rs#L82-L131）在应用编辑前：
 
@@ -574,7 +574,8 @@ if !event.ghost_transaction {
 | LanguageServerInitialized 钩子 | helix-view/src/handlers/lsp.rs | L387-L404 | 重发 didOpen |
 | TextDocumentSyncKind | helix-lsp-types/src/lib.rs | L1774-L1786 | 同步模式枚举 |
 | PublishDiagnosticsParams | helix-lsp-types/src/lib.rs | L2537-L2547 | 诊断通知参数 |
-| VersionedTextDocumentIdentifier | helix-lsp-types/src/lib.rs | L970-L980 | 版本号+URI |
+| VersionedTextDocumentIdentifier | helix-lsp-types/src/lib.rs | L970-L980 | 版本号+URI（didChange 用，version 必选） |
+| OptionalVersionedTextDocumentIdentifier | helix-lsp-types/src/lib.rs | L990-L1005 | 可选版本号+URI（applyEdit 用，version 可选） |
 | DidChangeTextDocumentParams | helix-lsp-types/src/lib.rs | L2266-L2273 | didChange 参数 |
 | TextDocumentContentChangeEvent | helix-lsp-types/src/lib.rs | L2279-L2292 | 增量变更事件 |
 | Client::offset_encoding | helix-lsp/src/client.rs | L410-L424 | 偏移编码选择 |
